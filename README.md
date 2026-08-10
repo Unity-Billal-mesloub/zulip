@@ -52,7 +52,4 @@ Come find us on the [development community chat](https://zulip.com/development-c
   Zulip](https://zulip.com/help/support-zulip-project), including contributing
   financially, and helping others discover it.
 
-You may also be interested in reading our [blog](https://blog.zulip.org/), and
-following us on [LinkedIn](https://www.linkedin.com/company/zulip-project/),
-[Mastodon](https://fosstodon.org/@zulip), and [X](https://x.com/zulip).
 

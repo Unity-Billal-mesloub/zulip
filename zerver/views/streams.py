@@ -128,7 +128,7 @@ def bulk_principals_to_user_profiles(
     # principals are user emails.
     if isinstance(principals[0], str):
         return bulk_access_users_by_email(
-            principals,  # type: ignore[arg-type] # principals guaranteed to be list[str] only.
+            principals,
             acting_user=acting_user,
             allow_deactivated=False,
             allow_bots=True,
@@ -138,7 +138,7 @@ def bulk_principals_to_user_profiles(
     # principals are user ids.
     else:
         return bulk_access_users_by_id(
-            principals,  # type: ignore[arg-type] # principals guaranteed to be list[int] only.
+            principals,
             acting_user=acting_user,
             allow_deactivated=False,
             allow_bots=True,
@@ -302,6 +302,7 @@ def update_stream_backend(
     can_resolve_topics_group: Json[GroupSettingChangeRequest] | None = None,
     can_send_message_group: Json[GroupSettingChangeRequest] | None = None,
     can_subscribe_group: Json[GroupSettingChangeRequest] | None = None,
+    default_push_notifications: Json[bool] | None = None,
     description: ChannelDescription = None,
     folder_id: Json[int | None] | MissingType = Missing,
     history_public_to_subscribers: Json[bool] | None = None,
@@ -440,8 +441,15 @@ def update_stream_backend(
             stream, user_profile, new_message_retention_days_value
         )
 
+    if default_push_notifications is not None:
+        if not user_profile.is_realm_admin:
+            raise JsonableError(_("Insufficient permission"))
+        do_set_stream_property(
+            stream, "default_push_notifications", default_push_notifications, user_profile
+        )
+
     if is_archived is not None and not is_archived:
-        do_unarchive_stream(stream, stream.name, acting_user=None)
+        do_unarchive_stream(stream, stream.name, acting_user=user_profile)
 
     if (
         can_delete_any_message_group is not None or can_delete_own_message_group is not None
@@ -691,6 +699,7 @@ def create_channel(
     can_resolve_topics_group: Json[int | UserGroupMembersData] | None = None,
     can_send_message_group: Json[int | UserGroupMembersData] | None = None,
     can_subscribe_group: Json[int | UserGroupMembersData] | None = None,
+    default_push_notifications: Json[bool] = False,
     description: ChannelDescription = None,
     folder_id: Json[int] | None = None,
     history_public_to_subscribers: Json[bool] | None = None,
@@ -744,6 +753,9 @@ def create_channel(
         )
     )
 
+    if default_push_notifications and not user_profile.is_realm_admin:
+        raise JsonableError(_("Insufficient permission"))
+
     group_settings_map = stream_group_settings_map[name]
     new_channel, created = create_stream_if_needed(
         realm,
@@ -753,6 +765,7 @@ def create_channel(
         history_public_to_subscribers=history_public_to_subscribers,
         is_web_public=is_web_public,
         message_retention_days=parsed_message_retention_days,
+        default_push_notifications=default_push_notifications,
         anonymous_group_membership=anonymous_group_membership,
         acting_user=user_profile,
         can_add_subscribers_group=group_settings_map["can_add_subscribers_group"],
@@ -824,6 +837,7 @@ def add_subscriptions_backend(
     can_resolve_topics_group: Json[int | UserGroupMembersData] | None = None,
     can_send_message_group: Json[int | UserGroupMembersData] | None = None,
     can_subscribe_group: Json[int | UserGroupMembersData] | None = None,
+    default_push_notifications: Json[bool] = False,
     folder_id: Json[int] | None = None,
     history_public_to_subscribers: Json[bool] | None = None,
     invite_only: Json[bool] = False,
@@ -848,6 +862,9 @@ def add_subscriptions_backend(
     if folder_id is not None:
         folder = get_channel_folder_by_id(folder_id, realm)
 
+    if default_push_notifications and not user_profile.is_realm_admin:
+        raise JsonableError(_("Insufficient permission"))
+
     for stream_obj in streams_raw:
         # 'color' field is optional
         # check for its presence in the streams_raw first
@@ -870,6 +887,7 @@ def add_subscriptions_backend(
         if validated_topics_policy is not None:
             stream_dict_copy["topics_policy"] = validated_topics_policy.value
         stream_dict_copy["folder"] = folder
+        stream_dict_copy["default_push_notifications"] = default_push_notifications
 
         stream_dicts.append(stream_dict_copy)
 
@@ -1124,6 +1142,7 @@ def get_subscribers_backend(
     (stream, _sub) = access_stream_by_id(
         user_profile,
         stream_id,
+        require_active_channel=False,
         require_content_access=False,
     )
     subscribers = get_subscriber_ids(stream, user_profile)
@@ -1171,7 +1190,9 @@ def get_stream_backend(
     *,
     stream_id: PathOnly[int],
 ) -> HttpResponse:
-    (stream, _sub) = access_stream_by_id(user_profile, stream_id, require_content_access=False)
+    (stream, _sub) = access_stream_by_id(
+        user_profile, stream_id, require_active_channel=False, require_content_access=False
+    )
 
     recent_traffic = get_streams_traffic(user_profile.realm, {stream.id})
     anonymous_group_membership = get_anonymous_group_membership_dict_for_streams([stream])
@@ -1210,7 +1231,7 @@ def get_topics_backend(
     else:
         assert user_profile is not None
 
-        (stream, _sub) = access_stream_by_id(user_profile, stream_id)
+        (stream, _sub) = access_stream_by_id(user_profile, stream_id, require_active_channel=False)
 
         assert stream.recipient_id is not None
         result = get_topic_history_for_stream(
@@ -1254,7 +1275,9 @@ def delete_in_topic(
             return json_success(request, data={"complete": False})
         with transaction.atomic(durable=True):
             messages_to_delete = messages.order_by("-id")[0:batch_size].select_for_update(
-                of=("self",)
+                # We're deleting, so a FOR UPDATE lock is needed.
+                no_key=False,
+                of=("self",),
             )
             if not messages_to_delete:
                 break

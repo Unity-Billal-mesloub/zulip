@@ -1,10 +1,11 @@
 // See the Zulip URL spec at https://zulip.com/api/zulip-urls
 
 import {type NarrowTerm, narrow_operator_schema} from "./state_data.ts";
+import * as util from "./util.ts";
 
 export function get_hash_category(hash?: string): string {
     // given "#channels/subscribed", returns "channels"
-    return hash ? hash.replace(/^#/, "").split(/\//)[0]! : "";
+    return hash ? hash.replace(/^#/, "").split(/\//, 1)[0]! : "";
 }
 
 export function get_hash_section(hash?: string): string {
@@ -46,7 +47,7 @@ export function is_same_server_message_link(url: string): boolean {
         get_hash_category(url) === "narrow" &&
         (get_hash_section(url) === "channel" || get_hash_section(url) === "dm") &&
         get_nth_hash_section(url, -2) === "near" &&
-        /^\d+$/.test(get_nth_hash_section(url, -1))
+        util.is_numeric_string(get_nth_hash_section(url, -1))
     );
 }
 
@@ -134,6 +135,9 @@ export function is_an_allowed_web_public_narrow(
 export const allowed_web_public_narrow_operators = [
     "channels",
     "channel",
+    // This is sent as an anchor to the server rather
+    // than a narrow operator, but is part of the fragment.
+    "date",
     "streams",
     "stream",
     "topic",

@@ -195,36 +195,41 @@ p.n-margin {
     margin: 0;
 }
 
-.history-limited-box {
-    color: hsl(16deg 60% 45%);
-    border: 1px solid hsl(16deg 60% 45%);
-    box-shadow: 0 0 2px hsl(16deg 60% 45%);
-}
+.all-messages-search-caution,
+.combined-feed-notice {
+    display: none;
 
-.all-messages-search-caution {
-    border: 1px solid hsl(192deg 19% 75% / 20%);
-    box-shadow: 0 0 2px hsl(192deg 19% 75% / 20%);
+    .all-messages-search-caution-info,
+    .combined-feed-notice-info {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+    }
 }
 
 .history-limited-box,
-.all-messages-search-caution {
-    border-radius: 4px;
-    display: none;
+.all-messages-search-caution,
+.combined-feed-notice {
     margin: 0 auto 12px;
     padding: 5px;
-    /* Difference should be 16px to accommodate the icon. */
-    /* This emulates hanging indent. */
-    padding-left: 26px;
-    text-indent: -10px;
-
-    .all-messages-search-caution-icon {
-        margin: 0 3px 0 1px;
-    }
 
     & p {
         margin: 0;
         padding: 4px;
     }
+}
+
+.history-limited-box {
+    border-radius: 4px;
+    display: none;
+    /* Difference should be 16px to accommodate the icon. */
+    /* This emulates hanging indent. */
+    padding-left: 26px;
+    text-indent: -10px;
+    color: hsl(16deg 60% 45%);
+    border: 1px solid hsl(16deg 60% 45%);
+    box-shadow: 0 0 2px hsl(16deg 60% 45%);
 }
 
 .messages-logo-svg {
@@ -327,6 +332,7 @@ p.n-margin {
     & h3 {
         font-size: 16pt;
         margin-top: 2px;
+        font-weight: 300;
     }
 
     .exit-me {
@@ -612,6 +618,7 @@ body.has-overlay-scrollbar {
     }
 
     .column-right .right-sidebar {
+        box-sizing: border-box;
         padding-left: var(--right-sidebar-left-spacing);
         width: var(--right-sidebar-width);
     }
@@ -724,12 +731,6 @@ li,
 .table th,
 .table td {
     line-height: inherit;
-}
-
-.bootstrap-btn {
-    font-size: inherit;
-    height: auto;
-    line-height: 100%;
 }
 
 /* Classes which style copy buttons */
@@ -1383,7 +1384,8 @@ div.topic_edit_spinner .loading_indicator_spinner {
     padding: var(--input-vertical-padding) var(--input-horizontal-padding);
     color: var(--color-text-default);
     border-radius: 4px;
-    border: var(--input-border-width) solid hsl(0deg 0% 80%);
+    border: var(--input-border-width) solid var(--color-border-legacy-input);
+    background-color: var(--color-background-legacy-input);
     box-shadow: inset 0 1px 1px hsl(0deg 0% 0% / 7.5%);
     transition:
         border-color linear 0.2s,
@@ -1391,7 +1393,7 @@ div.topic_edit_spinner .loading_indicator_spinner {
     font-family: inherit;
 
     &:focus {
-        border-color: hsl(206deg 80% 62% / 80%);
+        border-color: var(--color-border-legacy-input-focus);
         outline: 0;
         box-shadow:
             inset 0 1px 1px hsl(0deg 0% 0% / 7.5%),
@@ -1414,6 +1416,7 @@ div.topic_edit_spinner .loading_indicator_spinner {
     font-size: 1.5em;
     font-weight: 400;
     line-height: inherit;
+    margin: 10px 0;
     overflow-wrap: break-word;
 }
 
@@ -1422,6 +1425,16 @@ div.topic_edit_spinner .loading_indicator_spinner {
 
     .search-query-word {
         overflow-wrap: break-word;
+    }
+}
+
+.empty-feed-notice-action {
+    display: none;
+    font-size: 1.1em;
+
+    .search-shared-history {
+        display: inline-block;
+        margin-top: 10px;
     }
 }
 
@@ -1843,7 +1856,9 @@ body:not(.spectator-view) {
     }
 
     .app-main .column-right.expanded .right-sidebar,
-    .app-main .column-left.expanded .left-sidebar {
+    .app-main .column-left.expanded .left-sidebar,
+    .app-main #left-sidebar.zoom-in-topics #left-sidebar-modal,
+    .app-main #left-sidebar.zoom-in-conversations #left-sidebar-modal {
         width: 100vw;
         max-width: 100%;
     }
@@ -2198,6 +2213,21 @@ body:not(.spectator-view) {
 }
 
 .dropdown-list-container {
+    /* For hidden searchbox dropdowns, when the user uses a click to open
+       the dropdown, we focus this container, so that the rest of the
+       keyboard navigation has the right container. That itself doesn't
+       introduce focus-visible. But hotkeys.ts uses a programmatic click
+       which goes through the same path and invokes focus-visible.
+    */
+    &:focus-visible {
+        outline: none;
+    }
+
+    .dropdown-list-viewport-padding {
+        padding-top: 4px;
+        padding-bottom: 4px;
+    }
+
     .dropdown-list-wrapper {
         /* Sync with `max-height` in dropdown_widget. */
         max-height: 210px;
@@ -2248,12 +2278,9 @@ body:not(.spectator-view) {
     .dropdown-list .dropdown-list-item-common-styles {
         display: grid;
         grid-template:
-            "privacy-icon     item-label       " min-content
-            "item-description item-description" minmax(0, min-content) / minmax(
-                0,
-                auto
-            )
-            minmax(0, 1fr);
+            "item-label" min-content
+            "item-description" minmax(0, min-content)
+            / minmax(0, 1fr);
         color: var(--color-dropdown-item);
         padding: 3px 10px 3px 8px;
         font-weight: 400;
@@ -2263,28 +2290,29 @@ body:not(.spectator-view) {
            vertically centered properly. */
         line-height: 1.214;
 
-        .channel-privacy-type-icon,
-        .zulip-icon-deactivated-circle {
-            grid-area: privacy-icon;
-            line-height: 1.214;
-            font-size: 0.93em;
-            /* We set only the width so that flexbox
-            can do its work to properly center,
-            regardless of the height. */
-            width: 0.93em;
-            padding-right: 5px;
-            padding-left: 0;
-            /* Override the [data-tippy-root] style in
-               `tooltips.css`.
-               Because we are manually holding icon
-               alignment to the first/only line of a
-               channel, we make this adjustment here.
-               Calculated by eye to look good at 12px-20px. */
-            top: 0.05em;
+        .decorated-channel-name-wrapper,
+        .dropdown-list-item-direct-message,
+        .dropdown-list-item-setting-disabled-option,
+        .dropdown-list-item-channel-mapping {
+            grid-area: item-label;
+            display: flex;
+            gap: var(--dropdown-list-item-label-icon-gap);
+
+            .zulip-icon {
+                font-size: 0.9375em; /* 15px at 16px/1em */
+            }
         }
 
-        .decorated-channel-name {
-            grid-area: item-label;
+        .decorated-channel-name-wrapper .channel-privacy-type-icon,
+        .dropdown-list-item-icon {
+            line-height: 1.214;
+        }
+
+        .dropdown-list-item-channel-mapping .zulip-icon {
+            position: relative;
+            /* Calculated from visual inspection
+               to look good for 12px-20px font sizes. */
+            top: 0.1467em; /* 2.2px at 15px/1em */
         }
 
         .dropdown-list-item-description {
@@ -2344,36 +2372,51 @@ body:not(.spectator-view) {
             }
         }
     }
-}
-
-.dropdown-list-container .list-item {
-    color: var(--color-dropdown-item);
-
-    &:focus,
-    &.current_selection {
-        background-color: var(--background-color-active-dropdown-item);
-        outline: none;
-    }
-}
-
-.inbox-filter-dropdown-list-container,
-.recent-view-filter-dropdown-list-container,
-.folder-filter-dropdown-list-container,
-.stream_settings_filter-dropdown-list-container,
-.user_group_visibility_settings-dropdown-list-container {
-    overflow: visible;
 
     .list-item {
-        &:focus {
-            border-radius: 4px;
-            outline: 1px solid var(--color-outline-focus) !important;
-            outline-offset: -2px;
-            background-color: transparent;
+        border-radius: 4px;
+        margin: 0 4px;
+        position: relative;
+        color: var(--color-dropdown-item);
+
+        &:focus,
+        &.current_selection {
+            outline: none;
+            background-color: var(
+                --background-color-current-selection-dropdown-item
+            );
+
+            &:not(.highlight_value):hover {
+                background-color: transparent;
+            }
         }
 
-        &.current_user_setting {
-            background-color: var(--background-color-active-dropdown-item);
-            outline: none;
+        &:focus::before,
+        &.current_selection::before {
+            content: "";
+            position: absolute;
+            left: -3px;
+            top: 0;
+            bottom: 0;
+            width: 3px;
+            background-color: var(--color-outline-focus);
+            border-radius: 4px;
+        }
+
+        .dropdown-list-item-common-styles {
+            padding: 5px 6px;
+            border-radius: 4px;
+        }
+
+        &.highlight_value {
+            background-color: var(
+                --background-color-current-setting-dropdown-item
+            );
+
+            .dropdown-list-text-selected,
+            .setting-disabled-option-text {
+                color: var(--color-current-setting-dropdown-item);
+            }
         }
     }
 }
@@ -2388,7 +2431,6 @@ body:not(.spectator-view) {
     display: flex;
     align-items: center;
     justify-content: flex-end;
-    flex-grow: 1;
     color: var(--color-failed-message-send-icon);
 
     .zulip-icon {
@@ -2426,7 +2468,8 @@ body:not(.spectator-view) {
         text-decoration: none;
     }
 
-    &:hover {
+    &:hover,
+    .navbar-item.active-navbar-menu & {
         background-color: var(--color-header-button-hover);
     }
 

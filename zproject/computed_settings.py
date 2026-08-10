@@ -35,6 +35,7 @@ from .configured_settings import (
     DEFAULT_RATE_LIMITING_RULES,
     EMAIL_BACKEND,
     EMAIL_HOST,
+    EMAIL_MAX_CONNECTION_LIFETIME_IN_MINUTES,
     ERROR_REPORTING,
     EXTERNAL_HOST,
     EXTERNAL_HOST_WITHOUT_PORT,
@@ -186,7 +187,7 @@ RUNNING_OPENAPI_CURL_TEST = False
 # This is overridden in test_settings.py for the test suites
 GENERATE_STRIPE_FIXTURES = False
 # This is overridden in test_settings.py for the test suites
-GENERATE_LITELLM_FIXTURES = False
+GENERATE_LLM_FIXTURES = False
 # This is overridden in test_settings.py for the test suites
 BAN_CONSOLE_OUTPUT = False
 # This is overridden in test_settings.py for the test suites
@@ -299,6 +300,9 @@ TORNADO_PROCESSES = len(TORNADO_PORTS)
 RUNNING_INSIDE_TORNADO = (
     len(sys.argv) > 1 and "manage.py" in sys.argv[0] and sys.argv[1] == "runtornado"
 )
+
+if RUNNING_INSIDE_TORNADO:
+    ROOT_URLCONF = "zproject.tornado_urls"
 
 SILENCED_SYSTEM_CHECKS = [
     # auth.W004 checks that the UserProfile field named by USERNAME_FIELD has
@@ -441,13 +445,6 @@ CACHES: dict[str, dict[str, object]] = {
 
 # Merge any local overrides with the default rules.
 RATE_LIMITING_RULES = {**DEFAULT_RATE_LIMITING_RULES, **RATE_LIMITING_RULES}
-
-# List of domains that, when applied to a request in a Tornado process,
-# will be handled with the separate in-memory rate limiting backend for Tornado,
-# which has its own buckets separate from the default backend.
-# In principle, it should be impossible to make requests to tornado that fall into
-# other domains, but we use this list as an extra precaution.
-RATE_LIMITING_DOMAINS_FOR_TORNADO = ["api_by_user", "api_by_ip"]
 
 # These ratelimits are also documented publicly at
 # https://zulip.readthedocs.io/en/latest/production/email-gateway.html
@@ -1175,6 +1172,7 @@ SOCIAL_AUTH_GOOGLE_SECRET = get_secret("social_auth_google_secret")
 GOOGLE_OAUTH2_CLIENT_SECRET = get_secret("google_oauth2_client_secret")
 SOCIAL_AUTH_GOOGLE_KEY = SOCIAL_AUTH_GOOGLE_KEY or GOOGLE_OAUTH2_CLIENT_ID
 SOCIAL_AUTH_GOOGLE_SECRET = SOCIAL_AUTH_GOOGLE_SECRET or GOOGLE_OAUTH2_CLIENT_SECRET
+SOCIAL_AUTH_DISCORD_SECRET = get_secret("social_auth_discord_secret")
 
 if PRODUCTION:
     SOCIAL_AUTH_SAML_SP_PUBLIC_CERT = get_from_file_if_exists("/etc/zulip/saml/zulip-cert.crt")
@@ -1239,8 +1237,11 @@ elif not EMAIL_HOST:
     WARN_NO_EMAIL = True
     EMAIL_BACKEND = "django.core.mail.backends.dummy.EmailBackend"
 else:
-    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-
+    # Route '0' to Django's default, everything else to custom class
+    if EMAIL_MAX_CONNECTION_LIFETIME_IN_MINUTES == 0:
+        EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    else:
+        EMAIL_BACKEND = "zproject.email_backends.PersistentSMTPEmailBackend"
 EMAIL_TIMEOUT = 15
 
 if DEVELOPMENT:
@@ -1274,6 +1275,17 @@ MOBILE_NOTIFICATIONS_SHARDS = int(
     get_config("application_server", "mobile_notification_shards", "1")
 )
 USER_ACTIVITY_SHARDS = int(get_config("application_server", "user_activity_shards", "1"))
+
+# Process soft reactivations in their own queue and worker process instead of
+# sharing deferred_work. This lives here, not in default_settings, because it
+# can only be configured via zulip.conf: enabling it requires a puppet apply
+# to actually run the dedicated worker, so a settings.py override would be
+# ineffective. Off by default so small servers don't pay for an extra worker
+# process; large servers can enable it so reactivations aren't delayed behind
+# long deferred_work jobs such as realm exports.
+DEDICATED_SOFT_REACTIVATION_QUEUE = get_config(
+    "application_server", "dedicated_soft_reactivation_queue", False
+)
 
 TWO_FACTOR_PATCH_ADMIN = False
 

@@ -114,6 +114,36 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.assert_json_error(result, "Bad name or username")
         self.assert_num_bots_equal(0)
 
+    def test_add_bot_demo_organization_restrictions(self) -> None:
+        demo_owner_account = self.create_demo_organization_owner()
+        realm = demo_owner_account.realm
+        bot_info = {
+            "full_name": "Demo organization bot",
+            "short_name": "demobot",
+            "bot_type": "1",
+        }
+
+        # Confirm owner account has no associated bots.
+        result = self.client_get("/json/bots", subdomain=realm.subdomain)
+        response_dict = self.assert_json_success(result)
+        self.assert_length(response_dict["bots"], 0)
+
+        # Bot creation is restricted before demo organization owner email set.
+        result = self.client_post("/json/bots", bot_info, subdomain=realm.subdomain)
+        self.assert_json_error(result, "Configure owner account email address.")
+
+        # Set owner email account.
+        demo_owner_account.delivery_email = "demo-owner-test@zulip.com"
+        demo_owner_account.save()
+
+        result = self.client_post("/json/bots", bot_info, subdomain=realm.subdomain)
+        self.assert_json_success(result)
+
+        # Confirm owner account now has one associated bot.
+        result = self.client_get("/json/bots", subdomain=realm.subdomain)
+        response_dict = self.assert_json_success(result)
+        self.assert_length(response_dict["bots"], 1)
+
     @override_settings(FAKE_EMAIL_DOMAIN="invaliddomain", REALM_HOSTS={"zulip": "127.0.0.1"})
     def test_add_bot_with_invalid_fake_email_domain(self) -> None:
         self.login("hamlet")
@@ -168,7 +198,6 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.assert_json_success(users_result)
 
     def test_add_bot(self) -> None:
-        hamlet = self.example_user("hamlet")
         self.login("hamlet")
         self.assert_num_bots_equal(0)
         with self.capture_send_event_calls(expected_num_events=4) as events:
@@ -186,18 +215,11 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
                 type="realm_bot",
                 op="add",
                 bot=dict(
-                    email="hambot-bot@zulip.testserver",
                     user_id=bot.id,
-                    bot_type=bot.bot_type,
-                    full_name="The Bot of Hamlet",
-                    is_active=True,
-                    api_key=result["api_key"],
-                    avatar_url=result["avatar_url"],
                     default_sending_stream=None,
                     default_events_register_stream=None,
                     default_all_public_streams=False,
                     services=[],
-                    owner_id=hamlet.id,
                 ),
             ),
             event["event"],
@@ -242,6 +264,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.get_bot_user(email)
 
     def test_add_bot_with_username_in_use(self) -> None:
+        hamlet = self.example_user("hamlet")
         self.login("hamlet")
         self.assert_num_bots_equal(0)
         self.create_bot()
@@ -264,6 +287,17 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         )
         result = self.client_post("/json/bots", bot_info)
         self.assert_json_error(result, "Name is already in use.")
+
+        # Duplicate names are not allowed for bots even when require_unique_names
+        # is false, but this test is added just for completion.
+        dup_full_name = hamlet.full_name
+        do_set_realm_property(hamlet.realm, "require_unique_names", True, acting_user=None)
+        bot_info = dict(
+            full_name=dup_full_name,
+            short_name="whatever",
+        )
+        result = self.client_post("/json/bots", bot_info)
+        self.assert_json_error(result, "Unique names required in this organization.")
 
     def test_add_bot_with_user_avatar(self) -> None:
         email = "hambot-bot@zulip.testserver"
@@ -338,7 +372,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.login_user(user)
         self.assert_num_bots_equal(0)
         with self.capture_send_event_calls(expected_num_events=4) as events:
-            result = self.create_bot()
+            self.create_bot()
         self.assert_num_bots_equal(1)
 
         email = "hambot-bot@zulip.testserver"
@@ -350,18 +384,11 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
                 type="realm_bot",
                 op="add",
                 bot=dict(
-                    email="hambot-bot@zulip.testserver",
                     user_id=bot.id,
-                    bot_type=bot.bot_type,
-                    full_name="The Bot of Hamlet",
-                    is_active=True,
-                    api_key=result["api_key"],
-                    avatar_url=result["avatar_url"],
                     default_sending_stream=None,
                     default_events_register_stream=None,
                     default_all_public_streams=False,
                     services=[],
-                    owner_id=user.id,
                 ),
             ),
             event["event"],
@@ -449,18 +476,11 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
                 type="realm_bot",
                 op="add",
                 bot=dict(
-                    email="hambot-bot@zulip.testserver",
                     user_id=profile.id,
-                    full_name="The Bot of Hamlet",
-                    bot_type=profile.bot_type,
-                    is_active=True,
-                    api_key=result["api_key"],
-                    avatar_url=result["avatar_url"],
                     default_sending_stream="Denmark",
                     default_events_register_stream=None,
                     default_all_public_streams=False,
                     services=[],
-                    owner_id=user_profile.id,
                 ),
             ),
             event["event"],
@@ -532,18 +552,11 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
                 type="realm_bot",
                 op="add",
                 bot=dict(
-                    email="hambot-bot@zulip.testserver",
-                    full_name="The Bot of Hamlet",
                     user_id=bot_profile.id,
-                    bot_type=bot_profile.bot_type,
-                    is_active=True,
-                    api_key=result["api_key"],
-                    avatar_url=result["avatar_url"],
                     default_sending_stream=None,
                     default_events_register_stream="Denmark",
                     default_all_public_streams=False,
                     services=[],
-                    owner_id=user_profile.id,
                 ),
             ),
             event["event"],
@@ -1962,8 +1975,10 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.assertEqual(
             m.output,
             [
-                "WARNING:root:Overriding HTTP method via 'method' parameter: "
-                f"original={result.request['REQUEST_METHOD']}, override={bot_info['method']}, client={request_notes.client_name}"
+                (
+                    "WARNING:root:Overriding HTTP method via 'method' parameter: "
+                    f"original={result.request['REQUEST_METHOD']}, override={bot_info['method']}, client={request_notes.client_name}"
+                )
             ],
         )
 

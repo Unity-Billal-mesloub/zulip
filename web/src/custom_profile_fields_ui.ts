@@ -1,5 +1,5 @@
 import flatpickr from "flatpickr";
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -32,9 +32,9 @@ export function append_custom_profile_fields(element_id: string, user_id: number
     const all_field_types = realm.custom_profile_field_types;
 
     const all_field_template_types = new Map([
-        [all_field_types.LONG_TEXT.id, "text"],
+        [all_field_types.PARAGRAPH.id, "text"],
         [all_field_types.SHORT_TEXT.id, "text"],
-        [all_field_types.SELECT.id, "select"],
+        [all_field_types.DROPDOWN.id, "select"],
         [all_field_types.USER.id, "user"],
         [all_field_types.DATE.id, "date"],
         [all_field_types.EXTERNAL_ACCOUNT.id, "text"],
@@ -48,11 +48,11 @@ export function append_custom_profile_fields(element_id: string, user_id: number
             rendered_value: "",
         };
         const editable_by_user = current_user.is_admin || field.editable_by_user;
-        const is_select_field = field.type === all_field_types.SELECT.id;
+        const is_dropdown_field = field.type === all_field_types.DROPDOWN.id;
         const field_choices = [];
 
-        if (is_select_field) {
-            const field_choice_dict = settings_components.select_field_data_schema.parse(
+        if (is_dropdown_field) {
+            const field_choice_dict = settings_components.custom_profile_field_choices_schema.parse(
                 JSON.parse(field.field_data),
             );
             for (const [value, {order, text}] of Object.entries(field_choice_dict)) {
@@ -68,12 +68,12 @@ export function append_custom_profile_fields(element_id: string, user_id: number
             field,
             field_type: all_field_template_types.get(field.type),
             field_value,
-            is_long_text_field: field.type === all_field_types.LONG_TEXT.id,
+            is_long_text_field: field.type === all_field_types.PARAGRAPH.id,
             is_user_field: field.type === all_field_types.USER.id,
             is_date_field: field.type === all_field_types.DATE.id,
             is_url_field: field.type === all_field_types.URL.id,
             is_pronouns_field: field.type === all_field_types.PRONOUNS.id,
-            is_select_field,
+            is_dropdown_field,
             field_choices,
             for_manage_user_modal: element_id === "#edit-user-form .custom-profile-field-form",
             is_empty_required_field: field.required && !field_value.value,
@@ -171,20 +171,14 @@ export function initialize_custom_user_type_fields(
 
             if (is_target_element_editable && !is_disabled) {
                 const $input = $pill_container.children(".input");
+                pill_typeahead.set_up_user($input, pills, {exclude_bots: true});
                 if (pill_update_handler) {
-                    const update_func = (): void => {
+                    pills.onPillCreate(() => {
                         pill_update_handler(field, pills);
-                    };
-                    const opts = {
-                        update_func,
-                        exclude_bots: true,
-                    };
-                    pill_typeahead.set_up_user($input, pills, opts);
+                    });
                     pills.onPillRemove(() => {
                         pill_update_handler(field, pills);
                     });
-                } else {
-                    pill_typeahead.set_up_user($input, pills, {exclude_bots: true});
                 }
             }
             user_pills.set(field.id, pills);
@@ -245,6 +239,14 @@ export function format_date(date: Date | undefined, format: string): string {
     return flatpickr.formatDate(date, format);
 }
 
+// The "has-date" class controls the clear-date button's visibility,
+// so derive it from the visible alt input's value.
+function update_has_date_class($custom_user_field: JQuery): void {
+    const has_value =
+        $custom_user_field.find<HTMLInputElement>(".date-field-alt-input").val()!.length > 0;
+    $custom_user_field.toggleClass("has-date", has_value);
+}
+
 export function initialize_custom_date_type_fields(
     element_id: string,
     user_id: number,
@@ -286,6 +288,7 @@ export function initialize_custom_date_type_fields(
             );
             const original_value = people.get_custom_profile_data(user_id, field_id)?.value ?? "";
             instance.setDate(original_value);
+            update_has_date_class($input_elem.closest(".custom_user_field"));
             if (!for_profile_settings_panel) {
                 // Trigger "input" event so that save button state can
                 // be toggled in "Manage user" modal.
@@ -326,7 +329,6 @@ export function initialize_custom_date_type_fields(
         altInputClass: "date-field-alt-input " + common_class_name,
         altFormat: "F j, Y",
         allowInput: true,
-        static: true,
         // This helps us in accepting inputs in other formats
         // like MM/DD/YYYY and basically any other format
         // which is accepted by Date.
@@ -338,8 +340,20 @@ export function initialize_custom_date_type_fields(
         // values.
         formatDate: format_date,
         allowInvalidPreload: true,
+        // Close the date picker on scroll, since flatpickr leaves the
+        // open calendar in place and it would drift away from the input.
+        onOpen(_selected_dates, _date_str, instance) {
+            window.addEventListener(
+                "scroll",
+                () => {
+                    instance.close();
+                },
+                {capture: true, once: true},
+            );
+        },
         onChange(_selected_dates, date_str, instance) {
             update_date(instance, date_str);
+            update_has_date_class($(instance.element).closest(".custom_user_field"));
         },
     });
 
@@ -376,23 +390,26 @@ export function initialize_custom_date_type_fields(
         });
 
     $(element_id)
-        .find<HTMLInputElement>(".custom_user_field input.datepicker")
-        .on("mouseenter", function () {
-            if ($(this).val()!.length <= 0) {
-                $(this).parent().find(".remove_date").hide();
-            } else {
-                $(this).parent().find(".remove_date").show();
-            }
-        });
-
-    $(element_id)
         .find(".custom_user_field .remove_date")
         .on("click", function () {
             const $custom_user_field = $(this).parent().find(".custom_user_field_value");
             const $displayed_input = $(this).parent().find(".date-field-alt-input");
             $displayed_input.val("");
             $custom_user_field.val("");
+            update_has_date_class($(this).closest(".custom_user_field"));
             $custom_user_field.trigger("input");
+        });
+
+    $(element_id)
+        .find<HTMLInputElement>("input.date-field-alt-input")
+        .on("input", function () {
+            update_has_date_class($(this).closest(".custom_user_field"));
+        });
+
+    $(element_id)
+        .find(".custom_user_field .datepicker")
+        .each(function () {
+            update_has_date_class($(this).closest(".custom_user_field"));
         });
 }
 
@@ -410,15 +427,16 @@ export function initialize_custom_pronouns_type_fields(element_id: string): void
                 type: "input" as const,
             };
             new Typeahead(bootstrap_typeahead_input, {
-                helpOnEmptyStrings: true,
+                helpOnEmptyStrings: () => true,
                 source() {
                     return commonly_used_pronouns;
                 },
                 sorter(items, query) {
                     return bootstrap_typeahead.defaultSorter(items, query);
                 },
-                item_html(item) {
-                    return typeahead_helper.render_typeahead_item({primary: item});
+                item_html(_query: string) {
+                    return (item: string) =>
+                        typeahead_helper.render_typeahead_item({primary: item});
                 },
             });
         });

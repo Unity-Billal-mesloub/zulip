@@ -10,18 +10,18 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.errors import HeaderDefect
 from email.headerregistry import Address
 from typing import Any, TypeAlias
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import urlsplit
 
 import orjson
 import requests
-from django.conf import settings
 from django.forms.models import model_to_dict
 from django.utils.timezone import now as timezone_now
 
 from zerver.data_import.import_util import (
+    AttachmentRecordData,
+    ImportedBotEmail,
     UploadFileRequest,
     UploadRecordData,
     ZerverFieldsT,
@@ -41,12 +41,15 @@ from zerver.data_import.import_util import (
     download_and_export_upload_file,
     get_attachment_path_and_content,
     get_data_file,
+    get_domain_name_for_import,
     long_term_idle_helper,
     make_subscriber_map,
     process_avatars,
     process_emojis,
     request_file_stream,
+    scrub_missing_upload_records_after_download,
     validate_user_emails_for_import,
+    write_response_file_stream_to_path,
 )
 from zerver.data_import.sequencer import NEXT_ID
 from zerver.data_import.slack_message_conversion import (
@@ -63,6 +66,7 @@ from zerver.lib.parallel import run_parallel_queue
 from zerver.lib.partial import partial
 from zerver.lib.storage import static_path
 from zerver.lib.thumbnail import THUMBNAIL_ACCEPT_IMAGE_TYPES, resize_realm_icon
+from zerver.lib.topic_link_util import get_stream_topic_link_syntax
 from zerver.lib.validator import to_wild_value
 from zerver.models import (
     CustomProfileField,
@@ -79,7 +83,6 @@ SlackToZulipUserIDT: TypeAlias = dict[str, int]
 AddedChannelsT: TypeAlias = dict[str, tuple[str, int]]
 AddedMPIMsT: TypeAlias = dict[str, tuple[str, int]]
 AddedDMsT: TypeAlias = dict[str, int]
-DMMembersT: TypeAlias = dict[str, tuple[str, str]]
 SlackToZulipRecipientT: TypeAlias = dict[str, int]
 
 
@@ -113,50 +116,20 @@ for emoji_dict in emoji_data:
 
 
 class SlackBotEmail:
-    duplicate_email_count: dict[str, int] = {}
-    # Mapping of `bot_id` to final email assigned to the bot.
-    assigned_email: dict[str, str] = {}
-
     @classmethod
     def get_email(cls, user_profile: ZerverFieldsT, domain_name: str) -> str:
         slack_bot_id = user_profile["bot_id"]
-        if slack_bot_id in cls.assigned_email:
-            return cls.assigned_email[slack_bot_id]
 
-        if "real_name_normalized" in user_profile:
-            slack_bot_name = user_profile["real_name_normalized"]
-        elif "first_name" in user_profile:
-            slack_bot_name = user_profile["first_name"]
-        else:
-            raise AssertionError("Could not identify bot type")
+        def bot_name_getter(_user_profile: ZerverFieldsT) -> str:
+            if "real_name_normalized" in _user_profile:
+                slack_bot_name = _user_profile["real_name_normalized"]
+            elif "first_name" in _user_profile:
+                slack_bot_name = _user_profile["first_name"]
+            else:
+                raise AssertionError("Could not identify bot type")
+            return slack_bot_name
 
-        email = Address(
-            username=slack_bot_name.replace("Bot", "").replace(" ", "").lower() + "-bot",
-            domain=domain_name,
-        ).addr_spec
-        # The address formed above may not be a valid email format - e.g. containing
-        # non-ASCII characters in the local part, if the slack_bot_name contains them.
-        # Only Address(addr_spec=...) triggers the necessary validation.
-        # Thus we call it here, and if issues are detected, we fall back to forming the
-        # email address in a safer way - using the bot id string.
-        try:
-            Address(addr_spec=email)
-        except HeaderDefect:
-            email = Address(
-                username=slack_bot_id + "-bot",
-                domain=domain_name,
-            ).addr_spec
-
-        if email in cls.duplicate_email_count:
-            cls.duplicate_email_count[email] += 1
-            address = Address(addr_spec=email)
-            email_username = address.username + "-" + str(cls.duplicate_email_count[email])
-            email = Address(username=email_username, domain=address.domain).addr_spec
-        else:
-            cls.duplicate_email_count[email] = 1
-
-        cls.assigned_email[slack_bot_id] = email
-        return email
+        return ImportedBotEmail.get_email(user_profile, domain_name, slack_bot_id, bot_name_getter)
 
 
 def rm_tree(path: str) -> None:
@@ -178,7 +151,6 @@ def slack_workspace_to_realm(
     AddedChannelsT,
     AddedMPIMsT,
     AddedDMsT,
-    DMMembersT,
     list[ZerverFieldsT],
     ZerverFieldsT,
 ]:
@@ -190,9 +162,8 @@ def slack_workspace_to_realm(
        name(channel names, mpim names, usernames, etc) to Zulip recipient id
     4. added_channels, which is a dictionary to map from channel name to channel id, Zulip stream_id
     5. added_mpims, which is a dictionary to map from MPIM name to MPIM id, Zulip direct_message_group_id
-    6. dm_members, which is a dictionary to map from DM id to tuple of DM participants.
-    7. avatars, which is list to map avatars to Zulip avatar records.json
-    8. emoji_url_map, which is maps emoji name to its Slack URL
+    6. avatars, which is list to map avatars to Zulip avatar records.json
+    7. emoji_url_map, which is maps emoji name to its Slack URL
     """
     NOW = float(timezone_now().timestamp())
 
@@ -211,7 +182,6 @@ def slack_workspace_to_realm(
         added_channels,
         added_mpims,
         added_dms,
-        dm_members,
         slack_recipient_name_to_zulip_recipient_id,
     ) = channels_to_zerver_stream(
         slack_data_dir, realm_id, realm, slack_user_id_to_zulip_user_id, zerver_userprofile
@@ -234,7 +204,6 @@ def slack_workspace_to_realm(
         added_channels,
         added_mpims,
         added_dms,
-        dm_members,
         avatars,
         emoji_url_map,
     )
@@ -572,7 +541,6 @@ def channels_to_zerver_stream(
     AddedChannelsT,
     AddedMPIMsT,
     AddedDMsT,
-    DMMembersT,
     SlackToZulipRecipientT,
 ]:
     """
@@ -581,8 +549,7 @@ def channels_to_zerver_stream(
     2. added_channels, which is a dictionary to map from channel name to channel id, Zulip stream_id
     3. added_mpims, which is a dictionary to map from MPIM(multiparty IM) name to MPIM id, Zulip
        direct_message_group_id
-    4. dm_members, which is a dictionary to map from DM id to tuple of DM participants.
-    5. slack_recipient_name_to_zulip_recipient_id, which is a dictionary to map from Slack recipient
+    4. slack_recipient_name_to_zulip_recipient_id, which is a dictionary to map from Slack recipient
        name(channel names, mpim names, usernames etc) to Zulip recipient_id
     """
     logging.info("######### IMPORTING CHANNELS STARTED #########\n")
@@ -592,7 +559,6 @@ def channels_to_zerver_stream(
     added_channels = {}
     added_mpims = {}
     added_dms = {}
-    dm_members = {}
     slack_recipient_name_to_zulip_recipient_id = {}
 
     realm["zerver_stream"] = []
@@ -716,63 +682,37 @@ def channels_to_zerver_stream(
         mpims = []
     process_mpims(mpims)
 
-    # This may have duplicated zulip user_ids, since we merge multiple
-    # Slack same-email shared-channel users into one Zulip dummy user
-    if not settings.PREFER_DIRECT_MESSAGE_GROUP:
-        zulip_user_to_recipient: dict[int, int] = {}
-        for slack_user_id, zulip_user_id in slack_user_id_to_zulip_user_id.items():
-            if zulip_user_id in zulip_user_to_recipient:
-                slack_recipient_name_to_zulip_recipient_id[slack_user_id] = zulip_user_to_recipient[
-                    zulip_user_id
-                ]
-                continue
-            recipient = build_recipient(zulip_user_id, recipient_id_count, Recipient.PERSONAL)
-            slack_recipient_name_to_zulip_recipient_id[slack_user_id] = recipient_id_count
-            zulip_user_to_recipient[zulip_user_id] = recipient_id_count
-            sub = build_subscription(recipient_id_count, zulip_user_id, subscription_id_count)
-            realm["zerver_recipient"].append(recipient)
-            realm["zerver_subscription"].append(sub)
-            recipient_id_count += 1
-            subscription_id_count += 1
-
     def process_dms(dms: list[dict[str, Any]]) -> None:
         nonlocal direct_message_group_id_count, recipient_id_count, subscription_id_count
 
         for dm in dms:
-            if settings.PREFER_DIRECT_MESSAGE_GROUP:
-                # Create direct message group for 1:1 DMs when the setting is enabled
-                direct_message_group = build_direct_message_group(
-                    direct_message_group_id_count, len(set(dm["members"]))
-                )
-                realm["zerver_huddle"].append(direct_message_group)
+            direct_message_group = build_direct_message_group(
+                direct_message_group_id_count, len(set(dm["members"]))
+            )
+            realm["zerver_huddle"].append(direct_message_group)
 
-                # Use DM id as the key for mapping, similar to mpims
-                added_dms[dm["id"]] = direct_message_group_id_count
+            # Use DM id as the key for mapping, similar to mpims
+            added_dms[dm["id"]] = direct_message_group_id_count
 
-                recipient = build_recipient(
-                    direct_message_group_id_count,
-                    recipient_id_count,
-                    Recipient.DIRECT_MESSAGE_GROUP,
-                )
-                realm["zerver_recipient"].append(recipient)
-                slack_recipient_name_to_zulip_recipient_id[dm["id"]] = recipient_id_count
+            recipient = build_recipient(
+                direct_message_group_id_count,
+                recipient_id_count,
+                Recipient.DIRECT_MESSAGE_GROUP,
+            )
+            realm["zerver_recipient"].append(recipient)
+            slack_recipient_name_to_zulip_recipient_id[dm["id"]] = recipient_id_count
 
-                subscription_id_count = get_subscription(
-                    dm["members"],
-                    realm["zerver_subscription"],
-                    recipient_id_count,
-                    slack_user_id_to_zulip_user_id,
-                    subscription_id_count,
-                )
+            subscription_id_count = get_subscription(
+                dm["members"],
+                realm["zerver_subscription"],
+                recipient_id_count,
+                slack_user_id_to_zulip_user_id,
+                subscription_id_count,
+            )
 
-                direct_message_group_id_count += 1
-                recipient_id_count += 1
-                logging.info("DM %s -> created as direct message group", dm["id"])
-            else:
-                # Original behavior for personal messages
-                user_a = dm["members"][0]
-                user_b = dm["members"][1]
-                dm_members[dm["id"]] = (user_a, user_b)
+            direct_message_group_id_count += 1
+            recipient_id_count += 1
+            logging.info("DM %s -> created as direct message group", dm["id"])
 
     try:
         dms = get_data_file(slack_data_dir + "/dms.json")
@@ -786,7 +726,6 @@ def channels_to_zerver_stream(
         added_channels,
         added_mpims,
         added_dms,
-        dm_members,
         slack_recipient_name_to_zulip_recipient_id,
     )
 
@@ -822,11 +761,10 @@ def process_long_term_idle_users(
     added_channels: AddedChannelsT,
     added_mpims: AddedMPIMsT,
     added_dms: AddedDMsT,
-    dm_members: DMMembersT,
     zerver_userprofile: list[ZerverFieldsT],
 ) -> set[int]:
     return long_term_idle_helper(
-        get_messages_iterator(slack_data_dir, added_channels, added_mpims, added_dms, dm_members),
+        get_messages_iterator(slack_data_dir, added_channels, added_mpims, added_dms),
         get_message_sending_user,
         get_timestamp_from_message,
         lambda id: slack_user_id_to_zulip_user_id[id],
@@ -844,7 +782,6 @@ def convert_slack_workspace_messages(
     added_channels: AddedChannelsT,
     added_mpims: AddedMPIMsT,
     added_dms: AddedDMsT,
-    dm_members: DMMembersT,
     realm: ZerverFieldsT,
     zerver_userprofile: list[ZerverFieldsT],
     zerver_realmemoji: list[ZerverFieldsT],
@@ -853,7 +790,7 @@ def convert_slack_workspace_messages(
     convert_slack_threads: bool,
     do_download_and_export_upload_file: Callable[[UploadFileRequest], None],
     chunk_size: int = MESSAGE_BATCH_CHUNK_SIZE,
-) -> tuple[list[ZerverFieldsT], list[UploadRecordData], list[ZerverFieldsT]]:
+) -> tuple[list[ZerverFieldsT], list[UploadRecordData], list[AttachmentRecordData]]:
     """
     Returns:
     1. reactions, which is a list of the reactions
@@ -868,18 +805,21 @@ def convert_slack_workspace_messages(
         added_channels,
         added_mpims,
         added_dms,
-        dm_members,
         zerver_userprofile,
     )
 
-    all_messages = get_messages_iterator(
-        slack_data_dir, added_channels, added_mpims, added_dms, dm_members
+    thread_reply_counts = count_thread_replies(
+        get_messages_iterator(slack_data_dir, added_channels, added_mpims, added_dms),
+        convert_slack_threads,
     )
+    all_messages = get_messages_iterator(slack_data_dir, added_channels, added_mpims, added_dms)
     logging.info("######### IMPORTING MESSAGES STARTED #########\n")
 
     total_reactions: list[ZerverFieldsT] = []
-    total_attachments: list[ZerverFieldsT] = []
+    total_attachments: list[AttachmentRecordData] = []
     total_uploads: list[UploadRecordData] = []
+    thread_counter: dict[str, int] = defaultdict(int)
+    thread_map: dict[str, ThreadMetadata] = {}
 
     dump_file_id = 1
 
@@ -897,11 +837,13 @@ def convert_slack_workspace_messages(
             zerver_realmemoji,
             subscriber_map,
             added_channels,
-            dm_members,
             domain_name,
             long_term_idle,
             convert_slack_threads,
             do_download_and_export_upload_file,
+            thread_counter,
+            thread_map,
+            thread_reply_counts,
         )
 
         message_json = dict(
@@ -928,14 +870,13 @@ def get_messages_iterator(
     added_channels: dict[str, Any],
     added_mpims: AddedMPIMsT,
     added_dms: AddedDMsT,
-    dm_members: DMMembersT,
 ) -> Iterator[ZerverFieldsT]:
     """This function is an iterator that returns all the messages across
     all Slack channels, in order by timestamp.  It's important to
     not read all the messages into memory at once, because for
     large imports that can OOM kill."""
 
-    dir_names = [*added_channels, *added_mpims, *added_dms, *dm_members]
+    dir_names = [*added_channels, *added_mpims, *added_dms]
     all_json_names: dict[str, list[str]] = defaultdict(list)
     for dir_name in dir_names:
         dir_path = os.path.join(slack_data_dir, dir_name)
@@ -969,7 +910,7 @@ def get_messages_iterator(
                     message["channel_name"] = dir_name
                 elif dir_name in added_mpims:
                     message["mpim_name"] = dir_name
-                elif dir_name in dm_members or dir_name in added_dms:
+                elif dir_name in added_dms:
                     message["pm_name"] = dir_name
                 messages.append(message)
             messages_for_one_day += messages
@@ -1002,7 +943,7 @@ def get_parent_user_id_from_thread_message(thread_message: ZerverFieldsT, subtyp
                 return thread_message["root"]["user"]
             except KeyError:
                 return thread_message["root"]["bot_id"]
-        elif thread_message["thread_ts"] == thread_message["ts"]:
+        elif is_thread_parent_message(thread_message):
             # This is the original thread message. We're following the logic recommended
             # in Slack's documentation here:
             # https://docs.slack.dev/messaging/retrieving-messages/#finding_threads
@@ -1066,9 +1007,170 @@ def get_zulip_thread_topic_name(
 class MessageConversionResult:
     zerver_message: list[ZerverFieldsT]
     zerver_usermessage: list[ZerverFieldsT]
-    zerver_attachment: list[ZerverFieldsT]
+    zerver_attachment: list[AttachmentRecordData]
     uploads_list: list[UploadRecordData]
     reaction_list: list[ZerverFieldsT]
+
+
+@dataclass
+class ThreadMetadata:
+    topic_link_syntax: str
+    topic_name: str
+
+
+MAIN_SLACK_IMPORT_TOPIC = "imported from Slack"
+
+
+def is_message_skipped_during_conversion(message: ZerverFieldsT) -> bool:
+    if not get_message_sending_user(message):
+        # Slack sometimes emits messages with no sending user.
+        return True
+    return message.get("subtype") in [
+        # Zulip doesn't have a pinned_item concept.
+        "pinned_item",
+        "unpinned_item",
+        # Slack's channel join/leave notices are spammy.
+        "channel_join",
+        "channel_leave",
+        "channel_name",
+    ]
+
+
+def is_thread_parent_message(message: ZerverFieldsT) -> bool:
+    """The first thread message has a "thread_ts" that matches its
+    "ts" field."""
+    thread_ts = message.get("thread_ts")
+    message_ts = message.get("ts")
+
+    return isinstance(thread_ts, str) and isinstance(message_ts, str) and (thread_ts == message_ts)
+
+
+def get_thread_key(message: ZerverFieldsT) -> str:
+    subtype = message.get("subtype", False)
+    parent_user_id = get_parent_user_id_from_thread_message(message, subtype)
+    return f"{message['thread_ts']}-{parent_user_id}"
+
+
+def is_slack_thread_message(convert_slack_threads: bool, message: ZerverFieldsT) -> bool:
+    return convert_slack_threads and "thread_ts" in message
+
+
+def count_thread_replies(
+    all_messages: Iterator[ZerverFieldsT], convert_slack_threads: bool
+) -> dict[str, int]:
+    """`get_thread_reply_notification` creates, for each thread parent, a
+    cross-linking notification containing the number of thread replies and
+    a thread topic link, which will be appended to the thread parent message.
+    Because messages are converted and written to disk in chunks, a thread's
+    parent and its replies can land in different chunks, so the final reply
+    count isn't known when the parent message is written.
+
+    This pre-scans the whole message stream to count, per thread, how many
+    replies will be imported.
+    """
+    thread_reply_counts: dict[str, int] = defaultdict(int)
+    if not convert_slack_threads:
+        return thread_reply_counts
+
+    for message in all_messages:
+        if not is_slack_thread_message(convert_slack_threads, message):
+            continue
+        if is_message_skipped_during_conversion(message):
+            continue
+
+        # Compute the key on every thread message so the thread parent's
+        # user id is cached in thread_parent_map before its replies (which
+        # may omit parent_user_id) look it up; see get_thread_key.
+        thread_key = get_thread_key(message)
+        if not is_thread_parent_message(message):
+            thread_reply_counts[thread_key] += 1
+
+    return thread_reply_counts
+
+
+def get_thread_reply_notification(
+    convert_slack_threads: bool,
+    message: ZerverFieldsT,
+    thread_map: dict[str, ThreadMetadata],
+    thread_reply_counts: dict[str, int],
+) -> str:
+    """This creates a notification that contains a link to
+    the given message's thread topic.
+
+    e.g "*3 replies in #**channel>2023-05-23 foobar***"
+    """
+    if not is_slack_thread_message(convert_slack_threads, message):
+        return ""
+
+    if not is_thread_parent_message(message):
+        # Only the parent message carries the cross-linking notice.
+        return ""
+
+    thread_key = get_thread_key(message)
+    if thread_key not in thread_map:
+        # This could be a DM or a thread whose parent message wasn't imported.
+        return ""
+
+    number_of_replies = thread_reply_counts.get(thread_key, 0)
+    if number_of_replies < 1:
+        # This could happen if only part of the Slack workspace history was
+        # exported, or if the thread's replies were deleted.
+        return ""
+
+    reply_string = "replies" if number_of_replies > 1 else "reply"
+    # e.g "\n\n*3 replies in #**channel>2023-05-23 foobar***"
+    return f"\n\n*{number_of_replies} {reply_string} in {thread_map[thread_key].topic_link_syntax}*"
+
+
+def create_topic_name_for_message(
+    added_channels: AddedChannelsT,
+    channel_name: str | None,
+    content: str,
+    convert_slack_threads: bool,
+    is_direct_message_type: bool,
+    message: ZerverFieldsT,
+    thread_counter: dict[str, int],
+    thread_map: dict[str, ThreadMetadata],
+) -> str:
+    if is_direct_message_type:
+        return ""
+
+    assert channel_name is not None
+
+    # Slack's unthreaded messages go into a single topic, while
+    # threaded messages are put into separate thread topics.
+    if not is_slack_thread_message(convert_slack_threads, message):
+        return MAIN_SLACK_IMPORT_TOPIC
+
+    thread_ts = message["thread_ts"]
+    thread_ts_datetime = datetime.fromtimestamp(float(thread_ts), tz=timezone.utc)
+    thread_ts_str = thread_ts_datetime.strftime(r"%Y/%m/%d %H:%M:%S")
+    thread_key = get_thread_key(message)
+
+    if is_thread_parent_message(message):
+        # Send the thread parent message to the main import topic; the
+        # cross-linking notice to the thread topic is appended by
+        # get_thread_reply_notification.
+        thread_topic_name = get_zulip_thread_topic_name(content, thread_ts_datetime, thread_counter)
+
+        thread_map[thread_key] = ThreadMetadata(
+            topic_link_syntax=get_stream_topic_link_syntax(
+                stream_id=added_channels[channel_name][1],
+                stream_name=channel_name,
+                topic_name=thread_topic_name,
+            ),
+            topic_name=thread_topic_name,
+        )
+        return MAIN_SLACK_IMPORT_TOPIC
+    elif thread_key in thread_map:
+        # For thread replies, send them to the thread topic.
+        # TODO: Make the first reply in the thread quote the thread message
+        # in the main topic.
+        return thread_map[thread_key].topic_name
+    else:
+        # This can occur when the original thread message isn't imported,
+        # such as when only a slice of the chat history is imported.
+        return f"{thread_ts_str} No channel message"
 
 
 def channel_message_to_zerver_message(
@@ -1080,40 +1182,29 @@ def channel_message_to_zerver_message(
     zerver_realmemoji: list[ZerverFieldsT],
     subscriber_map: dict[int, set[int]],
     added_channels: AddedChannelsT,
-    dm_members: DMMembersT,
     domain_name: str,
     long_term_idle: set[int],
     convert_slack_threads: bool,
     do_download_and_export_upload_file: Callable[[UploadFileRequest], None],
+    thread_counter: dict[str, int],
+    thread_map: dict[str, ThreadMetadata],
+    thread_reply_counts: dict[str, int],
 ) -> MessageConversionResult:
-    zerver_message = []
+    zerver_message: list[ZerverFieldsT] = []
     zerver_usermessage: list[ZerverFieldsT] = []
     uploads_list: list[UploadRecordData] = []
-    zerver_attachment: list[ZerverFieldsT] = []
+    zerver_attachment: list[AttachmentRecordData] = []
     reaction_list: list[ZerverFieldsT] = []
 
     total_user_messages = 0
     total_skipped_user_messages = 0
-    thread_counter: dict[str, int] = defaultdict(int)
-    thread_map: dict[str, str] = {}
     for message in all_messages:
-        slack_user_id = get_message_sending_user(message)
-        if not slack_user_id:
-            # Ignore messages without slack_user_id
-            # These are Sometimes produced by Slack
+        if is_message_skipped_during_conversion(message):
             continue
 
+        slack_user_id = get_message_sending_user(message)
+        assert slack_user_id
         subtype = message.get("subtype", False)
-        if subtype in [
-            # Zulip doesn't have a pinned_item concept
-            "pinned_item",
-            "unpinned_item",
-            # Slack's channel join/leave notices are spammy
-            "channel_join",
-            "channel_leave",
-            "channel_name",
-        ]:
-            continue
 
         raw_content = process_slack_block_and_attachment(
             (to_wild_value("message", json.dumps(message))),
@@ -1129,27 +1220,17 @@ def channel_message_to_zerver_message(
             continue
         rendered_content = None
 
+        channel_name: str | None = None
         if "channel_name" in message:
             is_direct_message_type = False
             recipient_id = slack_recipient_name_to_zulip_recipient_id[message["channel_name"]]
+            channel_name = message["channel_name"]
         elif "mpim_name" in message:
             is_direct_message_type = True
             recipient_id = slack_recipient_name_to_zulip_recipient_id[message["mpim_name"]]
         elif "pm_name" in message:
             is_direct_message_type = True
-            if settings.PREFER_DIRECT_MESSAGE_GROUP:
-                # When PREFER_DIRECT_MESSAGE_GROUP is enabled, 1:1 DMs are treated as direct message groups
-                recipient_id = slack_recipient_name_to_zulip_recipient_id[message["pm_name"]]
-            else:
-                # Original behavior: use personal recipients for 1:1 DMs
-                sender = get_message_sending_user(message)
-                members = dm_members[message["pm_name"]]
-                if sender == members[0]:
-                    recipient_id = slack_recipient_name_to_zulip_recipient_id[members[1]]
-                    sender_recipient_id = slack_recipient_name_to_zulip_recipient_id[members[0]]
-                else:
-                    recipient_id = slack_recipient_name_to_zulip_recipient_id[members[0]]
-                    sender_recipient_id = slack_recipient_name_to_zulip_recipient_id[members[1]]
+            recipient_id = slack_recipient_name_to_zulip_recipient_id[message["pm_name"]]
 
         message_id = NEXT_ID("message")
 
@@ -1188,31 +1269,27 @@ def channel_message_to_zerver_message(
             do_download_and_export_upload_file=do_download_and_export_upload_file,
         )
 
-        content = "\n".join([part for part in [content, file_info["content"]] if part != ""])
         has_link = has_link or file_info["has_link"]
 
         has_attachment = file_info["has_attachment"]
         has_image = file_info["has_image"]
 
-        # Slack's unthreaded messages go into a single topic, while
-        # threads each generate a unique topic labeled by the date,
-        # a snippet of the original message and a counter if there
-        # are any thread with the same topic name
-        topic_name = "imported from Slack"
-        if convert_slack_threads and not is_direct_message_type and "thread_ts" in message:
-            thread_ts = datetime.fromtimestamp(float(message["thread_ts"]), tz=timezone.utc)
-            thread_ts_str = thread_ts.strftime(r"%Y/%m/%d %H:%M:%S")
-            parent_user_id = get_parent_user_id_from_thread_message(message, subtype)
-            thread_key = f"{thread_ts_str}-{parent_user_id}"
+        topic_name = create_topic_name_for_message(
+            added_channels=added_channels,
+            channel_name=channel_name,
+            content=content,
+            convert_slack_threads=convert_slack_threads,
+            is_direct_message_type=is_direct_message_type,
+            message=message,
+            thread_counter=thread_counter,
+            thread_map=thread_map,
+        )
 
-            if thread_key in thread_map:
-                topic_name = thread_map[thread_key]
-            else:
-                topic_name = get_zulip_thread_topic_name(content, thread_ts, thread_counter)
-                thread_map[thread_key] = topic_name
+        content = "\n".join([part for part in [content, file_info["content"]] if part != ""])
 
-        if is_direct_message_type:
-            topic_name = ""
+        content += get_thread_reply_notification(
+            convert_slack_threads, message, thread_map, thread_reply_counts
+        )
 
         zulip_message = build_message(
             topic_name=topic_name,
@@ -1243,23 +1320,6 @@ def channel_message_to_zerver_message(
         total_user_messages += num_created
         total_skipped_user_messages += num_skipped
 
-        if (
-            "pm_name" in message
-            and not settings.PREFER_DIRECT_MESSAGE_GROUP
-            and recipient_id != sender_recipient_id
-        ):
-            (num_created, num_skipped) = build_usermessages(
-                zerver_usermessage=zerver_usermessage,
-                subscriber_map=subscriber_map,
-                recipient_id=sender_recipient_id,
-                mentioned_user_ids=mentioned_user_ids,
-                message_id=message_id,
-                is_private=is_direct_message_type,
-                long_term_idle=long_term_idle,
-            )
-            total_user_messages += num_created
-            total_skipped_user_messages += num_skipped
-
     logging.debug(
         "Created %s UserMessages; deferred %s due to long-term idle",
         total_user_messages,
@@ -1282,7 +1342,7 @@ def process_message_files(
     slack_user_id: str,
     users: list[ZerverFieldsT],
     slack_user_id_to_zulip_user_id: SlackToZulipUserIDT,
-    zerver_attachment: list[ZerverFieldsT],
+    zerver_attachment: list[AttachmentRecordData],
     uploads_list: list[UploadRecordData],
     do_download_and_export_upload_file: Callable[[UploadFileRequest], None],
 ) -> dict[str, Any]:
@@ -1321,7 +1381,7 @@ def process_message_files(
             # For attachments with Slack download link
             has_attachment = True
             has_link = True
-            has_image = "image" in fileinfo["mimetype"]
+            has_image = has_image or "image" in fileinfo["mimetype"]
 
             attachment_data = get_attachment_path_and_content(
                 link_name=fileinfo["title"], filename=fileinfo["name"], realm_id=realm_id
@@ -1342,7 +1402,7 @@ def process_message_files(
 
             do_download_and_export_upload_file(
                 UploadFileRequest(
-                    output_file_path=attachment_data.path_id,
+                    output_file_path_id=attachment_data.path_id,
                     request_url=fileinfo["url_private"],
                     params=None,
                     headers=None,
@@ -1547,7 +1607,7 @@ def fetch_shared_channel_users(
                 if user_id not in normal_user_ids:
                     mirror_dummy_user_ids.add(user_id)
 
-    all_messages = get_messages_iterator(slack_data_dir, added_channels, {}, {}, {})
+    all_messages = get_messages_iterator(slack_data_dir, added_channels, {}, {})
     for message in all_messages:
         if is_integration_bot_message(message):
             # This message is likely from an integration bot. Since Slack's integration
@@ -1610,14 +1670,13 @@ def fetch_team_icons(
         return []
 
     response = request_file_stream(icon_url)
-    response_raw = response.raw
 
     realm_id = zerver_realm["id"]
     os.makedirs(os.path.join(output_dir, str(realm_id)), exist_ok=True)
 
     original_icon_output_path = os.path.join(output_dir, str(realm_id), "icon.original")
-    with open(original_icon_output_path, "wb") as output_file:
-        shutil.copyfileobj(response_raw, output_file)
+    write_response_file_stream_to_path(response, original_icon_output_path)
+
     records.append(
         {
             "realm_id": realm_id,
@@ -1661,7 +1720,6 @@ def do_convert_zipfile(
         os.makedirs(slack_data_dir, exist_ok=True)
 
         with zipfile.ZipFile(original_path) as zipObj:
-            total_size = 0
             for fileinfo in zipObj.infolist():
                 # Slack's export doesn't set the UTF-8 flag on each
                 # filename entry, despite encoding them as such, so
@@ -1671,6 +1729,17 @@ def do_convert_zipfile(
                 fileinfo.filename = fileinfo.filename.encode("cp437").decode("utf-8")
                 zipObj.NameToInfo[fileinfo.filename] = fileinfo
 
+            # Reject the archive wholesale if any entry contains a
+            # `..` path component.  Python's zipfile silently strips
+            # these during extraction, so this is defense in depth
+            # rather than a fix for a live traversal bug -- but we'd
+            # rather refuse an obviously malformed archive than rely
+            # on stdlib sanitization.
+            if any(".." in info.filename.split("/") for info in zipObj.infolist()):
+                raise SlackImportInvalidFileError("Uploaded zip file is not a valid Slack export.")
+
+            total_size = 0
+            for fileinfo in zipObj.infolist():
                 # The only files we expect to find in a Slack export are .json files:
                 #   something.json
                 #   channelname/
@@ -1748,7 +1817,7 @@ def do_convert_directory(
     # Subdomain is set by the user while running the import command
     realm_subdomain = ""
     realm_id = 0
-    domain_name = SplitResult("", settings.EXTERNAL_HOST, "", "", "").hostname
+    domain_name = get_domain_name_for_import()
     assert isinstance(domain_name, str)
 
     (
@@ -1758,7 +1827,6 @@ def do_convert_directory(
         added_channels,
         added_mpims,
         added_dms,
-        dm_members,
         avatar_list,
         emoji_url_map,
     ) = slack_workspace_to_realm(
@@ -1781,7 +1849,6 @@ def do_convert_directory(
             added_channels,
             added_mpims,
             added_dms,
-            dm_members,
             realm,
             realm["zerver_userprofile"],
             realm["zerver_realmemoji"],
@@ -1790,6 +1857,16 @@ def do_convert_directory(
             convert_slack_threads,
             do_download_and_export_upload_file,
         )
+
+    # Attachment and upload records are built before the download runs,
+    # so records for files whose download failed will be invalid.
+    # This filters out such records after the download process has
+    # completed.
+    scrubbed_data = scrub_missing_upload_records_after_download(
+        output_dir, zerver_attachment, uploads_list
+    )
+    zerver_attachment = scrubbed_data.zerver_attachments
+    uploads_list = scrubbed_data.upload_records
 
     # Move zerver_reactions to realm.json file
     realm["zerver_reaction"] = reactions
@@ -1827,32 +1904,44 @@ def do_convert_directory(
     logging.info("Zulip data dump created at %s", output_dir)
 
 
+class SlackTokenValidationError(Exception):
+    """Raised by check_slack_token_access when a Slack token fails validation.
+    The message never includes the token itself, so it is safe to surface to
+    users -- e.g. on the self-serve import page or to a webhook's bot owner."""
+
+
 def check_slack_token_access(token: str, required_scopes: set[str]) -> None:
     if token.startswith("xoxp-"):
         logging.info("This is a Slack user token, which grants all rights the user has!")
     elif not required_scopes:
         raise ValueError("required_scopes shouldn't be empty!")
     elif token.startswith("xoxb-"):
-        data = requests.get(
-            "https://slack.com/api/api.test", headers={"Authorization": f"Bearer {token}"}
-        )
+        try:
+            data = requests.get(
+                "https://slack.com/api/api.test", headers={"Authorization": f"Bearer {token}"}
+            )
+        except requests.RequestException as e:
+            logging.info("Slack token validation request failed: %s", e)
+            raise SlackTokenValidationError(
+                "Could not reach Slack to validate the token. Please try again."
+            )
         if data.status_code != 200:
-            raise ValueError(
-                f"Failed to fetch data (HTTP status {data.status_code}) for Slack token: {token}"
+            raise SlackTokenValidationError(
+                f"Failed to validate the token with Slack (HTTP status {data.status_code})."
             )
         if not data.json()["ok"]:
             error = data.json()["error"]
             if error != "missing_scope":
-                logging.error("Slack token is invalid: %s", error)
-                raise ValueError(f"Invalid token: {token}")
+                logging.info("Slack token is invalid: %s", error)
+                raise SlackTokenValidationError("Invalid token.")
         has_scopes = set(data.headers.get("x-oauth-scopes", "").split(","))
         missing_scopes = required_scopes - has_scopes
         if missing_scopes:
-            raise ValueError(
+            raise SlackTokenValidationError(
                 f"Slack token is missing the following required scopes: {sorted(missing_scopes)}"
             )
     else:
-        raise Exception("Invalid token. Valid tokens start with xoxb-.")
+        raise SlackTokenValidationError("Invalid token. Valid tokens start with xoxb-.")
 
 
 def get_slack_api_data(

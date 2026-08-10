@@ -65,7 +65,7 @@ function createRedirectPlugin() {
                             // run-dev being run with `--only-help-center` flag.
                             if (redirectUrl.port !== proxyPort) {
                                 redirectUrl.port = proxyPort;
-                                res.writeHead(302, {Location: redirectUrl.toString()});
+                                res.writeHead(302, {Location: redirectUrl.href});
                                 res.end();
                                 return;
                             }
@@ -82,6 +82,7 @@ function createRedirectPlugin() {
 // https://astro.build/config
 export default defineConfig({
     base: "help",
+    compressHTML: "jsx",
     trailingSlash: "never",
     vite: {
         plugins: [
@@ -298,7 +299,7 @@ export default defineConfig({
                         "format-your-message-using-markdown",
                         {
                             label: "Search filters",
-                            link: "/search-for-messages/#search-filters",
+                            link: "/search-for-messages#search-filters",
                         },
                         "using-zulip-via-email",
                     ],
@@ -326,6 +327,7 @@ export default defineConfig({
                         "paragraph-and-section-formatting",
                         "bulleted-lists",
                         "numbered-lists",
+                        "indent-a-list-item",
                         "tables",
                         "code-blocks",
                         "latex",
@@ -385,6 +387,7 @@ export default defineConfig({
                         "view-messages-sent-by-a-user",
                         "link-to-a-message-or-conversation",
                         "search-for-messages",
+                        "scroll-to-date",
                         "printing-messages",
                         {
                             label: "View message content as Markdown",
@@ -539,6 +542,7 @@ export default defineConfig({
                             label: "Configure default new user settings",
                             link: "/configure-default-new-user-settings",
                         },
+                        "configure-default-profile-pictures",
                         "custom-profile-fields",
                         "invite-new-users",
                         "restrict-account-creation",
@@ -555,6 +559,7 @@ export default defineConfig({
                         "change-a-users-name",
                         "manage-user-channel-subscriptions",
                         "manage-user-group-membership",
+                        "reset-settings-for-users",
                     ],
                 },
                 {
@@ -596,6 +601,7 @@ export default defineConfig({
                         "change-the-channel-description",
                         "pin-information",
                         "change-the-privacy-of-a-channel",
+                        "enable-mobile-notifications-by-default",
                         {
                             label: "Delete or archive a channel",
                             link: "/archive-a-channel",

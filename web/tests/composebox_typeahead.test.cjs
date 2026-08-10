@@ -12,7 +12,7 @@ const {make_stream} = require("./lib/example_stream.cjs");
 const {make_user, make_cross_realm_bot} = require("./lib/example_user.cjs");
 const {mock_esm, set_global, with_overrides, zrequire} = require("./lib/namespace.cjs");
 const {run_test, noop} = require("./lib/test.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 
 let autosize_called;
 const REALM_EMPTY_TOPIC_DISPLAY_NAME = "general chat";
@@ -20,7 +20,7 @@ const REALM_EMPTY_TOPIC_DISPLAY_NAME = "general chat";
 const bootstrap_typeahead = mock_esm("../src/bootstrap_typeahead");
 const message_lists = mock_esm("../src/message_lists");
 const pm_conversations = mock_esm("../src/pm_conversations", {
-    is_partner: () => false,
+    get_latest_direct_message_id_with_user: () => undefined,
 });
 const compose_ui = mock_esm("../src/compose_ui", {
     autosize_textarea() {
@@ -28,7 +28,7 @@ const compose_ui = mock_esm("../src/compose_ui", {
     },
     cursor_inside_code_block: () => false,
     set_code_formatting_button_triggered: noop,
-    set_compose_textarea_typeahead: noop,
+    maybe_set_compose_textarea_typeahead: noop,
 });
 const compose_validate = mock_esm("../src/compose_validate", {
     validate_message_length: () => true,
@@ -38,6 +38,83 @@ const compose_validate = mock_esm("../src/compose_validate", {
     initialize: noop,
 });
 const input_pill = mock_esm("../src/input_pill");
+const message_util = mock_esm("../src/message_util", {
+    get_direct_message_permission_hints: () => ({
+        is_known_empty_conversation: false,
+        is_local_echo_safe: true,
+    }),
+    user_can_send_direct_message(user_ids_string) {
+        return (
+            (!message_util.get_direct_message_permission_hints(user_ids_string)
+                .is_known_empty_conversation ||
+                people.user_can_initiate_direct_message_thread(user_ids_string)) &&
+            people.user_can_direct_message(user_ids_string)
+        );
+    },
+    // currently is synced with the actual function.
+    make_check_message_permission_for_dm_candidate(recipient_ids) {
+        const current_user_id = people.my_current_user_id();
+        const is_current_user_in_initiator_group = user_groups.is_user_in_setting_group(
+            realm.realm_direct_message_initiator_group,
+            current_user_id,
+        );
+        const is_current_user_in_permission_group = user_groups.is_user_in_setting_group(
+            realm.realm_direct_message_permission_group,
+            current_user_id,
+        );
+
+        if (is_current_user_in_initiator_group && is_current_user_in_permission_group) {
+            return null;
+        }
+
+        const recipient_is_in_permission_group = recipient_ids.some(
+            (user_id) =>
+                !people.is_valid_bot_user(user_id) &&
+                user_id !== current_user_id &&
+                user_groups.is_user_in_setting_group(
+                    realm.realm_direct_message_permission_group,
+                    user_id,
+                ),
+        );
+
+        if (is_current_user_in_initiator_group && recipient_is_in_permission_group) {
+            return null;
+        }
+
+        const all_recipients_are_bots = recipient_ids.every(
+            (user_id) => people.is_valid_bot_user(user_id) || user_id === current_user_id,
+        );
+
+        const permission_group_user_ids = user_groups.get_user_ids_in_setting_group(
+            realm.realm_direct_message_permission_group,
+        );
+
+        return (candidate_user_id) => {
+            if (all_recipients_are_bots && people.is_valid_bot_user(candidate_user_id)) {
+                return true;
+            }
+
+            const is_candidate_in_permission_group =
+                permission_group_user_ids.has(candidate_user_id);
+
+            if (is_current_user_in_initiator_group && is_candidate_in_permission_group) {
+                return true;
+            }
+
+            if (
+                !is_current_user_in_permission_group &&
+                !recipient_is_in_permission_group &&
+                !is_candidate_in_permission_group
+            ) {
+                return false;
+            }
+
+            const conversation_user_ids_string = [...recipient_ids, candidate_user_id].join(",");
+            return !message_util.get_direct_message_permission_hints(conversation_user_ids_string)
+                .is_known_empty_conversation;
+        };
+    },
+});
 const message_user_ids = mock_esm("../src/message_user_ids", {
     user_ids: () => [],
 });
@@ -289,18 +366,18 @@ const light_command = {
 const light_command_item = slash_item(light_command);
 
 const name_to_codepoint = {};
-for (const [key, val] of emojis_by_name.entries()) {
+for (const [key, val] of emojis_by_name) {
     name_to_codepoint[key] = val.emoji_code;
 }
 
 const codepoint_to_name = {};
-for (const [key, val] of emojis_by_name.entries()) {
+for (const [key, val] of emojis_by_name) {
     codepoint_to_name[val.emoji_code] = key;
 }
 
 const emoji_codes = {
     name_to_codepoint,
-    names: [...emojis_by_name.keys()],
+    names: emojis_by_name.keys().toArray(),
     emoji_catalog: {},
     emoticon_conversions: {},
     codepoint_to_name,
@@ -312,7 +389,7 @@ emoji.initialize({
 });
 emoji.active_realm_emojis.clear();
 emoji.emojis_by_name.clear();
-for (const [key, val] of emojis_by_name.entries()) {
+for (const [key, val] of emojis_by_name) {
     emoji.emojis_by_name.set(key, val);
 }
 typeahead.set_frequently_used_emojis(
@@ -569,6 +646,26 @@ const full_members = user_group_item(
     }),
 );
 
+const nobody = user_group_item(
+    make_user_group({
+        name: "role:nobody",
+        id: 8,
+        creator_id: null,
+        date_created: 1596710000,
+        description: "Nobody",
+        members: new Set(),
+        is_system_group: true,
+        direct_subgroup_ids: new Set(),
+        can_add_members_group: 2,
+        can_join_group: 2,
+        can_leave_group: 2,
+        can_manage_group: 2,
+        can_mention_group: 2,
+        can_remove_members_group: 2,
+        deactivated: false,
+    }),
+);
+
 const sweden_stream = stream_item(
     make_stream({
         name: "Sweden",
@@ -656,19 +753,21 @@ const make_emoji = (emoji_dict) => ({
     type: "emoji",
 });
 
-// Sorted by name
+// Empty query: compare_users_for_dms sorts alphabetically
+// by full_name (no direct message history, and no name-length
+// tiebreaker without a query).
 const sorted_user_list = [
-    ali_item,
-    alice_item,
-    cordelia_item,
-    hal_item, // Early Hal
-    gael_item,
-    harry_item,
+    ali_item, // Ali
+    alice_item, // Alice
+    cordelia_item, // Cordelia, Lear's daughter
+    hal_item, // Earl Hal
+    gael_item, // Gaël Twin
+    harry_item, // Harry
     hamlet_item, // King Hamlet
-    lear_item,
+    lear_item, // King Lear
     twin1_item, // Mark Twin
-    twin2_item,
-    othello_item,
+    twin2_item, // Mark Twin
+    othello_item, // Othello, the Moor of Venice
 ];
 
 function test(label, f) {
@@ -681,6 +780,8 @@ function test(label, f) {
             server_supported_permission_settings,
         );
         helpers.override(realm, "realm_can_access_all_users_group", members.id);
+        helpers.override(realm, "realm_direct_message_permission_group", members.id);
+        helpers.override(realm, "realm_direct_message_initiator_group", members.id);
 
         people.add_active_user(ali);
         people.add_active_user(alice);
@@ -706,6 +807,7 @@ function test(label, f) {
         user_groups.add(admins);
         user_groups.add(members);
         user_groups.add(full_members);
+        user_groups.add(nobody);
 
         muted_users.set_muted_users([]);
 
@@ -740,6 +842,99 @@ test("topics_seen_for", ({override}) => {
 
     // Test when the stream doesn't exist (there are no topics)
     assert.deepEqual(ct.topics_seen_for(""), []);
+});
+
+test("should_suppress_topic_typeahead", () => {
+    // An empty query is never suppressed, even when the empty topic (which
+    // renders as a non-empty display name) is among the items.
+    assert.ok(!ct.should_suppress_topic_typeahead("", ["", "design"]));
+
+    // An exact match against an existing topic suppresses the typeahead,
+    // normalizing case and surrounding whitespace.
+    assert.ok(ct.should_suppress_topic_typeahead("design", ["design", "other"]));
+    assert.ok(ct.should_suppress_topic_typeahead("  DESIGN ", ["Design"]));
+
+    // An exact match is not suppressed while another topic still matches
+    // the query, since the user may be typing toward it.
+    assert.ok(!ct.should_suppress_topic_typeahead("design", ["design", "designs"]));
+    assert.ok(!ct.should_suppress_topic_typeahead("design", ["design", "my design doc"]));
+
+    // Another topic keeps the typeahead open only if the typeahead would
+    // actually display it: a multi-word query must match other topics at
+    // a word boundary, not as a mid-word substring ("design office"
+    // contains "sign off" but is not a suggestion for it).
+    assert.ok(!ct.should_suppress_topic_typeahead("sign off", ["sign off", "sign offsite"]));
+    assert.ok(ct.should_suppress_topic_typeahead("sign off", ["sign off", "design office"]));
+
+    // A query that names no existing topic is not suppressed.
+    assert.ok(!ct.should_suppress_topic_typeahead("new topic", ["design"]));
+
+    // People suggestions keep the typeahead open even on an exact match.
+    assert.ok(!ct.should_suppress_topic_typeahead("design", ["design", cordelia_item]));
+});
+
+test("topic typeahead auto-opens when topic creation is disabled", ({
+    override,
+    override_rewire,
+}) => {
+    let topic_edit_config;
+    override(bootstrap_typeahead, "Typeahead", (_input_element, config) => {
+        topic_edit_config = config;
+    });
+
+    let topic_creation_allowed = true;
+    override_rewire(stream_data, "can_create_new_topics_in_stream", () => topic_creation_allowed);
+
+    ct.initialize_topic_edit_typeahead($.create("fake-topic-edit-input"), "Denmark", false);
+
+    // The same typeahead instance reflects the channel's live permission,
+    // so it auto-opens on focus (showOnFocus) and shows for an empty query
+    // (helpOnEmptyStrings) exactly when topic creation is disabled.
+    topic_creation_allowed = false;
+    assert.ok(topic_edit_config.showOnFocus());
+    assert.ok(topic_edit_config.helpOnEmptyStrings());
+
+    topic_creation_allowed = true;
+    assert.ok(!topic_edit_config.showOnFocus());
+    assert.ok(!topic_edit_config.helpOnEmptyStrings());
+
+    // With no channel resolved, topic creation is treated as allowed, so
+    // the typeahead does not auto-open.
+    ct.initialize_topic_edit_typeahead($.create("fake-missing-stream-input"), "Nonexistent", false);
+    topic_creation_allowed = false;
+    assert.ok(!topic_edit_config.showOnFocus());
+    assert.ok(!topic_edit_config.helpOnEmptyStrings());
+});
+
+test("topic typeahead source suppresses an exact-match topic", ({override}) => {
+    let topic_edit_config;
+    override(bootstrap_typeahead, "Typeahead", (_input_element, config) => {
+        topic_edit_config = config;
+    });
+    override(stream_topic_history_util, "get_server_history", noop);
+    // Higher message_ids are more recent, so "design" sorts before
+    // "design docs" in the source's output.
+    for (const [message_id, topic_name] of [
+        [2, "design"],
+        [1, "design docs"],
+    ]) {
+        stream_topic_history.add_message({
+            stream_id: netherland_stream.stream_id,
+            message_id,
+            topic_name,
+        });
+    }
+
+    ct.initialize_topic_edit_typeahead($.create("fake-source-input"), "The Netherlands", false);
+
+    // "design docs" still has "design" as a substring, so an exact match on
+    // "design" keeps the existing topics listed.
+    assert.deepEqual(topic_edit_config.source("design"), ["design", "design docs"]);
+    // Matching the longest topic exactly leaves nothing to suggest, so the
+    // source returns no items and the typeahead stays hidden.
+    assert.deepEqual(topic_edit_config.source("design docs"), []);
+    // A query that names no existing topic lists the topics as usual.
+    assert.deepEqual(topic_edit_config.source("new"), ["design", "design docs"]);
 });
 
 test("content_typeahead_selected", ({override}) => {
@@ -969,13 +1164,13 @@ test("content_typeahead_selected", ({override}) => {
     query = "#**A* al";
     ct.get_or_set_token_for_testing("A* al");
     actual_value = ct.content_typeahead_selected(broken_link_stream, query, input_element);
-    expected_value = "[#A&#42; Algorithm](#narrow/channel/6-A*-Algorithm)>";
+    expected_value = "[#A&#42; Algorithm](#narrow/channel/6-A.2A-Algorithm)>";
     assert.equal(actual_value, expected_value);
 
     query = "#>";
     ct.get_or_set_token_for_testing("#");
     actual_value = ct.content_typeahead_selected(broken_link_stream, query, input_element);
-    expected_value = "[#A&#42; Algorithm](#narrow/channel/6-A*-Algorithm)>";
+    expected_value = "[#A&#42; Algorithm](#narrow/channel/6-A.2A-Algorithm)>";
     assert.equal(actual_value, expected_value);
 
     // topic_list
@@ -1108,7 +1303,7 @@ test("content_typeahead_selected", ({override}) => {
         query,
         input_element,
     );
-    expected_value = "Hello [#A&#42; Algorithm](#narrow/channel/6-A*-Algorithm) ";
+    expected_value = "Hello [#A&#42; Algorithm](#narrow/channel/6-A.2A-Algorithm) ";
     assert.equal(actual_value, expected_value);
 
     query = "Hello #**A* Algorithm>";
@@ -1127,7 +1322,8 @@ test("content_typeahead_selected", ({override}) => {
         query,
         input_element,
     );
-    expected_value = "Hello [#A&#42; Algorithm > fast](#narrow/channel/6-A*-Algorithm/topic/fast) ";
+    expected_value =
+        "Hello [#A&#42; Algorithm > fast](#narrow/channel/6-A.2A-Algorithm/topic/fast) ";
     assert.equal(actual_value, expected_value);
 
     // syntax
@@ -1208,6 +1404,7 @@ for (const [index, topic_name] of sweden_topics_to_show.entries()) {
 
 test("initialize", ({override, override_rewire, mock_template}) => {
     mock_banners();
+    $("#private_message_recipient").set_parent($.create("pm-recipient-container"));
 
     let pill_items = [];
     let cleared = false;
@@ -1259,8 +1456,8 @@ test("initialize", ({override, override_rewire, mock_template}) => {
     };
     override(pm_conversations, "get_partners", () => [100]);
     override(bootstrap_typeahead, "Typeahead", (input_element, options) => {
-        switch (input_element.$element) {
-            case $("input#stream_message_recipient_topic"): {
+        switch (input_element.$element[0]) {
+            case $("input#stream_message_recipient_topic")[0]: {
                 compose_state.set_stream_id(sweden_stream.stream_id);
                 const lear_user_data = [
                     {
@@ -1297,7 +1494,7 @@ test("initialize", ({override, override_rewire, mock_template}) => {
 
                 // options.item_html()
                 options.query = "Kro";
-                actual_value = options.item_html("kronor");
+                actual_value = options.item_html()("kronor");
                 expected_value =
                     '<div class="typeahead-content">\n' +
                     '    <div class="typeahead-text-container">\n' +
@@ -1307,7 +1504,7 @@ test("initialize", ({override, override_rewire, mock_template}) => {
 
                 // Highlighted content should be escaped.
                 options.query = "<";
-                actual_value = options.item_html("<&>");
+                actual_value = options.item_html()("<&>");
                 expected_value =
                     '<div class="typeahead-content">\n' +
                     '    <div class="typeahead-text-container">\n' +
@@ -1316,7 +1513,7 @@ test("initialize", ({override, override_rewire, mock_template}) => {
                 assert.equal(actual_value, expected_value);
 
                 options.query = "even m";
-                actual_value = options.item_html("even more ice");
+                actual_value = options.item_html()("even more ice");
                 expected_value =
                     '<div class="typeahead-content">\n' +
                     '    <div class="typeahead-text-container">\n' +
@@ -1377,23 +1574,24 @@ test("initialize", ({override, override_rewire, mock_template}) => {
 
                 break;
             }
-            case $("#private_message_recipient"): {
+            case $("#private_message_recipient")[0]: {
                 pill_items = [];
 
-                // This should match the users added at the beginning of this test file.
+                // Empty query: alphabetical by full_name (no direct
+                // message history), then groups, then bot.
                 let actual_value = options.source("");
                 let expected_value = [
-                    ali_item,
-                    alice_item,
-                    cordelia_item,
-                    hal_item,
-                    gael_item,
-                    harry_item,
-                    hamlet_item,
-                    lear_item,
-                    twin1_item,
-                    twin2_item,
-                    othello_item,
+                    ali_item, // Ali
+                    alice_item, // Alice
+                    cordelia_item, // Cordelia, Lear's daughter
+                    hal_item, // Earl Hal
+                    gael_item, // Gaël Twin
+                    harry_item, // Harry
+                    hamlet_item, // King Hamlet
+                    lear_item, // King Lear
+                    twin1_item, // Mark Twin
+                    twin2_item, // Mark Twin
+                    othello_item, // Othello, the Moor of Venice
                     hamletcharacters,
                     backend,
                     call_center,
@@ -1404,8 +1602,13 @@ test("initialize", ({override, override_rewire, mock_template}) => {
                 assert.deepEqual(actual_value, expected_value);
 
                 function matcher(query, person) {
-                    query = typeahead.clean_query_lowercase(query);
-                    return typeahead_helper.query_matches_person(query, person);
+                    query = typeahead.clean_query_lowercase(query, false);
+                    const should_remove_diacritics = !typeahead.contains_diacritics(query);
+                    return typeahead_helper.query_matches_person(
+                        query,
+                        person,
+                        should_remove_diacritics,
+                    );
                 }
 
                 let query;
@@ -1424,6 +1627,12 @@ test("initialize", ({override, override_rewire, mock_template}) => {
                 assert.equal(matcher(query, gael_item), true);
 
                 query = "gaël";
+                assert.equal(matcher(query, gael_item), true);
+
+                query = "gaël twi";
+                assert.equal(matcher(query, gael_item), true);
+
+                query = "gael twi";
                 assert.equal(matcher(query, gael_item), true);
 
                 // Don't make suggestions if the last name only has whitespaces
@@ -1489,7 +1698,7 @@ test("initialize", ({override, override_rewire, mock_template}) => {
                 // Adds a `no break-space` at the end. This should fail
                 // if there wasn't any logic replacing `no break-space`
                 // with normal space.
-                query = "cordelia, lear's\u00A0";
+                query = "cordelia, lear's\u{A0}";
                 assert.equal(matcher(query, cordelia_item), true);
                 assert.equal(matcher(query, othello_item), false);
 
@@ -1505,7 +1714,7 @@ test("initialize", ({override, override_rewire, mock_template}) => {
 
                 options.query = "othello@zulip.com, cor";
                 appended_names = [];
-                actual_value = options.updater(cordelia_item, event);
+                options.updater(cordelia_item, event);
                 assert.deepEqual(appended_names, ["Cordelia, Lear's daughter"]);
 
                 const click_event = {type: "click", target: "#doesnotmatter"};
@@ -1513,7 +1722,7 @@ test("initialize", ({override, override_rewire, mock_template}) => {
                 // Focus lost (caused by the click event in the typeahead list)
                 $("#private_message_recipient").trigger("blur");
                 appended_names = [];
-                actual_value = options.updater(othello_item, click_event);
+                options.updater(othello_item, click_event);
                 assert.deepEqual(appended_names, ["Othello, the Moor of Venice"]);
 
                 cleared = false;
@@ -1534,7 +1743,7 @@ test("initialize", ({override, override_rewire, mock_template}) => {
 
                 break;
             }
-            case $("textarea#compose-textarea"): {
+            case $("textarea#compose-textarea")[0]: {
                 // options.source()
                 //
                 // For now we only test that get_sorted_filtered_items has been
@@ -1560,7 +1769,7 @@ test("initialize", ({override, override_rewire, mock_template}) => {
                 // content_item_html.
                 ct.get_or_set_completing_for_tests("mention");
                 ct.get_or_set_token_for_testing("othello");
-                actual_value = options.item_html(othello_item);
+                actual_value = options.item_html("othello")(othello_item);
                 expected_value =
                     '<div class="typeahead-content">\n' +
                     '        <div class="typeahead-image">\n' +
@@ -1577,7 +1786,7 @@ test("initialize", ({override, override_rewire, mock_template}) => {
 
                 ct.get_or_set_completing_for_tests("mention");
                 ct.get_or_set_token_for_testing("hamletcharacters");
-                actual_value = options.item_html(hamletcharacters);
+                actual_value = options.item_html("hamletcharacters")(hamletcharacters);
                 expected_value =
                     '<div class="typeahead-content">\n' +
                     '        <i class="typeahead-image zulip-icon zulip-icon-user-group" aria-hidden="true"></i>\n' +
@@ -1728,14 +1937,11 @@ test("initialize", ({override, override_rewire, mock_template}) => {
     $stub_target.attr("id", "some_non_existing_id");
     $("form#send_message_form").trigger(event);
 
-    $("textarea#compose-textarea")[0] = {
-        selectionStart: 0,
-        selectionEnd: 0,
-    };
+    $("textarea#compose-textarea")[0].selectionStart = 0;
+    $("textarea#compose-textarea")[0].selectionEnd = 0;
     override(compose_ui, "insert_and_scroll_into_view", (content, _textarea) => {
         assert.equal(content, "\n");
     });
-    $("textarea#compose-textarea").caret = () => $("textarea#compose-textarea")[0].selectionStart;
 
     event.key = "Enter";
     $stub_target.attr("id", "stream_message_recipient_topic");
@@ -1800,6 +2006,50 @@ test("initialize", ({override, override_rewire, mock_template}) => {
     });
     $("form#send_message_form").trigger(event);
 
+    // Test automatic bulleting with indentation (sub-list).
+    $("textarea#compose-textarea").val("- Message 1\n  - Message 2");
+    $("textarea#compose-textarea")[0].selectionStart = 25;
+    $("textarea#compose-textarea")[0].selectionEnd = 25;
+    override(compose_ui, "insert_and_scroll_into_view", (content, _textarea) => {
+        assert.equal(content, "\n  - ");
+    });
+    $("form#send_message_form").trigger(event);
+
+    // Test removal of indented bullet.
+    $("textarea#compose-textarea").val("- Message 1\n  - Message 2\n  - ");
+    $("textarea#compose-textarea")[0].selectionStart = 30;
+    $("textarea#compose-textarea")[0].selectionEnd = 30;
+    $("textarea#compose-textarea")[0].setSelectionRange = (start, end) => {
+        assert.equal(start, 26);
+        assert.equal(end, 30);
+    };
+    override(compose_ui, "insert_and_scroll_into_view", (content, _textarea) => {
+        assert.equal(content, "");
+    });
+    $("form#send_message_form").trigger(event);
+
+    // Test automatic numbering with indentation (sub-list).
+    $("textarea#compose-textarea").val("- Message 1\n  1. Message 2");
+    $("textarea#compose-textarea")[0].selectionStart = 26;
+    $("textarea#compose-textarea")[0].selectionEnd = 26;
+    override(compose_ui, "insert_and_scroll_into_view", (content, _textarea) => {
+        assert.equal(content, "\n  2. ");
+    });
+    $("form#send_message_form").trigger(event);
+
+    // Test removal of indented numbering.
+    $("textarea#compose-textarea").val("- Message 1\n  1. Message 2\n  1. ");
+    $("textarea#compose-textarea")[0].selectionStart = 32;
+    $("textarea#compose-textarea")[0].selectionEnd = 32;
+    $("textarea#compose-textarea")[0].setSelectionRange = (start, end) => {
+        assert.equal(start, 27);
+        assert.equal(end, 32);
+    };
+    override(compose_ui, "insert_and_scroll_into_view", (content, _textarea) => {
+        assert.equal(content, "");
+    });
+    $("form#send_message_form").trigger(event);
+
     $("textarea#compose-textarea").val("A");
     $("textarea#compose-textarea")[0].selectionStart = 4;
     $("textarea#compose-textarea")[0].selectionEnd = 4;
@@ -1852,6 +2102,178 @@ test("initialize", ({override, override_rewire, mock_template}) => {
     assert.ok(compose_textarea_typeahead_called);
 });
 
+test("get_person_suggestion_for_topic_typeahead excludes deactivated users", ({override}) => {
+    override(pm_conversations, "get_partners", () => []);
+
+    // Deactivated user from participants should be excluded.
+    message_lists.current = {
+        data: {
+            participants: {
+                visible: () => new Set([deactivated_user.user_id]),
+            },
+        },
+    };
+    assert.deepEqual(ct.get_person_suggestion_for_topic_typeahead("deactivated"), []);
+
+    // Deactivated user from DM partners should be excluded.
+    message_lists.current = undefined;
+    override(pm_conversations, "get_partners", () => [deactivated_user.user_id]);
+    assert.deepEqual(ct.get_person_suggestion_for_topic_typeahead("deactivated"), []);
+
+    // Active user from DM partners should be included.
+    override(pm_conversations, "get_partners", () => [lear.user_id]);
+    const results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.ok(results[0].user.user_id === lear.user_id);
+});
+
+test("get_person_suggestion_for_topic_typeahead respects DM permissions", ({override}) => {
+    function set_visible_participants(user_ids) {
+        message_lists.current = {
+            data: {
+                participants: {
+                    visible: () => new Set(user_ids),
+                },
+            },
+        };
+    }
+    // Set message history to empty
+    override(pm_conversations, "get_partners", () => []);
+    override(message_util, "get_direct_message_permission_hints", () => ({
+        is_known_empty_conversation: true,
+        is_local_echo_safe: true,
+    }));
+
+    // Bot suggestion doesn't show up if there is no past conversation.
+    override(realm, "realm_direct_message_permission_group", nobody.id);
+    override(realm, "realm_direct_message_initiator_group", nobody.id);
+    let results = ct.get_person_suggestion_for_topic_typeahead("notification");
+    assert.deepEqual(results, []);
+
+    // Don't show suggestion when sender/recipient is in direct_message_permission_group
+    // but the sender isn't in initiator group.
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [lear.user_id, hamlet.user_id],
+        direct_subgroups: [],
+    });
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.deepEqual(results, []);
+
+    set_visible_participants([lear.user_id]);
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.deepEqual(results, []);
+
+    // When no conversation history exists between the sender and recipient,
+    // we show the suggestion if the recipient is visible in the current narrow’s
+    // participants and either the sender or recipient is in the
+    // direct_message_permission_group, and the sender is also in the initiator group.
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [lear.user_id],
+        direct_subgroups: [],
+    });
+    override(realm, "realm_direct_message_initiator_group", {
+        direct_members: [hamlet.user_id],
+        direct_subgroups: [],
+    });
+    set_visible_participants([]);
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.deepEqual(results, []);
+
+    // Set current narrow participant
+    set_visible_participants([lear.user_id]);
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.equal(results[0].user.user_id, lear.user_id);
+
+    // We don't show suggestion when sender doesn't have initiator
+    // permission when past conversation doesn't exist.
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [hamlet.user_id],
+        direct_subgroups: [],
+    });
+    override(realm, "realm_direct_message_initiator_group", nobody.id);
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.deepEqual(results, []);
+
+    // We dont show suggestion if the sender doesn't have initiator permission
+    // even if recipient is in permission group
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [lear.user_id],
+        direct_subgroups: [],
+    });
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.deepEqual(results, []);
+
+    // Don't show suggestion if direct message is disabled.
+    override(realm, "realm_direct_message_permission_group", nobody.id);
+    override(realm, "realm_direct_message_initiator_group", {
+        direct_members: [hamlet.user_id, lear.user_id],
+        direct_subgroups: [],
+    });
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.deepEqual(results, []);
+
+    // Set message history
+    override(pm_conversations, "get_partners", () => [notification_bot.user_id, lear.user_id]);
+    override(message_util, "get_direct_message_permission_hints", () => ({
+        is_known_empty_conversation: false,
+        is_local_echo_safe: true,
+    }));
+
+    // Suggestion for bot always show up even if direct message is disabled,
+    // considering past conversation exists.
+    override(realm, "realm_direct_message_permission_group", nobody.id);
+    override(realm, "realm_direct_message_initiator_group", nobody.id);
+    results = ct.get_person_suggestion_for_topic_typeahead("notification");
+    assert.equal(results[0].user.user_id, notification_bot.user_id);
+
+    // Show suggestion when both sender and recipient has permission, and
+    // past conversation exists
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [hamlet.user_id, lear.user_id],
+        direct_subgroups: [],
+    });
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.equal(results[0].user.user_id, lear.user_id);
+
+    // Sender in initiator group, recipient in permission group, show suggestion
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [lear.user_id],
+        direct_subgroups: [],
+    });
+    override(realm, "realm_direct_message_initiator_group", {
+        direct_members: [hamlet.user_id],
+        direct_subgroups: [],
+    });
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.equal(results[0].user.user_id, lear.user_id);
+
+    // Show suggestion when sender has permission and past conversation exists
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [hamlet.user_id],
+        direct_subgroups: [],
+    });
+    override(realm, "realm_direct_message_initiator_group", nobody.id);
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.equal(results[0].user.user_id, lear.user_id);
+
+    // Show suggestion when recipient has permission and past conversation exists
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [lear.user_id],
+        direct_subgroups: [],
+    });
+    override(realm, "realm_direct_message_initiator_group", nobody.id);
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.equal(results[0].user.user_id, lear.user_id);
+
+    // No suggestion when direct message is disabled
+    override(realm, "realm_direct_message_permission_group", nobody.id);
+    override(realm, "realm_direct_message_initiator_group", {
+        direct_members: [hamlet.user_id, lear.user_id],
+        direct_subgroups: [],
+    });
+    results = ct.get_person_suggestion_for_topic_typeahead("lear");
+    assert.deepEqual(results, []);
+});
+
 test("begins_typeahead", ({override, override_rewire}) => {
     override(stream_topic_history_util, "get_server_history", noop);
 
@@ -1865,7 +2287,7 @@ test("begins_typeahead", ({override, override_rewire}) => {
     function get_values(input, rest) {
         // Stub out split_at_cursor that uses $(':focus')
         override_rewire(ct, "split_at_cursor", () => [input, rest]);
-        const values = ct.get_candidates(input, input_element);
+        const values = ct.get_candidates(input, input_element, {shown: false});
         return values;
     }
 
@@ -1932,22 +2354,24 @@ test("begins_typeahead", ({override, override_rewire}) => {
     ]);
 
     const mention_all = broadcast_item(ct.broadcast_mentions()[0]);
+    // No stream context and no direct message history: broadcast sorts
+    // before all these users; bots alphabetical by full_name.
     const users_and_all_mention = [
-        ...sorted_user_list,
         mention_all,
-        notification_bot_item,
-        welcome_bot_item,
+        ...sorted_user_list,
+        notification_bot_item, // Notification Bot
+        welcome_bot_item, // Welcome Bot
     ];
     const users_and_user_groups = [
         ...sorted_user_list,
-        // alphabetical
+        // Groups alphabetical by display name.
         hamletcharacters, // "Characters of Hamlet"
         backend,
-        call_center, // "folks working in support",
+        call_center, // "folks working in support"
         admins,
         members,
-        notification_bot_item,
-        welcome_bot_item,
+        notification_bot_item, // Notification Bot
+        welcome_bot_item, // Welcome Bot
     ];
     const mention_everyone = broadcast_item(ct.broadcast_mentions()[1]);
     function mentions_with_silent_marker(mentions, is_silent) {
@@ -1965,47 +2389,57 @@ test("begins_typeahead", ({override, override_rewire}) => {
     assert_typeahead_equals("@_*", mentions_with_silent_marker(users_and_user_groups, true));
     assert_typeahead_equals("@**", mentions_with_silent_marker(users_and_all_mention, false));
     assert_typeahead_equals("@_**", mentions_with_silent_marker(users_and_user_groups, true));
+    // "o" is anywhere in each name; Othello starts with "o" so
+    // sorts first.  Broadcast before users with no direct message
+    // history (none in test), then bots by name length (shorter first).
     assert_typeahead_equals(
         "test @**o",
         mentions_with_silent_marker(
             [
-                othello_item,
-                cordelia_item,
-                mention_everyone,
-                notification_bot_item,
-                welcome_bot_item,
+                othello_item, // Othello starts with "o"
+                mention_everyone, // broadcast: before users with no DMs
+                cordelia_item, // "Cordelia" contains "o"
+                welcome_bot_item, // Welcome Bot
+                notification_bot_item, // Notification Bot
             ],
             false,
         ),
     );
     assert_typeahead_equals(
         "test @_**o",
-
         mentions_with_silent_marker(
-            [othello_item, cordelia_item, admins, members, notification_bot_item, welcome_bot_item],
+            [othello_item, cordelia_item, admins, members, welcome_bot_item, notification_bot_item],
             true,
         ),
     );
+    // Same as @**o above.
     assert_typeahead_equals(
         "test @*o",
         mentions_with_silent_marker(
             [
                 othello_item,
-                cordelia_item,
                 mention_everyone,
-                notification_bot_item,
+                cordelia_item,
                 welcome_bot_item,
+                notification_bot_item,
             ],
             false,
         ),
     );
+    // "k" matches: "King Hamlet" and "King Lear" start with "k"
+    // (best, shorter name first); "Mark Twin" x2 contain "k" (ok,
+    // word-boundary match); "backend" group also matches.
     assert_typeahead_equals(
         "test @_*k",
         mentions_with_silent_marker(
-            [hamlet_item, lear_item, twin1_item, twin2_item, backend],
+            [lear_item, hamlet_item, twin1_item, twin2_item, backend],
             true,
         ),
     );
+    // "h": Harry starts with "h" (best); Earl Hal and King Hamlet
+    // have word-boundary match (ok, shorter name first); Cordelia and
+    // Othello contain "h" but no word-boundary match (worst,
+    // shorter name first).
     assert_typeahead_equals(
         "test @*h",
         mentions_with_silent_marker(
@@ -2030,57 +2464,66 @@ test("begins_typeahead", ({override, override_rewire}) => {
     assert_typeahead_equals("@_* ", []);
     assert_typeahead_equals("@** ", []);
     assert_typeahead_equals("@_** ", []);
+    // "i" has no name-start match; all users whose name contains "i"
+    // are in the worst tier, sorted by name length (shorter first);
+    // equal-length names alphabetical by full_name.
     assert_typeahead_equals(
         "test\n@i",
         mentions_with_silent_marker(
             [
-                ali_item,
-                alice_item,
-                cordelia_item,
-                gael_item,
-                hamlet_item,
-                lear_item,
-                twin1_item,
-                twin2_item,
-                othello_item,
-                notification_bot_item,
+                ali_item, // Ali (3)
+                alice_item, // Alice (5)
+                gael_item, // Gaël Twin (9)
+                lear_item, // King Lear (9)
+                twin1_item, // Mark Twin (9)
+                twin2_item, // Mark Twin (9)
+                hamlet_item, // King Hamlet (11)
+                cordelia_item, // Cordelia, Lear's daughter (25)
+                othello_item, // Othello, the Moor of Venice (28)
+                notification_bot_item, // Notification Bot (bot tier)
             ],
             false,
         ),
     );
+    // Unlike the non-silent "@i" above, the silent "@_" typeahead offers
+    // every user group (not just those you're allowed to mention), so the
+    // "admins" group appears here; it's the only group whose name has "i".
     assert_typeahead_equals(
         "test\n@_i",
         mentions_with_silent_marker(
             [
-                ali_item,
-                alice_item,
-                cordelia_item,
-                gael_item,
-                hamlet_item,
-                lear_item,
-                twin1_item,
-                twin2_item,
-                othello_item,
-                admins,
-                notification_bot_item,
+                ali_item, // Ali (3)
+                alice_item, // Alice (5)
+                gael_item, // Gaël Twin (9)
+                lear_item, // King Lear (9)
+                twin1_item, // Mark Twin (9)
+                twin2_item, // Mark Twin (9)
+                hamlet_item, // King Hamlet (11)
+                cordelia_item, // Cordelia, Lear's daughter (25)
+                othello_item, // Othello, the Moor of Venice (28)
+                admins, // group: admins
+                notification_bot_item, // Notification Bot (bot tier)
             ],
             true,
         ),
     );
+    // "l": King Lear and Cordelia have word-boundary match on "Lear"
+    // (best, shorter name first).  Broadcast before users with no direct
+    // message history (worst); remaining users by name length; then bot.
     assert_typeahead_equals(
         "test\n @l",
         mentions_with_silent_marker(
             [
-                cordelia_item,
-                lear_item,
-                ali_item,
-                alice_item,
-                hal_item,
-                gael_item,
-                hamlet_item,
-                othello_item,
-                mention_all,
-                welcome_bot_item,
+                lear_item, // King *L*ear (9)
+                cordelia_item, // Cordelia, *L*ear's daughter (25)
+                mention_all, // broadcast "all" (before users with no DMs)
+                ali_item, // Ali (3)
+                alice_item, // Alice (5)
+                hal_item, // Earl Hal (8)
+                gael_item, // Gaël Twin (9)
+                hamlet_item, // King Hamlet (11)
+                othello_item, // Othello, the Moor of Venice (28)
+                welcome_bot_item, // Welcome Bot (bot tier)
             ],
             false,
         ),
@@ -2089,8 +2532,8 @@ test("begins_typeahead", ({override, override_rewire}) => {
         "test\n @_l",
         mentions_with_silent_marker(
             [
-                cordelia_item,
                 lear_item,
+                cordelia_item,
                 ali_item,
                 alice_item,
                 hal_item,
@@ -2111,23 +2554,28 @@ test("begins_typeahead", ({override, override_rewire}) => {
     assert_typeahead_equals("@_ zuli", []);
     assert_typeahead_equals(" @zuli", []);
     assert_typeahead_equals(" @_zuli", []);
+    // Same ordering logic as @**o above: name-start match first, then
+    // the broadcast mention before users with no direct message
+    // history, then remaining matches by name length (shorter first).
     assert_typeahead_equals(
         "test @o",
         mentions_with_silent_marker(
             [
-                othello_item,
-                cordelia_item,
-                mention_everyone,
-                notification_bot_item,
-                welcome_bot_item,
+                othello_item, // Othello starts with "o"
+                mention_everyone, // broadcast: before users with no DMs
+                cordelia_item, // "Cordelia" contains "o"
+                welcome_bot_item, // Welcome Bot (11)
+                notification_bot_item, // Notification Bot (16)
             ],
             false,
         ),
     );
+    // Silent variant: user groups appear in place of the broadcast
+    // mention; bots still sort by name length (shorter first).
     assert_typeahead_equals(
         "test @_o",
         mentions_with_silent_marker(
-            [othello_item, cordelia_item, admins, members, notification_bot_item, welcome_bot_item],
+            [othello_item, cordelia_item, admins, members, welcome_bot_item, notification_bot_item],
             true,
         ),
     );
@@ -2221,6 +2669,12 @@ test("begins_typeahead", ({override, override_rewire}) => {
     assert_typeahead_equals("test ```a", []);
     assert_typeahead_equals("test\n```", []);
     assert_typeahead_equals("``c", []);
+    // But if the typeahead is already open (e.g. the user typed ```py
+    // and then deleted the "py"), a bare ``` keeps it open.
+    override_rewire(ct, "split_at_cursor", () => ["```", ""]);
+    const shown_typeahead_values = ct.get_candidates("```", input_element, {shown: true});
+    assert.ok(shown_typeahead_values.length > 0);
+    assert.equal(shown_typeahead_values[0].type, "syntax");
     // Languages filtered by a single letter is a very long list.
     // The typeahead displays languages sorted by popularity, so to
     // avoid typing out all of them here we'll just test that the
@@ -2270,7 +2724,7 @@ test("begins_typeahead", ({override, override_rewire}) => {
     ];
     assert_typeahead_equals("#**stream**>", topic_jump);
     assert_typeahead_equals("#**stream** >", topic_jump);
-    assert_typeahead_equals("[#A&#42; Algorithm](#narrow/channel/6-A*-Algorithm) >", topic_jump);
+    assert_typeahead_equals("[#A&#42; Algorithm](#narrow/channel/6-A.2A-Algorithm) >", topic_jump);
     assert_typeahead_equals("#**Sweden>some topic** >", []); // Already completed a topic.
 
     // topic_list
@@ -2328,7 +2782,7 @@ test("begins_typeahead", ({override, override_rewire}) => {
     assert_typeahead_equals(":test", "ing", []);
     assert_typeahead_equals("```test", "ing", []);
     assert_typeahead_equals("~~~test", "ing", []);
-    const terminal_symbols = ",.;?!()[]> \u00A0\"'\n\t";
+    const terminal_symbols = ",.;?!()[]> \u{A0}\"'\n\t";
     for (const symbol of terminal_symbols.split()) {
         assert_typeahead_equals(
             "@othello",
@@ -2378,27 +2832,28 @@ test("tokenizing", () => {
 test("content_item_html", ({override_rewire}) => {
     ct.get_or_set_completing_for_tests("emoji");
     const emoji = {emoji_name: "person shrugging", emoji_url: "¯\\_(ツ)_/¯", type: "emoji"};
-    let th_render_typeahead_item_called = false;
+    let th_render_typeahead_item_called;
     override_rewire(typeahead_helper, "render_emoji", (item) => {
         assert.deepEqual(item, emoji);
         th_render_typeahead_item_called = true;
     });
-    ct.content_item_html(emoji);
+    ct.content_item_html("")(emoji);
 
     ct.get_or_set_completing_for_tests("mention");
     let th_render_person_called = false;
-    override_rewire(typeahead_helper, "render_person", (person) => {
+    override_rewire(typeahead_helper, "render_person", (person, opts) => {
         assert.deepEqual(person, othello_item);
+        assert.ok(opts === undefined || typeof opts === "object");
         th_render_person_called = true;
     });
-    ct.content_item_html(othello_item);
+    ct.content_item_html("")(othello_item);
 
     let th_render_user_group_called = false;
     override_rewire(typeahead_helper, "render_user_group", (user_group) => {
         assert.deepEqual(user_group, backend);
         th_render_user_group_called = true;
     });
-    ct.content_item_html(backend);
+    ct.content_item_html("")(backend);
 
     // We don't have any fancy rendering for slash commands yet.
     ct.get_or_set_completing_for_tests("slash");
@@ -2415,7 +2870,7 @@ test("content_item_html", ({override_rewire}) => {
         });
         th_render_slash_command_called = true;
     });
-    ct.content_item_html(me_slash);
+    ct.content_item_html("")(me_slash);
 
     ct.get_or_set_completing_for_tests("stream");
     let th_render_stream_called = false;
@@ -2423,7 +2878,7 @@ test("content_item_html", ({override_rewire}) => {
         assert.deepEqual(stream, denmark_stream);
         th_render_stream_called = true;
     });
-    ct.content_item_html(denmark_stream);
+    ct.content_item_html("")(denmark_stream);
 
     ct.get_or_set_completing_for_tests("syntax");
     th_render_typeahead_item_called = false;
@@ -2434,7 +2889,7 @@ test("content_item_html", ({override_rewire}) => {
         });
         th_render_typeahead_item_called = true;
     });
-    ct.content_item_html({type: "syntax", language: "py"});
+    ct.content_item_html("")({type: "syntax", language: "py"});
 
     // Verify that all stub functions have been called.
     assert.ok(th_render_typeahead_item_called);
@@ -2610,7 +3065,8 @@ test("typeahead_results", ({override}) => {
     assert_mentions_matches("oor ", []);
     assert_mentions_matches("oor o", []);
     assert_mentions_matches("oor of venice", []);
-    assert_mentions_matches("King ", [not_silent(hamlet_item), not_silent(lear_item)]);
+    // Both start with "King "; shorter name first: Lear (9) < Hamlet (11).
+    assert_mentions_matches("King ", [not_silent(lear_item), not_silent(hamlet_item)]);
     assert_mentions_matches("King H", [not_silent(hamlet_item)]);
     assert_mentions_matches("King L", [not_silent(lear_item)]);
     assert_mentions_matches("delia lear", []);
@@ -2629,33 +3085,37 @@ test("typeahead_results", ({override}) => {
     // Verify we suggest only the first matching stream wildcard mention,
     // irrespective of how many equivalent stream wildcard mentions match.
     const mention_everyone = not_silent(broadcast_item(ct.broadcast_mentions()[1]));
-    // Here, we suggest only "everyone" instead of both the matching
-    // "everyone" and "stream" wildcard mentions.
+    // compose_state is "stream" here, so broadcasts sort before users.
+    // "everyone" and Earl Hal start with "e" (best, broadcast first);
+    // remaining users contain "e" (worst, shorter name first); then
+    // groups and bots.
     assert_mentions_matches("e", [
-        not_silent(mention_everyone),
-        not_silent(hal_item),
-        not_silent(alice_item),
-        not_silent(cordelia_item),
-        not_silent(gael_item),
-        not_silent(hamlet_item),
-        not_silent(lear_item),
-        not_silent(othello_item),
-        not_silent(hamletcharacters),
-        not_silent(call_center),
-        not_silent(welcome_bot_item),
+        not_silent(mention_everyone), // broadcast: "everyone" starts with "e"
+        not_silent(hal_item), // Earl Hal (8) starts with "e"
+        not_silent(alice_item), // Alice (5)
+        not_silent(gael_item), // Gaël Twin (9)
+        not_silent(lear_item), // King Lear (9)
+        not_silent(hamlet_item), // King Hamlet (11)
+        not_silent(cordelia_item), // Cordelia, Lear's daughter (25)
+        not_silent(othello_item), // Othello, the Moor of Venice (28)
+        not_silent(hamletcharacters), // group
+        not_silent(call_center), // group
+        not_silent(welcome_bot_item), // Welcome Bot (bot tier)
     ]);
 
     // Verify we suggest both 'the first matching stream wildcard' and
     // 'topic wildcard' mentions. Not only one matching wildcard mention.
     const mention_topic = broadcast_item(ct.broadcast_mentions()[4]);
-    // Here, we suggest both "everyone" and "topic".
+    // Othello starts with "o" (best); everyone/topic broadcasts and
+    // Cordelia contain "o" (worst, broadcasts first in stream mode,
+    // then user); bots by name length (shorter first).
     assert_mentions_matches("o", [
-        not_silent(othello_item),
-        not_silent(mention_everyone),
-        not_silent(mention_topic),
-        not_silent(cordelia_item),
-        not_silent(notification_bot_item),
-        not_silent(welcome_bot_item),
+        not_silent(othello_item), // Othello starts with "o"
+        not_silent(mention_everyone), // broadcast (stream mode: first)
+        not_silent(mention_topic), // broadcast (stream mode: first)
+        not_silent(cordelia_item), // "Cordelia" contains "o"
+        not_silent(welcome_bot_item), // Welcome Bot
+        not_silent(notification_bot_item), // Notification Bot
     ]);
 
     // Autocomplete by slash commands.
@@ -2795,4 +3255,122 @@ test("direct message recipients sorted according to stream / topic being viewed"
     // 1st despite having an exact name match with the query.
     results = ct.get_pm_people("ali");
     assert.deepEqual(results, [alice_item, ali_item]);
+});
+
+test("get_pm_people respects DM permissions", ({override}) => {
+    $("#private_message_recipient").set_parent($.create("pm-recipient-container"));
+
+    let pill_items = [];
+
+    override(input_pill, "create", () => ({
+        clear() {
+            pill_items = [];
+        },
+        clear_text() {},
+        items: () => pill_items,
+        onPillCreate() {},
+        onPillRemove() {},
+        appendValidatedData(item) {
+            pill_items.push(item);
+        },
+    }));
+
+    compose_pm_pill.initialize({on_pill_create_or_remove: noop});
+
+    mock_banners();
+    compose_state.set_stream_id("");
+
+    compose_state.set_private_message_recipient_ids([]);
+
+    override(message_util, "get_direct_message_permission_hints", () => ({
+        is_known_empty_conversation: true,
+        is_local_echo_safe: true,
+    }));
+
+    // When DMs are disabled realm-wide, lear should not appear in suggestions.
+    override(realm, "realm_direct_message_permission_group", nobody.id);
+    override(realm, "realm_direct_message_initiator_group", nobody.id);
+    let results = ct.get_pm_people("king lear");
+    assert.deepEqual(results, []);
+
+    // Bot suggestions always appear regardless of DM permissions.
+    results = ct.get_pm_people("welcome");
+    assert.deepEqual(results, [welcome_bot_item]);
+
+    // When DMs are allowed, lear should appear in suggestions.
+    override(realm, "realm_direct_message_permission_group", members.id);
+    override(realm, "realm_direct_message_initiator_group", members.id);
+    results = ct.get_pm_people("king lear");
+    assert.deepEqual(results, [lear_item]);
+
+    // Sender is not in initiator group and no past conversation history;
+    // lear should not appear even though lear is in the permission group.
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [lear.user_id],
+        direct_subgroups: [],
+    });
+    override(realm, "realm_direct_message_initiator_group", nobody.id);
+    results = ct.get_pm_people("king lear");
+    assert.deepEqual(results, []);
+
+    // Sender is in initiator group; lear should appear.
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [lear.user_id],
+        direct_subgroups: [],
+    });
+    override(realm, "realm_direct_message_initiator_group", {
+        direct_members: [hamlet.user_id],
+        direct_subgroups: [],
+    });
+    results = ct.get_pm_people("king lear");
+    assert.deepEqual(results, [lear_item]);
+
+    // Othello is not in the permission group, so othello should not appear.
+    results = ct.get_pm_people("othello");
+    assert.deepEqual(results, []);
+
+    // With lear already in the recipient box, othello can be added to a group
+    // DM because lear is in the permission group, satisfying the check.
+    compose_state.set_private_message_recipient_ids([lear.user_id]);
+    results = ct.get_pm_people("othello");
+    assert.deepEqual(results, [othello_item]);
+
+    // Sender is not in initiator group but past conversation history exists;
+    // lear should appear because the conversation is not known to be empty.
+    compose_state.set_private_message_recipient_ids([]);
+    override(message_util, "get_direct_message_permission_hints", () => ({
+        is_known_empty_conversation: false,
+        is_local_echo_safe: true,
+    }));
+    override(realm, "realm_direct_message_initiator_group", nobody.id);
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [lear.user_id],
+        direct_subgroups: [],
+    });
+    results = ct.get_pm_people("king lear");
+    assert.deepEqual(results, [lear_item]);
+
+    // With a bot already in the recipient box and sender in the initiator
+    // group, another bot should always appear in suggestions.
+    compose_state.set_private_message_recipient_ids([notification_bot.user_id]);
+    override(realm, "realm_direct_message_initiator_group", {
+        direct_members: [hamlet.user_id],
+        direct_subgroups: [],
+    });
+    override(realm, "realm_direct_message_permission_group", {
+        direct_members: [lear.user_id],
+        direct_subgroups: [],
+    });
+    results = ct.get_pm_people("welcome");
+    assert.deepEqual(results, [welcome_bot_item]);
+
+    // With a bot already in the recipient box, a user in the permission
+    // group should appear because the sender can initiate.
+    results = ct.get_pm_people("king lear");
+    assert.deepEqual(results, [lear_item]);
+
+    // With a bot already in the recipient box, a user not in the
+    // permission group should not appear.
+    results = ct.get_pm_people("othello");
+    assert.deepEqual(results, []);
 });

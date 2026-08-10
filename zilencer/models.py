@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Literal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -180,7 +181,7 @@ class RemoteRealm(models.Model):
         choices=[(t["id"], t["name"]) for t in Realm.ORG_TYPES.values()],
     )
 
-    # The fields below are analogical to RemoteZulipServer fields.
+    # The fields below are analogous to RemoteZulipServer fields.
 
     last_updated = models.DateTimeField("last updated", auto_now=True)
     last_request_datetime = models.DateTimeField(null=True)
@@ -307,6 +308,12 @@ class PreregistrationRemoteServerBillingUser(AbstractRemoteServerBillingUser):
     next_page = models.TextField(null=True)
 
     created_user = models.ForeignKey(RemoteServerBillingUser, null=True, on_delete=models.SET_NULL)
+
+
+RemoteServerDeactivationReasonType = Literal[
+    "owner_request",
+    "tos_violation",
+]
 
 
 class RemoteZulipServerAuditLog(AbstractRealmAuditLog):

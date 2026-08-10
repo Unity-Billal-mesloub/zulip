@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
 import assert from "minimalistic-assert";
 
@@ -19,6 +19,7 @@ import {$t} from "./i18n.ts";
 import * as keydown_util from "./keydown_util.ts";
 import * as message_lists from "./message_lists.ts";
 import * as message_store from "./message_store.ts";
+import * as message_util from "./message_util.ts";
 import * as muted_users from "./muted_users.ts";
 import {page_params} from "./page_params.ts";
 import * as people from "./people.ts";
@@ -214,30 +215,48 @@ export function get_language_matcher(query: string): (language: string) => boole
 
 export function get_stream_matcher(query: string): (stream: StreamPillData) => boolean {
     // Case-insensitive.
-    query = typeahead.clean_query_lowercase(query);
+    query = typeahead.clean_query_lowercase(query, false);
+    const should_remove_diacritics = !typeahead.contains_diacritics(query);
 
     return function (stream: StreamPillData) {
-        return typeahead_helper.query_matches_stream_name(query, stream);
+        return typeahead_helper.query_matches_stream_name(query, stream, should_remove_diacritics);
     };
 }
 
 export function get_slash_matcher(query: string): (item: SlashCommand) => boolean {
-    query = typeahead.clean_query_lowercase(query);
+    query = typeahead.clean_query_lowercase(query, false);
+    const should_remove_diacritics = !typeahead.contains_diacritics(query);
 
     return function (item: SlashCommand) {
         return (
-            typeahead.query_matches_string_in_order(query, item.name, " ") ||
-            typeahead.query_matches_string_in_order(query, item.aliases, " ")
+            typeahead.query_matches_string_in_order(
+                query,
+                item.name,
+                " ",
+                should_remove_diacritics,
+            ) ||
+            typeahead.query_matches_string_in_order(
+                query,
+                item.aliases,
+                " ",
+                should_remove_diacritics,
+            )
         );
     };
 }
 
 function get_topic_matcher(query: string): (topic: string) => boolean {
-    query = typeahead.clean_query_lowercase(query);
+    query = typeahead.clean_query_lowercase(query, false);
+    const should_remove_diacritics = !typeahead.contains_diacritics(query);
 
     return function (topic: string): boolean {
         const topic_display_name = util.get_final_topic_display_name(topic);
-        return typeahead.query_matches_string_in_order(query, topic_display_name, " ");
+        return typeahead.query_matches_string_in_order(
+            query,
+            topic_display_name,
+            " ",
+            should_remove_diacritics,
+        );
     };
 }
 
@@ -276,29 +295,37 @@ function handle_bulleting_or_numbering(
     assert(val !== undefined);
     const before_text = split_at_cursor(val, $textarea)[0];
     const previous_line = bulleted_numbered_list_util.get_last_line(before_text);
+    const indent = bulleted_numbered_list_util.get_indent(previous_line);
+    const trimmed_previous_line = previous_line.slice(indent.length);
     let to_append = "";
     // if previous line was bulleted, automatically add a bullet to the new line
-    if (bulleted_numbered_list_util.is_bulleted(previous_line)) {
+    if (bulleted_numbered_list_util.is_bulleted(trimmed_previous_line)) {
         // if previous line had only bullet, remove it and stay on the same line
-        if (bulleted_numbered_list_util.strip_bullet(previous_line) === "") {
-            // below we select and replace the last 2 characters in the textarea before
-            // the cursor - the bullet syntax - with an empty string
-            util.the($textarea).setSelectionRange($textarea.caret() - 2, $textarea.caret());
+        if (bulleted_numbered_list_util.strip_bullet(trimmed_previous_line) === "") {
+            // below we select and replace the last few characters in the textarea before
+            // the cursor - the indentation and bullet syntax - with an empty string
+            util.the($textarea).setSelectionRange(
+                $textarea.caret() - indent.length - 2,
+                $textarea.caret(),
+            );
             compose_ui.insert_and_scroll_into_view("", $textarea);
             e.preventDefault();
             return;
         }
-        // use same bullet syntax as the previous line
-        to_append = previous_line.slice(0, 2);
-    } else if (bulleted_numbered_list_util.is_numbered(previous_line)) {
+        // use same indentation and bullet syntax as the previous line
+        to_append = indent + trimmed_previous_line.slice(0, 2);
+    } else if (bulleted_numbered_list_util.is_numbered(trimmed_previous_line)) {
         // if previous line was numbered, continue numbering with the new line
-        const previous_number_string = previous_line.slice(0, previous_line.indexOf("."));
+        const previous_number_string = trimmed_previous_line.slice(
+            0,
+            trimmed_previous_line.indexOf("."),
+        );
         // if previous line had only numbering, remove it and stay on the same line
-        if (bulleted_numbered_list_util.strip_numbering(previous_line) === "") {
+        if (bulleted_numbered_list_util.strip_numbering(trimmed_previous_line) === "") {
             // below we select then replaces the last few characters in the textarea before
-            // the cursor - the numbering syntax - with an empty string
+            // the cursor - the indentation and numbering syntax - with an empty string
             util.the($textarea).setSelectionRange(
-                $textarea.caret() - previous_number_string.length - 2,
+                $textarea.caret() - indent.length - previous_number_string.length - 2,
                 $textarea.caret(),
             );
             compose_ui.insert_and_scroll_into_view("", $textarea);
@@ -306,7 +333,7 @@ function handle_bulleting_or_numbering(
             return;
         }
         const previous_number = Number.parseInt(previous_number_string, 10);
-        to_append = previous_number + 1 + ". ";
+        to_append = indent + (previous_number + 1) + ". ";
     }
     // if previous line was neither numbered nor bulleted, only add
     // a new line to emulate default behaviour (to_append is blank)
@@ -455,7 +482,8 @@ export function tokenize_compose_str(s: string): string {
                 // Code block must start on a new line
                 if (i === 2) {
                     return s;
-                } else if (i > 2 && s[i - 3] === "\n") {
+                }
+                if (i > 2 && s[i - 3] === "\n") {
                     return s.slice(i - 2);
                 }
                 break;
@@ -470,7 +498,8 @@ export function tokenize_compose_str(s: string): string {
             case "_":
                 if (i === 0) {
                     return s;
-                } else if (/[\s"'(/<[{]/.test(s[i - 1]!)) {
+                }
+                if (/[\s"'(/<[{]/.test(s[i - 1]!)) {
                     return s.slice(i);
                 }
                 break;
@@ -511,11 +540,6 @@ export function broadcast_mentions(): PseudoMentionUser[] {
         special_item_text: mention,
         secondary_text: get_wildcard_string(mention),
         email: mention,
-
-        // Always sort above, under the assumption that names will
-        // be longer and only contain "all" as a substring.
-        pm_recipient_count: Number.POSITIVE_INFINITY,
-
         full_name: mention,
 
         // used for sorting
@@ -618,6 +642,7 @@ export function get_pm_people(query: string): (UserGroupPillData | UserPillData)
         stream_id: compose_state.stream_id(),
         topic: compose_state.topic(),
         filter_groups_for_dm: true,
+        filter_by_dm_permission: true,
     };
     const suggestions = get_person_suggestions(query, opts, true);
     const current_user_ids = compose_pm_pill.get_user_ids();
@@ -650,6 +675,7 @@ type PersonSuggestionOpts = {
     filter_groups_for_dm?: boolean;
     filter_groups_for_mention?: boolean;
     allow_custom_profile_field_matching?: boolean;
+    filter_by_dm_permission?: boolean;
 };
 
 function filter_persons<T>(
@@ -686,28 +712,30 @@ function filter_persons<T>(
 }
 
 export function get_person_suggestion_for_topic_typeahead(query: string): UserPillData[] {
-    query = typeahead.clean_query_lowercase(query);
+    query = typeahead.clean_query_lowercase(query, false);
+    const should_remove_diacritics = !typeahead.contains_diacritics(query);
 
-    const filterer = (person_items: UserPillData[]): UserPillData[] => {
-        const should_remove_diacritics = people.should_remove_diacritics_for_query(
-            query.toLowerCase(),
-        );
-
-        return person_items.filter((item) =>
+    const filterer = (person_items: UserPillData[]): UserPillData[] =>
+        person_items.filter((item) =>
             typeahead_helper.query_matches_person_name(query, item, should_remove_diacritics, true),
         );
-    };
 
     const current_narrow_participant_ids = message_lists.current?.data.participants.visible();
 
     let filtered_persons;
     let participants_people;
-    let dm_people;
 
     if (current_narrow_participant_ids) {
+        // Check DM permissions for the user suggestion only, since we
+        // will reset any previously selected DM recipients.
         participants_people = util.try_parse_as_truthy(
             [...current_narrow_participant_ids]
-                .filter((user_id) => user_id !== current_user.user_id)
+                .filter(
+                    (user_id) =>
+                        user_id !== current_user.user_id &&
+                        people.is_person_active(user_id) &&
+                        message_util.user_can_send_direct_message(String(user_id)),
+                )
                 .map((user_id) => people.maybe_get_user_by_id(user_id))
                 .filter(Boolean),
         );
@@ -716,10 +744,15 @@ export function get_person_suggestion_for_topic_typeahead(query: string): UserPi
     }
 
     if (!(filtered_persons && filtered_persons?.length >= 3)) {
-        dm_people = util.try_parse_as_truthy(
+        const dm_people = util.try_parse_as_truthy(
             pm_conversations
                 .get_partners()
-                .filter((user_id) => !current_narrow_participant_ids?.has(user_id))
+                .filter(
+                    (user_id) =>
+                        !current_narrow_participant_ids?.has(user_id) &&
+                        people.is_person_active(user_id) &&
+                        message_util.user_can_send_direct_message(String(user_id)),
+                )
                 .map((user_id) => people.maybe_get_user_by_id(user_id))
                 .filter(Boolean),
         );
@@ -751,7 +784,8 @@ export function get_person_suggestions(
     opts: PersonSuggestionOpts,
     exclude_non_welcome_bots = false,
 ): (UserOrMentionPillData | UserGroupPillData)[] {
-    query = typeahead.clean_query_lowercase(query);
+    query = typeahead.clean_query_lowercase(query, false);
+    const should_remove_diacritics = !typeahead.contains_diacritics(query);
 
     let groups: UserGroup[];
     if (opts.filter_groups_for_mention) {
@@ -790,7 +824,7 @@ export function get_person_suggestions(
     }));
 
     const filtered_groups = group_pill_data.filter((item) =>
-        typeahead_helper.query_matches_group_name(query, item),
+        typeahead_helper.query_matches_group_name(query, item, should_remove_diacritics),
     );
 
     const user = people.get_from_unique_full_name(query);
@@ -842,9 +876,6 @@ export function get_person_suggestions(
         broadcast_items: UserOrMentionPillData[],
     ): UserOrMentionPillData[] {
         const suggestion_items: UserOrMentionPillData[] = [...person_items, ...broadcast_items];
-        const should_remove_diacritics = people.should_remove_diacritics_for_query(
-            query.toLowerCase(),
-        );
 
         return suggestion_items.filter((item) =>
             typeahead_helper.query_matches_person(
@@ -857,11 +888,33 @@ export function get_person_suggestions(
         );
     };
 
-    const filtered_message_persons = filter_persons(
-        people.get_active_message_people(),
-        opts.filter_pills,
-        opts.want_broadcast,
-        filterer,
+    // The DM-permission check is expensive per candidate, so we apply it after
+    // the query-match filter trims the candidate set — the loop then runs over
+    // the handful of query-matched users rather than the full realm.
+    const check_dm_permission = opts.filter_by_dm_permission
+        ? message_util.make_check_message_permission_for_dm_candidate(
+              compose_state.private_message_recipient_ids(),
+          )
+        : null;
+    const apply_dm_permission_filter = (
+        items: UserOrMentionPillData[],
+    ): UserOrMentionPillData[] => {
+        if (check_dm_permission === null) {
+            return items;
+        }
+        return items.filter(
+            (item) => item.type !== "user" || check_dm_permission(item.user.user_id),
+        );
+    };
+
+    const message_persons = people.get_people_for_dm({
+        exclude_non_welcome_bots,
+        exclude_non_message_people: true,
+        active_users_only: true,
+    });
+
+    const filtered_message_persons = apply_dm_permission_filter(
+        filter_persons(message_persons, opts.filter_pills, opts.want_broadcast, filterer),
     );
 
     let filtered_persons: UserOrMentionPillData[];
@@ -869,21 +922,14 @@ export function get_person_suggestions(
     if (filtered_message_persons.length >= cutoff_length) {
         filtered_persons = filtered_message_persons;
     } else {
-        if (exclude_non_welcome_bots) {
-            filtered_persons = filter_persons(
-                people.get_realm_users_and_welcome_bot(),
-                opts.filter_pills,
-                opts.want_broadcast,
-                filterer,
-            );
-        } else {
-            filtered_persons = filter_persons(
-                people.get_realm_users_and_system_bots(),
-                opts.filter_pills,
-                opts.want_broadcast,
-                filterer,
-            );
-        }
+        const realm_people = people.get_people_for_dm({
+            exclude_non_welcome_bots,
+            exclude_non_message_people: false,
+            active_users_only: false,
+        });
+        filtered_persons = apply_dm_permission_filter(
+            filter_persons(realm_people, opts.filter_pills, opts.want_broadcast, filterer),
+        );
     }
 
     return typeahead_helper.sort_recipients({
@@ -935,6 +981,7 @@ const ALLOWED_MARKDOWN_FEATURES = {
 export function get_candidates(
     query: string,
     input_element: TypeaheadInputElement,
+    typeahead_instance: Typeahead<TypeaheadSuggestion>,
 ): TypeaheadSuggestion[] {
     const split = split_at_cursor(query, input_element.$element);
     let current_token: string | boolean = tokenize_compose_str(split[0]);
@@ -949,7 +996,7 @@ export function get_candidates(
     // already-completed object.
 
     // We will likely want to extend this list to be more i18n-friendly.
-    const terminal_symbols = ",.;?!()[]> \u00A0\"'\n\t";
+    const terminal_symbols = ",.;?!()[]> \u{A0}\"'\n\t";
     if (rest !== "" && !terminal_symbols.includes(rest[0]!)) {
         return [];
     }
@@ -963,7 +1010,7 @@ export function get_candidates(
         if (
             current_token.length === 3 &&
             !compose_ui.code_formatting_button_triggered &&
-            !compose_ui.compose_textarea_typeahead?.shown
+            !typeahead_instance.shown
         ) {
             return [];
         }
@@ -1232,41 +1279,49 @@ export function get_candidates(
     return [];
 }
 
-export function content_item_html(item: TypeaheadSuggestion): string | undefined {
-    switch (item.type) {
-        case "emoji":
-            return typeahead_helper.render_emoji(item);
-        case "user_group":
-        case "user":
-        case "broadcast":
-            return typeahead_helper.render_person_or_user_group(item, token);
-        case "slash":
-            return typeahead_helper.render_typeahead_item({
-                primary: item.text,
-                secondary: item.info,
-            });
-        case "stream":
-            return typeahead_helper.render_stream(item);
-        case "syntax":
-            return typeahead_helper.render_typeahead_item({
-                primary: item.language,
-                is_default_language:
-                    item.language !== "" &&
-                    item.language === realm.realm_default_code_block_language,
-            });
-        case "topic_jump":
-            return typeahead_helper.render_typeahead_item({primary: item.message});
-        case "topic_list": {
-            if (item.is_channel_link) {
-                return typeahead_helper.render_stream(item.stream_data);
+export function content_item_html(
+    query: string,
+): (item: TypeaheadSuggestion) => string | undefined {
+    const should_remove_diacritics = !typeahead.contains_diacritics(query);
+    return function (item: TypeaheadSuggestion): string | undefined {
+        switch (item.type) {
+            case "emoji":
+                return typeahead_helper.render_emoji(item);
+            case "user_group":
+            case "user":
+            case "broadcast":
+                return typeahead_helper.render_person_or_user_group(item, {
+                    query: token,
+                    should_remove_diacritics,
+                });
+            case "slash":
+                return typeahead_helper.render_typeahead_item({
+                    primary: item.text,
+                    secondary: item.info,
+                });
+            case "stream":
+                return typeahead_helper.render_stream(item);
+            case "syntax":
+                return typeahead_helper.render_typeahead_item({
+                    primary: item.language,
+                    is_default_language:
+                        item.language !== "" &&
+                        item.language === realm.realm_default_code_block_language,
+                });
+            case "topic_jump":
+                return typeahead_helper.render_typeahead_item({primary: item.message});
+            case "topic_list": {
+                if (item.is_channel_link) {
+                    return typeahead_helper.render_stream(item.stream_data);
+                }
+                return typeahead_helper.render_stream_topic(item);
             }
-            return typeahead_helper.render_stream_topic(item);
+            case "time_jump":
+                return typeahead_helper.render_typeahead_item({primary: item.message});
+            default:
+                return undefined;
         }
-        case "time_jump":
-            return typeahead_helper.render_typeahead_item({primary: item.message});
-        default:
-            return undefined;
-    }
+    };
 }
 
 export function content_typeahead_selected(
@@ -1362,7 +1417,7 @@ export function content_typeahead_selected(
         case "slash":
             beginning = beginning.slice(0, -token.length - 1) + "/" + item.name + " ";
             if (item.placeholder) {
-                beginning = beginning + item.placeholder;
+                beginning += item.placeholder;
                 highlight.start = item.name.length + 2;
                 highlight.end = highlight.start + item.placeholder.length;
             }
@@ -1410,7 +1465,7 @@ export function content_typeahead_selected(
             // If there is more text after the cursor, then don't
             // touch "rest" (i.e. do not add a closing fence)
             if (rest === "") {
-                beginning = beginning + "\n";
+                beginning += "\n";
                 rest = "\n" + beginning.slice(Math.max(0, backticks - 4), backticks).trim() + rest;
             }
             break;
@@ -1518,31 +1573,63 @@ function compose_trigger_selection(event: JQuery.KeyDownEvent): boolean {
     return false;
 }
 
+// Used to hide the auto-opened topic typeahead once the input already
+// names an existing topic and no other topic still matches the query,
+// since there is then nothing left to suggest. We never suppress an
+// empty query (the typeahead should still list the existing topics)
+// nor when there are non-topic suggestions such as people to show.
+export function should_suppress_topic_typeahead(
+    query: string,
+    items: (string | UserPillData)[],
+): boolean {
+    if (!query) {
+        return false;
+    }
+    if (items.some((item) => typeof item !== "string")) {
+        return false;
+    }
+    const topics = items.filter((item): item is string => typeof item === "string");
+    const normalize = (topic: string): string =>
+        util.get_final_topic_display_name(topic).trim().toLowerCase();
+    const normalized_query = normalize(query);
+    if (topics.every((topic) => normalize(topic) !== normalized_query)) {
+        return false;
+    }
+    // Suppress only if every topic is either the one the user already
+    // typed, or wouldn't be displayed for this query anyway; otherwise
+    // the user may be typing toward another suggestion.
+    const matcher = get_topic_matcher(query);
+    return topics.every((topic) => normalize(topic) === normalized_query || !matcher(topic));
+}
+
 export function initialize_topic_edit_typeahead(
     form_field: JQuery<HTMLInputElement>,
     stream_name: string,
     dropup: boolean,
 ): Typeahead<string> {
+    const stream_id = stream_data.get_stream_id(stream_name);
     const bootstrap_typeahead_input: TypeaheadInputElement = {
         $element: form_field,
         type: "input",
     };
     return new Typeahead(bootstrap_typeahead_input, {
         dropup,
-        item_html(item: string): string {
-            const is_empty_string_topic = item === "";
-            const topic_display_name = util.get_final_topic_display_name(item);
-            return typeahead_helper.render_typeahead_item({
-                primary: topic_display_name,
-                is_empty_string_topic,
-            });
+        helpOnEmptyStrings: () => !stream_data.is_topic_creation_enabled(stream_id),
+        showOnFocus: () => !stream_data.is_topic_creation_enabled(stream_id),
+        item_html(_query: string): (item: string) => string {
+            return function (item: string): string {
+                const is_empty_string_topic = item === "";
+                const topic_display_name = util.get_final_topic_display_name(item);
+                return typeahead_helper.render_typeahead_item({
+                    primary: topic_display_name,
+                    is_empty_string_topic,
+                });
+            };
         },
-        matcher(item: string, query: string): boolean {
-            const matcher = get_topic_matcher(query);
-            return matcher(item);
+        matcher(query: string): (item: string) => boolean {
+            return get_topic_matcher(query);
         },
         sorter(items: string[], query: string): string[] {
-            const stream_id = stream_data.get_stream_id(stream_name);
             const sorted = typeahead_helper.sorter(query, items, (x) =>
                 util.get_final_topic_display_name(x),
             );
@@ -1556,9 +1643,12 @@ export function initialize_topic_edit_typeahead(
             }
             return sorted;
         },
-        source(): string[] {
-            const stream_id = stream_data.get_stream_id(stream_name);
-            return topics_seen_for(stream_id);
+        source(query: string): string[] {
+            const topics = topics_seen_for(stream_id);
+            if (should_suppress_topic_typeahead(query, topics)) {
+                return [];
+            }
+            return topics;
         },
         items: max_num_items,
         getCustomItemClassname() {
@@ -1569,7 +1659,7 @@ export function initialize_topic_edit_typeahead(
 }
 
 function get_footer_html(): string | false {
-    let tip_text = "";
+    let tip_text;
     switch (completing) {
         case "silent_mention":
             tip_text = $t({defaultMessage: "This silent mention won't trigger notifications."});
@@ -1614,7 +1704,7 @@ export function initialize_compose_typeahead($element: JQuery<HTMLTextAreaElemen
         type: "textarea",
     };
 
-    compose_ui.set_compose_textarea_typeahead(
+    compose_ui.maybe_set_compose_textarea_typeahead(
         new Typeahead(bootstrap_typeahead_input, {
             items: max_num_items,
             dropup: true,
@@ -1624,8 +1714,8 @@ export function initialize_compose_typeahead($element: JQuery<HTMLTextAreaElemen
             // inside the typeahead library.
             source: get_candidates,
             item_html: content_item_html,
-            matcher() {
-                return true;
+            matcher(_query: string) {
+                return () => true;
             },
             sorter(items) {
                 return items;
@@ -1649,7 +1739,8 @@ export function initialize_compose_typeahead($element: JQuery<HTMLTextAreaElemen
                         item.language === realm.realm_default_code_block_language
                     ) {
                         return `<em>${$t({defaultMessage: "(default)"})}</em>`;
-                    } else if (item.language === "text") {
+                    }
+                    if (item.language === "text") {
                         return `<em>${$t({defaultMessage: "(no highlighting)"})}</em>`;
                     }
                 }
@@ -1706,32 +1797,42 @@ export function initialize({
     };
     stream_message_topic_typeahead = new Typeahead(stream_message_typeahead_input, {
         dropup: true,
+        helpOnEmptyStrings: () => !stream_data.is_topic_creation_enabled(compose_state.stream_id()),
+        showOnFocus: () => !stream_data.is_topic_creation_enabled(compose_state.stream_id()),
         source(query: string): (UserPillData | string)[] {
             let people_candidates: UserPillData[] = [];
             if (query && query.length > 3) {
                 people_candidates = get_person_suggestion_for_topic_typeahead(query);
             }
             const topics = topics_seen_for(compose_state.stream_id());
-            return [...people_candidates, ...topics];
+            const candidates = [...people_candidates, ...topics];
+            if (should_suppress_topic_typeahead(query, candidates)) {
+                return [];
+            }
+            return candidates;
         },
         items: max_num_items,
-        item_html(item: string | UserPillData): string {
-            if (typeof item === "string") {
-                const is_empty_string_topic = item === "";
-                const topic_display_name = util.get_final_topic_display_name(item);
-                return typeahead_helper.render_typeahead_item({
-                    primary: topic_display_name,
-                    is_empty_string_topic,
-                });
-            }
-            return typeahead_helper.render_person_or_user_group(item);
+        item_html(_query: string): (item: string | UserPillData) => string {
+            return function (item: string | UserPillData): string {
+                if (typeof item === "string") {
+                    const is_empty_string_topic = item === "";
+                    const topic_display_name = util.get_final_topic_display_name(item);
+                    return typeahead_helper.render_typeahead_item({
+                        primary: topic_display_name,
+                        is_empty_string_topic,
+                    });
+                }
+                return typeahead_helper.render_person_or_user_group(item);
+            };
         },
-        matcher(item: UserPillData | string, query: string): boolean {
-            if (typeof item === "string") {
-                const matcher = get_topic_matcher(query);
-                return matcher(item);
-            }
-            return true;
+        matcher(query: string): (item: UserPillData | string) => boolean {
+            const topic_matcher = get_topic_matcher(query);
+            return (item: UserPillData | string): boolean => {
+                if (typeof item === "string") {
+                    return topic_matcher(item);
+                }
+                return true;
+            };
         },
         sorter(items: (UserPillData | string)[], query: string): (UserPillData | string)[] {
             const topic_items: string[] = [];
@@ -1785,7 +1886,8 @@ export function initialize({
         ): string | false {
             if (typeof item !== "string" && item.type === "user") {
                 return `<em>${$t({defaultMessage: "DM"})}</em>`;
-            } else if (!matching_items.includes(item)) {
+            }
+            if (!matching_items.includes(item)) {
                 return `<em>${$t({defaultMessage: "New"})}</em>`;
             }
             return false;
@@ -1813,11 +1915,12 @@ export function initialize({
         source: get_pm_people,
         items: max_num_items,
         dropup: true,
-        item_html(item: UserGroupPillData | UserPillData) {
-            return typeahead_helper.render_person_or_user_group(item);
+        item_html(_query: string): (item: UserGroupPillData | UserPillData) => string {
+            return (item: UserGroupPillData | UserPillData) =>
+                typeahead_helper.render_person_or_user_group(item);
         },
-        matcher(): boolean {
-            return true;
+        matcher(_query: string) {
+            return () => true;
         },
         sorter(items: (UserGroupPillData | UserPillData)[]): (UserGroupPillData | UserPillData)[] {
             return items;

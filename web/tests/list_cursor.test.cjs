@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const {zrequire} = require("./lib/namespace.cjs");
 const {run_test, noop} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 
 const {ListCursor} = zrequire("list_cursor");
 
@@ -95,7 +95,7 @@ run_test("multiple item list", ({override}) => {
     override(cursor, "adjust_scroll", noop);
 
     function li(key) {
-        return $.create(`item-${key}`, {children: ["stub"]});
+        return $.create(`item-${key}`);
     }
 
     const list_items = {

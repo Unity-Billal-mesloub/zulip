@@ -4,11 +4,12 @@ const assert = require("node:assert/strict");
 
 const {make_user_group} = require("./lib/example_group.cjs");
 const {make_realm} = require("./lib/example_realm.cjs");
+const {make_stream} = require("./lib/example_stream.cjs");
 const {make_bot, make_user} = require("./lib/example_user.cjs");
 const {mock_esm, zrequire, set_global} = require("./lib/namespace.cjs");
 const {run_test, noop} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 const {page_params} = require("./lib/zpage_params.cjs");
 
 const hash_util = zrequire("hash_util");
@@ -16,6 +17,7 @@ const compose_state = zrequire("compose_state");
 const narrow_banner = zrequire("narrow_banner");
 const people = zrequire("people");
 const stream_data = zrequire("stream_data");
+stream_data.set_channel_has_locally_available_topic(() => false);
 const {Filter} = zrequire("../src/filter");
 const message_fetch = mock_esm("../src/message_fetch", {
     load_messages_around_anchor() {},
@@ -59,11 +61,13 @@ mock_esm("../src/spectators", {
     login_to_access() {},
 });
 
-function empty_narrow_html(title, notice_html, search_data) {
+function empty_narrow_html(title, title_html, notice_html, search_data, show_action) {
     const opts = {
         title,
+        title_html,
         notice_html,
         search_data,
+        show_action,
     };
     return require("../templates/empty_feed_notice.hbs")(opts);
 }
@@ -131,7 +135,12 @@ run_test("empty_narrow_html", ({mock_template}) => {
     );
 
     // Title and html
-    actual_html = empty_narrow_html("This is a title", "<h1> This is the html </h1>", undefined);
+    actual_html = empty_narrow_html(
+        "This is a title",
+        undefined,
+        "<h1> This is the html </h1>",
+        undefined,
+    );
     assert.equal(
         actual_html,
         `<div class="empty_feed_notice">
@@ -143,6 +152,42 @@ run_test("empty_narrow_html", ({mock_template}) => {
 `,
     );
 
+    // Title, html and action
+    actual_html = empty_narrow_html(
+        "This is a title",
+        undefined,
+        "<h1> This is the html </h1>",
+        undefined,
+        true,
+    );
+    assert.equal(
+        actual_html,
+        `<div class="empty_feed_notice">
+    <h4 class="empty-feed-notice-title"> This is a title </h4>
+        <div class="empty-feed-notice-description">
+            <h1> This is the html </h1>
+        </div>
+        <div class="empty-feed-notice-action">
+        <button
+          class="search-shared-history hidden-for-spectators action-button action-button-subtle-neutral"
+          type="button">
+            translated: Search all public channels
+        </button>
+    </div>
+</div>
+`,
+    );
+
+    // title_html
+    actual_html = empty_narrow_html("Plain text title", "<h1> This is the title html </h1>");
+    assert.equal(
+        actual_html,
+        `<div class="empty_feed_notice">
+    <h4 class="empty-feed-notice-title"> <h1> This is the title html </h1> </h4>
+</div>
+`,
+    );
+
     // Title and search data
     const search_data_with_stop_word = {
         has_stop_word: true,
@@ -151,7 +196,12 @@ run_test("empty_narrow_html", ({mock_template}) => {
             {query_word: "search", is_stop_word: false},
         ],
     };
-    actual_html = empty_narrow_html("This is a title", undefined, search_data_with_stop_word);
+    actual_html = empty_narrow_html(
+        "This is a title",
+        undefined,
+        undefined,
+        search_data_with_stop_word,
+    );
     assert.equal(
         actual_html,
         `<div class="empty_feed_notice">
@@ -174,7 +224,12 @@ run_test("empty_narrow_html", ({mock_template}) => {
             {query_word: "return", is_stop_word: false},
         ],
     };
-    actual_html = empty_narrow_html("This is a title", undefined, search_data_with_stop_words);
+    actual_html = empty_narrow_html(
+        "This is a title",
+        undefined,
+        undefined,
+        search_data_with_stop_words,
+    );
     assert.equal(
         actual_html,
         `<div class="empty_feed_notice">
@@ -194,7 +249,12 @@ run_test("empty_narrow_html", ({mock_template}) => {
         has_stop_word: false,
         query_words: [{query_word: "search", is_stop_word: false}],
     };
-    actual_html = empty_narrow_html("This is a title", undefined, search_data_without_stop_words);
+    actual_html = empty_narrow_html(
+        "This is a title",
+        undefined,
+        undefined,
+        search_data_without_stop_words,
+    );
     assert.equal(
         actual_html,
         `<div class="empty_feed_notice">
@@ -229,7 +289,7 @@ run_test("urls", () => {
     assert.deepEqual(user_ids, [5]);
 });
 
-run_test("show_empty_narrow_message", ({mock_template, override}) => {
+run_test("show_empty_narrow_message", ({mock_template, override, override_rewire}) => {
     settings_data.user_can_access_all_other_users = () => true;
     settings_data.user_has_permission_for_group_setting = () => true;
     override(realm, "stop_words", []);
@@ -243,6 +303,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: There are no messages in your combined feed.",
+            undefined,
             'translated: Would you like to <a href="#narrow/channels/public">view messages in all public channels</a>?',
         ),
     );
@@ -272,13 +333,16 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
 
     // for non-subbed public stream
     const rome_id = 99;
-    stream_data.add_sub_for_tests({name: "ROME", stream_id: rome_id});
+    stream_data.add_sub_for_tests(
+        make_stream({name: "ROME", subscribed: false, stream_id: rome_id}),
+    );
     current_filter = set_filter([["stream", rome_id.toString()]]);
     narrow_banner.show_empty_narrow_message(current_filter);
     assert.equal(
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: There are no messages here.",
+            undefined,
             'translated: Why not <a href="#" class="empty_feed_compose_stream">start the conversation</a>?',
         ),
     );
@@ -291,6 +355,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "",
+            undefined,
             'translated: This is not a <a target="_blank" rel="noopener noreferrer" href="/help/public-access-option">publicly accessible</a> conversation.',
         ),
     );
@@ -304,17 +369,20 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "",
+            undefined,
             'translated: This is not a <a target="_blank" rel="noopener noreferrer" href="/help/public-access-option">publicly accessible</a> conversation.',
         ),
     );
 
     // for web-public stream for spectator
     const web_public_id = 1231;
-    stream_data.add_sub_for_tests({
-        name: "web-public-stream",
-        stream_id: web_public_id,
-        is_web_public: true,
-    });
+    stream_data.add_sub_for_tests(
+        make_stream({
+            name: "web-public-stream",
+            stream_id: web_public_id,
+            is_web_public: true,
+        }),
+    );
     current_filter = set_filter([
         ["stream", web_public_id.toString()],
         ["topic", "foo"],
@@ -332,6 +400,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: You have no starred messages.",
+            undefined,
             'translated: Starring messages is a good way to keep track of important messages, such as tasks you need to go back to, or useful references. To star a message, hover over a message and click the <i class="zulip-icon zulip-icon-star" aria-hidden="true"></i>. <a target="_blank" rel="noopener noreferrer" href="/help/star-a-message">Learn more</a>',
         ),
     );
@@ -342,6 +411,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: This view will show messages where you are mentioned.",
+            undefined,
             'translated: To call attention to a message, you can mention a user, a group, topic participants, or all subscribers to a channel. Type @ in the compose box, and choose who you\'d like to mention from the list of suggestions. <a target="_blank" rel="noopener noreferrer" href="/help/mention-a-user-or-group">Learn more</a>',
         ),
     );
@@ -354,6 +424,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: You have no direct messages yet!",
+            undefined,
             'translated: Why not <a href="#" class="empty_feed_compose_private">start the conversation</a>?',
         ),
     );
@@ -369,7 +440,13 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
     narrow_banner.show_empty_narrow_message(current_filter);
     assert.equal(
         $(".empty_feed_notice_main").html(),
-        empty_narrow_html("translated: No topics are marked as resolved."),
+        empty_narrow_html(
+            undefined,
+            `translated: No topics in <a href="/help/search-for-messages#search-shared-history" target="_blank" rel="noopener noreferrer">your history</a> are marked as resolved.`,
+            undefined,
+            undefined,
+            true,
+        ),
     );
 
     current_filter = set_filter([["is", "followed"]]);
@@ -384,6 +461,16 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
     assert.equal(
         $(".empty_feed_notice_main").html(),
         empty_narrow_html("translated: You have no messages in muted topics and channels."),
+    );
+
+    current_filter = set_filter([["is", "alerted"]]);
+    narrow_banner.show_empty_narrow_message(current_filter);
+    assert.equal(
+        $(".empty_feed_notice_main").html(),
+        empty_narrow_html(
+            undefined,
+            `translated: No search results from <a href="/help/search-for-messages#search-shared-history" target="_blank" rel="noopener noreferrer">your message history</a>.`,
+        ),
     );
     // organization has disabled sending direct messages
     override(realm, "realm_direct_message_permission_group", nobody.id);
@@ -409,6 +496,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: Direct messages are disabled in this organization.",
+            undefined,
             'translated: <a target="_blank" rel="noopener noreferrer" href="/help/restrict-direct-messages">Learn more.</a>',
         ),
     );
@@ -422,6 +510,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: You have no direct messages with Example Bot yet.",
+            undefined,
             'translated: Why not <a href="#" class="empty_feed_compose_private">start the conversation</a>?',
         ),
     );
@@ -434,6 +523,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: Direct messages are disabled in this organization.",
+            undefined,
             'translated: <a target="_blank" rel="noopener noreferrer" href="/help/restrict-direct-messages">Learn more.</a>',
         ),
     );
@@ -446,6 +536,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: You have no direct messages with Alice Smith yet.",
+            undefined,
             'translated: Why not <a href="#" class="empty_feed_compose_private">start the conversation</a>?',
         ),
     );
@@ -469,6 +560,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: You haven't sent yourself any notes yet!",
+            undefined,
             "translated: Use this space for personal notes, or to test out Zulip features.",
         ),
     );
@@ -479,6 +571,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: You have no direct messages with these users yet.",
+            undefined,
             'translated: Why not <a href="#" class="empty_feed_compose_private">start the conversation</a>?',
         ),
     );
@@ -508,7 +601,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
     narrow_banner.show_empty_narrow_message(current_filter);
     assert.equal(
         $(".empty_feed_notice_main").html(),
-        empty_narrow_html("translated: This user does not exist!"),
+        empty_narrow_html("translated: One or more of these users do not exist!"),
     );
 
     current_filter = set_filter([["dm-including", [alice.user_id]]]);
@@ -517,6 +610,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: Direct messages are disabled in this organization.",
+            undefined,
             'translated: <a target="_blank" rel="noopener noreferrer" href="/help/restrict-direct-messages">Learn more.</a>',
         ),
     );
@@ -551,7 +645,13 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
     narrow_banner.show_empty_narrow_message(current_filter);
     assert.equal(
         $(".empty_feed_notice_main").html(),
-        empty_narrow_html("translated: You haven't received any messages sent by Raymond yet."),
+        empty_narrow_html(
+            "translated: You haven't received any messages sent by Raymond yet.",
+            undefined,
+            undefined,
+            undefined,
+            true,
+        ),
     );
 
     current_filter = set_filter([["sender", 9999]]);
@@ -573,22 +673,44 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         empty_narrow_html("translated: No search results."),
     );
 
+    current_filter = set_filter([["mentions", alice.user_id]]);
+    narrow_banner.show_empty_narrow_message(current_filter);
+    assert.equal(
+        $(".empty_feed_notice_main").html(),
+        empty_narrow_html(
+            "translated: No messages in your message history mention Alice Smith yet.",
+            'translated: No messages in <a href="/help/search-for-messages#search-shared-history" target="_blank" rel="noopener noreferrer">your message history</a> mention Alice Smith yet.',
+            undefined,
+            undefined,
+            true,
+        ),
+    );
+
+    current_filter = set_filter([["mentions", -1]]);
+    narrow_banner.show_empty_narrow_message(current_filter);
+    assert.equal(
+        $(".empty_feed_notice_main").html(),
+        empty_narrow_html("translated: This user does not exist!"),
+    );
+
     current_filter = set_filter([["is", "invalid"]]);
     narrow_banner.show_empty_narrow_message(current_filter);
     assert.equal(
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: There are no messages here.",
+            undefined,
             'translated: Why not <a href="#" class="empty_feed_compose_stream">start the conversation</a>?',
         ),
     );
 
     const my_stream_id = 103;
-    const my_stream = {
+    const my_stream = make_stream({
         name: "my stream",
         stream_id: my_stream_id,
-    };
+    });
     stream_data.add_sub_for_tests(my_stream);
+    override_rewire(stream_data, "set_max_channel_width_css_variable", noop);
     stream_data.subscribe_myself(my_stream);
     current_filter = set_filter([["stream", my_stream_id.toString()]]);
     const list = new MessageList({
@@ -607,6 +729,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: You have muted all the topics in this channel.",
+            undefined,
             'translated: To view a muted topic, click <b>show all topics</b> in the left sidebar, and select one from the list. <a target="_blank" rel="noopener noreferrer" href="/help/mute-a-topic">Learn more</a>',
         ),
     );
@@ -617,6 +740,7 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: There are no messages here.",
+            undefined,
             'translated: Why not <a href="#" class="empty_feed_compose_stream">start the conversation</a>?',
         ),
     );
@@ -630,6 +754,18 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         ),
     );
 
+    current_filter = set_filter([["has", "images"]]);
+    narrow_banner.show_empty_narrow_message(current_filter);
+    assert.equal(
+        $(".empty_feed_notice_main").html(),
+        empty_narrow_html(
+            undefined,
+            `translated: No search results from <a href="/help/search-for-messages#search-shared-history" target="_blank" rel="noopener noreferrer">your message history</a>.`,
+            undefined,
+            undefined,
+            true,
+        ),
+    );
     current_filter = set_filter([
         ["has", "reaction"],
         ["sender", me.user_id],
@@ -639,18 +775,19 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: None of your messages have emoji reactions yet.",
+            undefined,
             'translated: Learn more about emoji reactions <a target="_blank" rel="noopener noreferrer" href="/help/emoji-reactions">here</a>.',
         ),
     );
 
     // The channel is private, and the user cannot subscribe (e.g., they
     // have access to channel metadata, but don't have content access).
-    const private_sub = {
+    const private_sub = make_stream({
         stream_id: 101,
         name: "private",
         subscribed: false,
         invite_only: true,
-    };
+    });
     stream_data.add_sub_for_tests(private_sub);
     settings_data.user_has_permission_for_group_setting = () => false;
     current_filter = set_filter([["stream", private_sub.stream_id.toString()]]);
@@ -661,6 +798,15 @@ run_test("show_empty_narrow_message", ({mock_template, override}) => {
             "translated: You are not allowed to view messages in this private channel.",
         ),
     );
+    const channels_operands = ["archived", "public", "web-public"];
+    for (const operand of channels_operands) {
+        current_filter = set_filter([["channels", operand]]);
+        narrow_banner.show_empty_narrow_message(current_filter);
+        assert.equal(
+            $(".empty_feed_notice_main").html(),
+            empty_narrow_html("translated: There are no messages here."),
+        );
+    }
 });
 
 run_test("show_empty_narrow_message_with_search", ({mock_template, override}) => {
@@ -672,7 +818,13 @@ run_test("show_empty_narrow_message_with_search", ({mock_template, override}) =>
     narrow_banner.show_empty_narrow_message(current_filter);
     assert.equal(
         $(".empty_feed_notice_main").html(),
-        empty_narrow_html("translated: No search results."),
+        empty_narrow_html(
+            undefined,
+            `translated: No search results from <a href="/help/search-for-messages#search-shared-history" target="_blank" rel="noopener noreferrer">your message history</a>.`,
+            undefined,
+            undefined,
+            true,
+        ),
     );
 });
 
@@ -698,11 +850,17 @@ run_test("show_search_stopwords", ({mock_template, override}) => {
     narrow_banner.show_empty_narrow_message(current_filter);
     assert.equal(
         $(".empty_feed_notice_main").html(),
-        empty_narrow_html("translated: No search results.", undefined, expected_search_data),
+        empty_narrow_html(
+            undefined,
+            `translated: No search results from <a href="/help/search-for-messages#search-shared-history" target="_blank" rel="noopener noreferrer">your message history</a>.`,
+            undefined,
+            expected_search_data,
+            true,
+        ),
     );
 
     const streamA_id = 88;
-    stream_data.add_sub_for_tests({name: "streamA", stream_id: streamA_id});
+    stream_data.add_sub_for_tests(make_stream({name: "streamA", stream_id: streamA_id}));
     current_filter = set_filter([
         ["stream", streamA_id.toString()],
         ["search", "what about grail"],
@@ -710,7 +868,12 @@ run_test("show_search_stopwords", ({mock_template, override}) => {
     narrow_banner.show_empty_narrow_message(current_filter);
     assert.equal(
         $(".empty_feed_notice_main").html(),
-        empty_narrow_html("translated: No search results.", undefined, expected_search_data),
+        empty_narrow_html(
+            "translated: No search results.",
+            undefined,
+            undefined,
+            expected_search_data,
+        ),
     );
 
     current_filter = set_filter([
@@ -721,7 +884,36 @@ run_test("show_search_stopwords", ({mock_template, override}) => {
     narrow_banner.show_empty_narrow_message(current_filter);
     assert.equal(
         $(".empty_feed_notice_main").html(),
-        empty_narrow_html("translated: No search results.", undefined, expected_search_data),
+        empty_narrow_html(
+            "translated: No search results.",
+            undefined,
+            undefined,
+            expected_search_data,
+        ),
+    );
+
+    // Stop word exclusion is case insensitive.
+    const expected_search_data_capitalization_case = {
+        has_stop_word: true,
+        query_words: [
+            {query_word: "What", is_stop_word: true},
+            {query_word: "ABOUT", is_stop_word: true},
+            {query_word: "Grail", is_stop_word: false},
+        ],
+    };
+    current_filter = set_filter([
+        ["stream", streamA_id.toString()],
+        ["search", "What ABOUT Grail"],
+    ]);
+    narrow_banner.show_empty_narrow_message(current_filter);
+    assert.equal(
+        $(".empty_feed_notice_main").html(),
+        empty_narrow_html(
+            "translated: No search results.",
+            undefined,
+            undefined,
+            expected_search_data_capitalization_case,
+        ),
     );
 });
 
@@ -730,8 +922,8 @@ run_test("show_invalid_narrow_message", ({mock_template}) => {
 
     const streamA_id = 88;
     const streamB_id = 77;
-    stream_data.add_sub_for_tests({name: "streamA", stream_id: streamA_id});
-    stream_data.add_sub_for_tests({name: "streamB", stream_id: streamB_id});
+    stream_data.add_sub_for_tests(make_stream({name: "streamA", stream_id: streamA_id}));
+    stream_data.add_sub_for_tests(make_stream({name: "streamB", stream_id: streamB_id}));
 
     let current_filter = set_filter([
         ["stream", streamA_id.toString()],
@@ -742,6 +934,7 @@ run_test("show_invalid_narrow_message", ({mock_template}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: No search results.",
+            undefined,
             "translated: <p>You are searching for messages that belong to more than one channel, which is not possible.</p>",
         ),
     );
@@ -755,6 +948,7 @@ run_test("show_invalid_narrow_message", ({mock_template}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: No search results.",
+            undefined,
             "translated: <p>You are searching for messages that belong to more than one topic, which is not possible.</p>",
         ),
     );
@@ -771,6 +965,7 @@ run_test("show_invalid_narrow_message", ({mock_template}) => {
         $(".empty_feed_notice_main").html(),
         empty_narrow_html(
             "translated: No search results.",
+            undefined,
             "translated: <p>You are searching for messages that are sent by more than one person, which is not possible.</p>",
         ),
     );
@@ -799,7 +994,9 @@ run_test("narrow_to_compose_target streams", ({override, override_rewire}) => {
 
     compose_state.set_message_type("stream");
     const rome_id = 99;
-    stream_data.add_sub_for_tests({name: "ROME", stream_id: rome_id, topics_policy: "inherit"});
+    stream_data.add_sub_for_tests(
+        make_stream({name: "ROME", stream_id: rome_id, topics_policy: "inherit"}),
+    );
     compose_state.set_stream_id(99);
 
     // Test with existing topic
@@ -823,7 +1020,7 @@ run_test("narrow_to_compose_target streams", ({override, override_rewire}) => {
         {operator: "topic", operand: "four"},
     ]);
 
-    // Test with blank topic, with realm_topics_policy
+    // Test with blank topic, empty topic not allowed
     override(realm, "realm_topics_policy", "disable_empty_topic");
     compose_state.topic("");
     args.called = false;
@@ -831,8 +1028,9 @@ run_test("narrow_to_compose_target streams", ({override, override_rewire}) => {
     assert.equal(args.called, true);
     assert.deepEqual(args.terms, [{operator: "channel", operand: rome_id.toString()}]);
 
-    // Test with blank topic, without realm_topics_policy
+    // Test with blank topic, empty topic allowed
     override(realm, "realm_topics_policy", "allow_empty_topic");
+    override_rewire(stream_data, "can_create_new_topics_in_stream", () => true);
     compose_state.topic("");
     args.called = false;
     message_view.to_compose_target();
@@ -842,24 +1040,15 @@ run_test("narrow_to_compose_target streams", ({override, override_rewire}) => {
         {operator: "topic", operand: ""},
     ]);
 
-    // Test with no topic, with realm mandatory topics
-    override(realm, "realm_topics_policy", "disable_empty_topic");
-    compose_state.topic(undefined);
+    // When empty topic is allowed by policy but user cannot create
+    // topics and no empty topic exists, narrowing with blank topic
+    // should not include the topic term.
+    override_rewire(stream_data, "can_create_new_topics_in_stream", () => false);
+    compose_state.topic("");
     args.called = false;
     message_view.to_compose_target();
     assert.equal(args.called, true);
     assert.deepEqual(args.terms, [{operator: "channel", operand: rome_id.toString()}]);
-
-    // Test with no topic, without realm mandatory topics
-    override(realm, "realm_topics_policy", "allow_empty_topic");
-    compose_state.topic(undefined);
-    args.called = false;
-    message_view.to_compose_target();
-    assert.equal(args.called, true);
-    assert.deepEqual(args.terms, [
-        {operator: "channel", operand: rome_id.toString()},
-        {operator: "topic", operand: ""},
-    ]);
 });
 
 run_test("narrow_to_compose_target direct messages", ({override, override_rewire}) => {
@@ -935,12 +1124,17 @@ run_test("fast_track_current_msg_list_to_anchor date", ({override}) => {
         selected = {id, opts};
     };
     message_lists.current = list;
+    $("#navbar-fixed-container").set_height(50);
+    $(".message_header").set_height(30);
+    // Date jumps should place the selected message below the sticky
+    // message header, increasing the target scroll offset by the
+    // header's measured height (30px here).
 
     const in_range = new Date(150 * 1000).toISOString();
     message_view.fast_track_current_msg_list_to_anchor("date", in_range);
     assert.deepEqual(selected, {
         id: 102,
-        opts: {then_scroll: true, from_scroll: false},
+        opts: {then_scroll: true, from_scroll: false, target_scroll_offset: 80},
     });
 
     list.data.fetch_status.finish_older_batch({
@@ -952,7 +1146,7 @@ run_test("fast_track_current_msg_list_to_anchor date", ({override}) => {
     message_view.fast_track_current_msg_list_to_anchor("date", before_range);
     assert.deepEqual(selected, {
         id: 101,
-        opts: {then_scroll: true, from_scroll: false},
+        opts: {then_scroll: true, from_scroll: false, target_scroll_offset: 80},
     });
 
     // If we have not found the oldest message, and the anchor timestamp is
@@ -988,7 +1182,12 @@ run_test("fast_track_current_msg_list_to_anchor date", ({override}) => {
     assert.equal(load_messages_anchor, "date");
     assert.deepEqual(selected, {
         id: 100,
-        opts: {then_scroll: true, from_scroll: false, force_rerender: true},
+        opts: {
+            then_scroll: true,
+            from_scroll: false,
+            force_rerender: true,
+            target_scroll_offset: 80,
+        },
     });
 
     // Message 104 is not in the list so we need to fetch it from the API
@@ -1016,7 +1215,12 @@ run_test("fast_track_current_msg_list_to_anchor date", ({override}) => {
     assert.equal(load_messages_anchor, "date");
     assert.deepEqual(selected, {
         id: 104,
-        opts: {then_scroll: true, from_scroll: false, force_rerender: true},
+        opts: {
+            then_scroll: true,
+            from_scroll: false,
+            force_rerender: true,
+            target_scroll_offset: 80,
+        },
     });
 
     // If we have found the newest message, having anchor_date in
@@ -1030,7 +1234,7 @@ run_test("fast_track_current_msg_list_to_anchor date", ({override}) => {
     message_view.fast_track_current_msg_list_to_anchor("date", future_range);
     assert.deepEqual(selected, {
         id: 104,
-        opts: {then_scroll: true, from_scroll: false},
+        opts: {then_scroll: true, from_scroll: false, target_scroll_offset: 80},
     });
     assert.equal(load_messages_calls, 0);
 
@@ -1067,10 +1271,10 @@ run_test("narrow_compute_title", () => {
 
     // Stream narrows
     const foo_stream_id = 43;
-    const sub = {
+    const sub = make_stream({
         name: "Foo",
         stream_id: foo_stream_id,
-    };
+    });
     stream_data.add_sub_for_tests(sub);
 
     filter = new Filter([

@@ -1,15 +1,18 @@
 import ClipboardJS from "clipboard";
 import {isValid, parseISO} from "date-fns";
-import $ from "jquery";
+import {$} from "jquery";
+import _ from "lodash";
 import assert from "minimalistic-assert";
 
 import render_channel_message_link from "../templates/channel_message_link.hbs";
 import code_buttons_container from "../templates/code_buttons_container.hbs";
+import render_decorated_channel_name from "../templates/decorated_channel_name.hbs";
 import render_markdown_audio from "../templates/markdown_audio.hbs";
 import render_markdown_timestamp from "../templates/markdown_timestamp.hbs";
 import render_mention_content_wrapper from "../templates/mention_content_wrapper.hbs";
 import render_topic_link from "../templates/topic_link.hbs";
 
+import * as alert_words from "./alert_words.ts";
 import * as blueslip from "./blueslip.ts";
 import {show_copied_confirmation} from "./copied_tooltip.ts";
 import * as hash_util from "./hash_util.ts";
@@ -53,10 +56,7 @@ export function get_user_id_for_mention_button(elem: HTMLElement): "*" | number 
 
     if (email) {
         // Will return undefined if there's no match
-        const user = people.get_by_email(email);
-        if (user) {
-            return user.user_id;
-        }
+        return people.maybe_get_user_id_by_email(email);
     }
     return undefined;
 }
@@ -65,6 +65,49 @@ function get_user_group_id_for_mention_button(elem: HTMLElement): number {
     const user_group_id = $(elem).attr("data-user-group-id");
     assert(user_group_id !== undefined);
     return Number.parseInt(user_group_id, 10);
+}
+
+// We pass a minimal mock stream object in info_overlay for rendering stream links.
+type StreamInfo = sub_store.StreamSubscription | {stream_id: number; name: string};
+
+export function update_stream_link_element($elem: JQuery, stream_info: StreamInfo): void {
+    $elem.html(render_decorated_channel_name({stream: stream_info, inline_with_text: true}));
+}
+
+export function update_topic_or_message_link_element(
+    $elem: JQuery,
+    stream_info: StreamInfo,
+    topic_name: string,
+    narrow_url: string,
+    message?: Message,
+): void {
+    let topic_display_name = _.escape(util.get_final_topic_display_name(topic_name));
+
+    if (message?.alerted) {
+        topic_display_name = alert_words.highlight_alert_words(topic_display_name);
+    }
+
+    const context = {
+        channel_name: stream_info.name,
+        topic_display_name_html: topic_display_name,
+        is_empty_string_topic: topic_name === "",
+        href: narrow_url,
+    };
+
+    if ($elem.hasClass("stream-topic")) {
+        const topic_link_html = render_topic_link({
+            channel_id: stream_info.stream_id,
+            stream: stream_info,
+            ...context,
+        });
+        $elem.replaceWith($(topic_link_html));
+    } else {
+        const message_link_html = render_channel_message_link({
+            stream: stream_info,
+            ...context,
+        });
+        $elem.replaceWith($(message_link_html));
+    }
 }
 
 function get_message_for_message_content($content: JQuery): Message | undefined {
@@ -121,6 +164,7 @@ export function set_name_in_mention_element(
 }
 
 export const update_elements = ($content: JQuery): void => {
+    let message: Message | undefined;
     // Set the rtl class if the text has an rtl direction
     if (rtl.get_direction($content.text()) === "rtl") {
         $content.addClass("rtl");
@@ -135,24 +179,26 @@ export const update_elements = ($content: JQuery): void => {
         });
     }
 
+    // Hide video preview for browsers that cannot play the format.
+    // The download link remains available.
+    $content.find<HTMLMediaElement>(".message_inline_video video").each((_index, video) => {
+        $(video).on("error", () => {
+            $(video).closest(".message_inline_video").addClass("video-format-unsupported");
+        });
+    });
+
     // personal and stream wildcard mentions
     $content.find(".user-mention").each(function (): void {
         const user_id = get_user_id_for_mention_button(this);
-        const message = get_message_for_message_content($content);
+        message ??= get_message_for_message_content($content);
         const user_is_bot =
             user_id !== undefined && user_id !== "*" && people.is_valid_bot_user(user_id);
         // We give special highlights to the mention buttons
         // that refer to the current user.
-        if (user_id === "*" && message && message.stream_wildcard_mentioned) {
+        if (user_id === "*" && message?.stream_wildcard_mentioned) {
             $(this).addClass("user-mention-me");
         }
-        if (
-            user_id !== undefined &&
-            user_id !== "*" &&
-            people.is_my_user_id(user_id) &&
-            message &&
-            message.mentioned_me_directly
-        ) {
+        if (user_id !== undefined && user_id !== "*" && people.is_my_user_id(user_id) && message) {
             $(this).addClass("user-mention-me");
         }
 
@@ -185,9 +231,9 @@ export const update_elements = ($content: JQuery): void => {
     });
 
     $content.find(".topic-mention").each(function (): void {
-        const message = get_message_for_message_content($content);
+        message ??= get_message_for_message_content($content);
 
-        if (message && message.topic_wildcard_mentioned) {
+        if (message?.topic_wildcard_mentioned) {
             $(this).addClass("user-mention-me");
         }
 
@@ -227,12 +273,12 @@ export const update_elements = ($content: JQuery): void => {
         if (stream_id && $(this).find(".highlight").length === 0) {
             // Display the current name for stream if it is not
             // being displayed in search highlight.
-            const stream_name = sub_store.maybe_get_stream_name(stream_id);
-            if (stream_name !== undefined) {
-                // If the stream has been deleted,
-                // sub_store.maybe_get_stream_name might return
-                // undefined.  Otherwise, display the current stream name.
-                $(this).text("#" + stream_name);
+            const sub = sub_store.get(stream_id);
+            if (sub !== undefined) {
+                // If the stream has been deleted, sub_store.get
+                // might return undefined.  Otherwise, display the
+                // current stream name.
+                update_stream_link_element($(this), sub);
             }
         }
     });
@@ -242,31 +288,21 @@ export const update_elements = ($content: JQuery): void => {
         assert(narrow_url !== undefined);
         const channel_topic = hash_util.decode_stream_topic_from_url(narrow_url);
         assert(channel_topic !== null);
-        const channel_name = sub_store.maybe_get_stream_name(channel_topic.stream_id);
-        if (channel_name !== undefined && $(this).find(".highlight").length === 0) {
+        const sub = sub_store.get(channel_topic.stream_id);
+        if (sub !== undefined && $(this).find(".highlight").length === 0) {
             // Display the current channel name if it hasn't been deleted
             // and not being displayed in search highlight.
             // TODO: Ideally, we should NOT skip this if only topic is highlighted,
             // but we are doing so currently.
-            const topic_name = channel_topic.topic_name;
-            assert(topic_name !== undefined);
-            const topic_display_name = util.get_final_topic_display_name(topic_name);
-            const context = {
-                channel_name,
-                topic_display_name,
-                is_empty_string_topic: topic_name === "",
-                href: narrow_url,
-            };
-            if ($(this).hasClass("stream-topic")) {
-                const topic_link_html = render_topic_link({
-                    channel_id: channel_topic.stream_id,
-                    ...context,
-                });
-                $(this).replaceWith($(topic_link_html));
-            } else {
-                const message_link_html = render_channel_message_link(context);
-                $(this).replaceWith($(message_link_html));
-            }
+            assert(channel_topic.topic_name !== undefined);
+            message ??= get_message_for_message_content($content);
+            update_topic_or_message_link_element(
+                $(this),
+                sub,
+                channel_topic.topic_name,
+                narrow_url,
+                message,
+            );
         }
     });
 

@@ -74,8 +74,11 @@ def check_string_in(possible_values: Container[str]) -> Validator[str]:
     return validator
 
 
+SHORT_STRING_MAX_LENGTH = 50
+
+
 def check_short_string(var_name: str, val: object) -> str:
-    return check_capped_string(50)(var_name, val)
+    return check_capped_string(SHORT_STRING_MAX_LENGTH)(var_name, val)
 
 
 def check_capped_string(max_length: int) -> Validator[str]:
@@ -109,8 +112,11 @@ def check_string_fixed_length(length: int) -> Validator[str]:
     return validator
 
 
+LONG_STRING_MAX_LENGTH = 500
+
+
 def check_long_string(var_name: str, val: object) -> str:
-    return check_capped_string(500)(var_name, val)
+    return check_capped_string(LONG_STRING_MAX_LENGTH)(var_name, val)
 
 
 def check_date(var_name: str, val: object) -> str:
@@ -322,7 +328,7 @@ def equals(expected_val: ResultT) -> Validator[ResultT]:
                     value=val,
                 )
             )
-        return cast(ResultT, val)
+        return val
 
     return f
 
@@ -377,7 +383,9 @@ def check_external_account_url_pattern(var_name: str, val: object) -> str:
     return s
 
 
-def validate_select_field_data(field_data: ProfileFieldData) -> dict[str, dict[str, str]]:
+def validate_custom_profile_field_choices(
+    field_data: ProfileFieldData,
+) -> dict[str, dict[str, str]]:
     """
     This function is used to validate the data sent to the server while
     creating/editing choices of the choice field in Organization settings.
@@ -408,7 +416,7 @@ def validate_select_field_data(field_data: ProfileFieldData) -> dict[str, dict[s
     return cast(dict[str, dict[str, str]], field_data)
 
 
-def validate_select_field(var_name: str, field_data: str, value: object) -> str:
+def validate_dropdown_field(var_name: str, field_data: str, value: object) -> str:
     """
     This function is used to validate the value selected by the user against a
     choice field. This is not used to validate admin data.

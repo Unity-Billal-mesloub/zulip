@@ -1,4 +1,5 @@
-import $ from "jquery";
+import ClipboardJS from "clipboard";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -13,6 +14,7 @@ import * as avatar from "./avatar.ts";
 import * as bot_helper from "./bot_helper.ts";
 import * as channel from "./channel.ts";
 import * as common from "./common.ts";
+import {show_copied_confirmation} from "./copied_tooltip.ts";
 import {csrf_token} from "./csrf.ts";
 import * as custom_profile_fields_ui from "./custom_profile_fields_ui.ts";
 import type {CustomProfileFieldData, PillUpdateField} from "./custom_profile_fields_ui.ts";
@@ -30,6 +32,7 @@ import * as settings_data from "./settings_data.ts";
 import * as settings_org from "./settings_org.ts";
 import * as settings_ui from "./settings_ui.ts";
 import {current_user, realm} from "./state_data.ts";
+import * as timerender from "./timerender.ts";
 import * as ui_report from "./ui_report.ts";
 import * as ui_util from "./ui_util.ts";
 import * as user_deactivation_ui from "./user_deactivation_ui.ts";
@@ -40,8 +43,7 @@ import {user_settings} from "./user_settings.ts";
 import * as util from "./util.ts";
 
 let password_quality:
-    | ((password: string, $bar: JQuery | undefined, $password_field: JQuery) => boolean)
-    | undefined; // Loaded asynchronously
+    ((password: string, $bar: JQuery | undefined, $password_field: JQuery) => boolean) | undefined; // Loaded asynchronously
 let user_avatar_widget_created = false;
 let user_timezone_dropdown_widget: dropdown_widget.DropdownWidget | undefined;
 
@@ -307,9 +309,10 @@ export function update_privacy_settings_box(property: PrivacySettingName): void 
 }
 
 export function render_user_timezone_dropdown_widget(): void {
-    const timezone_items = timezones.timezones.map((tz: {name: string; utc_offset: string}) => ({
-        name: `${tz.name} (${tz.utc_offset})`,
-        unique_id: tz.name,
+    const now = new Date();
+    const timezone_items = timezones.timezones.map((tz) => ({
+        name: `${tz} (${timerender.get_utc_offset_string(tz, now)})`,
+        unique_id: tz,
     }));
 
     const opts: dropdown_widget.DropdownWidgetOptions = {
@@ -457,6 +460,16 @@ export function set_up(): void {
                 "#get_api_key_password + .password_visibility_toggle",
             );
         });
+        new ClipboardJS("#show_api_key .copy-button", {
+            text() {
+                return $("#api_key_value").text();
+            },
+        }).on("success", (e) => {
+            assert(e.trigger instanceof HTMLElement);
+            show_copied_confirmation(e.trigger, {
+                show_check_icon: true,
+            });
+        });
     };
 
     $("#api_key_button").on("click", (e) => {
@@ -602,7 +615,8 @@ export function set_up(): void {
                         "Sorry for the trouble!",
                 );
                 return;
-            } else if (!password_quality(new_pw, undefined, $new_pw_field)) {
+            }
+            if (!password_quality(new_pw, undefined, $new_pw_field)) {
                 settings_change_error($t_html({defaultMessage: "New password is too weak!"}));
                 return;
             }
@@ -851,7 +865,7 @@ export function set_up(): void {
                 success() {
                     dialog_widget.hide_dialog_spinner();
                     dialog_widget.close();
-                    window.location.href = "/login/";
+                    window.location.assign("/login/");
                 },
                 error(xhr) {
                     const error_last_owner = $t_html({
@@ -903,8 +917,7 @@ export function set_up(): void {
         e.stopPropagation();
         e.preventDefault();
 
-        const user = people.get_by_user_id(people.my_current_user_id());
-        user_profile.show_user_profile(user);
+        user_profile.show_user_profile(people.my_current_user_id());
     });
 
     // When the personal settings overlay is opened, we reset

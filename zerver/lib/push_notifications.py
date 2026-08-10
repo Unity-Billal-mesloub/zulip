@@ -6,7 +6,7 @@ import logging
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from email.headerregistry import Address
 from functools import cache
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, TypeAlias, Union, cast
@@ -185,6 +185,11 @@ def get_apns_context() -> APNsContext | None:
     if not has_apns_credentials():  # nocoverage
         return None
 
+    key: str | None = None
+    if settings.APNS_TOKEN_KEY_FILE:  # nocoverage
+        with open(settings.APNS_TOKEN_KEY_FILE) as f:
+            key = f.read()
+
     # NB if called concurrently, this will make excess connections.
     # That's a little sloppy, but harmless unless a server gets
     # hammered with a ton of these all at once after startup.
@@ -200,10 +205,6 @@ def get_apns_context() -> APNsContext | None:
         pass  # nocoverage
 
     async def make_apns() -> aioapns.APNs:
-        key: str | None = None
-        if settings.APNS_TOKEN_KEY_FILE:  # nocoverage
-            with open(settings.APNS_TOKEN_KEY_FILE) as f:
-                key = f.read()
         return aioapns.APNs(
             client_cert=settings.APNS_CERT_FILE,
             key=key,
@@ -1039,16 +1040,15 @@ def get_message_payload(
 
         data["topic"] = get_topic_display_name(message.topic_name(), user_profile.default_language)
     else:
-        assert message.recipient.type in [Recipient.PERSONAL, Recipient.DIRECT_MESSAGE_GROUP]
+        assert message.recipient.type == Recipient.DIRECT_MESSAGE_GROUP
         if for_legacy_clients:
             data["recipient_type"] = "private"
-            if message.recipient.type == Recipient.DIRECT_MESSAGE_GROUP:
-                # For group DMs, we need to fetch the users for the pm_users field.
-                # Note that this doesn't do a separate database query, because both
-                # functions use the get_display_recipient_by_id cache.
-                recipients = get_display_recipient(message.recipient)
-                if len(recipients) > 2:
-                    data["pm_users"] = direct_message_group_users(message.recipient.id)
+            # For 3+ person DMs, we need to fetch the users for the pm_users field.
+            # Note that this doesn't do a separate database query, because both
+            # functions use the get_display_recipient_by_id cache.
+            recipients = get_display_recipient(message.recipient)
+            if len(recipients) > 2:
+                data["pm_users"] = direct_message_group_users(message.recipient.id)
         else:
             data["recipient_type"] = "direct"
             # For 1:1 and group DMs, we need to fetch the users for the `recipient_user_ids`
@@ -1058,7 +1058,7 @@ def get_message_payload(
             recipient_user_ids = {
                 display_recipient["id"] for display_recipient in display_recipients
             }
-            if len(recipient_user_ids) == 1:  # Recipient.PERSONAL
+            if len(recipient_user_ids) == 1:  # Self-DM
                 recipient_user_ids.add(message.sender_id)
             data["recipient_user_ids"] = sorted(recipient_user_ids)
 
@@ -1116,8 +1116,6 @@ def get_apns_alert_subtitle(
         NotificationTriggers.STREAM_WILDCARD_MENTION,
     ):
         return _("{full_name} mentioned everyone:").format(full_name=sender_name)
-    elif message.recipient.type == Recipient.PERSONAL:
-        return ""
     elif message.recipient.type == Recipient.DIRECT_MESSAGE_GROUP:
         recipients = get_display_recipient(message.recipient)
         if len(recipients) <= 2:
@@ -1366,18 +1364,6 @@ def send_push_notifications_legacy(
     android_devices: list[PushDeviceToken],
 ) -> None:
     assert len(android_devices) + len(apple_devices) != 0
-    # While sending push notifications for new messages to older clients
-    # (which don't support E2EE), if `require_e2ee_push_notifications`
-    # realm setting is set to `true`, we redact the content.
-    if user_profile.realm.require_e2ee_push_notifications:
-        # Make deep copies so redaction doesn't affect the original dicts
-        placeholder_content = _("New message")
-        if gcm_payload and gcm_payload.get("event") != "remove":
-            gcm_payload = copy.deepcopy(gcm_payload)
-            gcm_payload["content"] = placeholder_content
-        if apns_payload and apns_payload["custom"]["zulip"].get("event") != "remove":
-            apns_payload = copy.deepcopy(apns_payload)
-            apns_payload["alert"]["body"] = placeholder_content
 
     if uses_notification_bouncer():
         send_notifications_to_bouncer(
@@ -1455,9 +1441,7 @@ class APNsHTTPHeaders:
 
 @dataclass
 class APNsPayload(PushRequestBasePayload):
-    aps: dict[str, int | dict[str, str]] = field(
-        default_factory=lambda: {"mutable-content": 1, "alert": {"title": "New notification"}}
-    )
+    aps: dict[str, int | str | dict[str, str]]
 
 
 @dataclass
@@ -1523,9 +1507,14 @@ def send_push_notifications(
                 apns_priority=apns_priority,
                 apns_push_type=apns_push_type,
             )
+            aps: dict[str, int | str | dict[str, str]] = {"mutable-content": 1}
+            if not is_removal:
+                aps["alert"] = {"title": "New notification"}
+                aps["sound"] = "default"
             apns_payload = APNsPayload(
                 push_key_id=push_device.push_key_id,
                 encrypted_data=encrypted_data,
+                aps=aps,
             )
             apns_push_request = APNsPushRequest(
                 token_id=b64encode_token_id_int(push_device.push_token_id),
@@ -1578,7 +1567,7 @@ def send_push_notifications(
         if is_test_notification:
             # Propagate the exception to the caller to notify the client
             # about the error while attempting to send test push notification.
-            raise e
+            raise
 
         return
 
@@ -1597,7 +1586,7 @@ def send_push_notifications(
         )
         # Uses 'zerver_device_user_push_token_id_idx' index.
         with transaction.atomic(durable=True):
-            push_devices = Device.objects.select_for_update().filter(
+            push_devices = Device.objects.select_for_update(no_key=True).filter(
                 user=user_profile, push_token_id__in=delete_token_ids_int
             )
             for push_device in push_devices:
@@ -1659,28 +1648,29 @@ def prepare_payload_and_send_push_notifications(
     ],
     get_payload_to_encrypt: Callable[[], dict[str, Any]],
 ) -> None:
-    # Send legacy/non-E2EE push notifications.
-    push_device_tokens = PushDeviceToken.objects.filter(user=user_profile).order_by("id")
-    if push_device_tokens:
-        apple_devices, android_devices = [], []
+    if not user_profile.realm.require_e2ee_push_notifications:
+        # Send legacy/non-E2EE push notifications.
+        push_device_tokens = PushDeviceToken.objects.filter(user=user_profile).order_by("id")
+        if push_device_tokens:
+            apple_devices, android_devices = [], []
 
-        for push_device_token in push_device_tokens:
-            if push_device_token.kind == PushDeviceToken.APNS:
-                apple_devices.append(push_device_token)
-            else:
-                android_devices.append(push_device_token)
+            for push_device_token in push_device_tokens:
+                if push_device_token.kind == PushDeviceToken.APNS:
+                    apple_devices.append(push_device_token)
+                else:
+                    android_devices.append(push_device_token)
 
-        apns_payload, gcm_payload, gcm_options = get_payload_legacy(
-            bool(apple_devices), bool(android_devices)
-        )
-        send_push_notifications_legacy(
-            user_profile, apns_payload, gcm_payload, gcm_options, apple_devices, android_devices
-        )
-    else:
-        logger.info(
-            "Skipping legacy push notifications for user %s because there are no registered devices",
-            user_profile.id,
-        )
+            apns_payload, gcm_payload, gcm_options = get_payload_legacy(
+                bool(apple_devices), bool(android_devices)
+            )
+            send_push_notifications_legacy(
+                user_profile, apns_payload, gcm_payload, gcm_options, apple_devices, android_devices
+            )
+        else:
+            logger.info(
+                "Skipping legacy push notifications for user %s because there are no registered devices",
+                user_profile.id,
+            )
 
     # Send E2EE push notifications.
     # Uses 'zerver_device_user_push_token_id_idx' index.
@@ -1723,7 +1713,6 @@ def handle_push_notification(user_profile_id: int, missed_message: dict[str, Any
             "subject",
             "rendered_content",
             "date_sent",
-            "sender__recipient_id",
             "sender__realm_id",
             "sender__is_bot",
             "sender__email",
@@ -1749,6 +1738,12 @@ def handle_push_notification(user_profile_id: int, missed_message: dict[str, Any
             if ArchivedMessage.objects.filter(id=missed_message["message_id"]).exists():
                 # If the cause is a race with the message being deleted,
                 # that's normal and we have no need to log an error.
+                return
+            if Message.objects.filter(id=missed_message["message_id"]).exists():
+                # If the message exists but is no longer accessible to
+                # the user, this is likely because the message was moved
+                # to a channel the user doesn't have access to. This is
+                # a normal race and we have no need to log an error.
                 return
             logging.info(
                 "Unexpected message access failure handling push notifications: %s %s",

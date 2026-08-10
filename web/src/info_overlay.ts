@@ -1,12 +1,15 @@
-import $ from "jquery";
+import {$} from "jquery";
+import assert from "minimalistic-assert";
 
 import render_keyboard_shortcut from "../templates/keyboard_shortcuts.hbs";
 import render_markdown_help from "../templates/markdown_help.hbs";
+import render_print_info_overlay from "../templates/print_info_overlay.hbs";
 import render_search_operator from "../templates/search_operators.hbs";
 import render_status_message_example from "../templates/status_message_example.hbs";
 import render_poll_widget_example from "../templates/widgets/poll_widget_example.hbs";
 import render_todo_widget_example from "../templates/widgets/todo_widget_example.hbs";
 
+import * as blueslip from "./blueslip.ts";
 import * as browser_history from "./browser_history.ts";
 import * as common from "./common.ts";
 import * as components from "./components.ts";
@@ -25,6 +28,39 @@ import {user_settings} from "./user_settings.ts";
 // Make it explicit that our toggler is undefined until
 // set_up_toggler is called.
 export let toggler: Toggle | undefined;
+
+const mock_sub = {stream_id: 0, name: $t({defaultMessage: "channel name"})};
+const mock_topic = $t({defaultMessage: "topic name"});
+
+export function print_current_pane(): void {
+    const pane_key = toggler?.key();
+    const title = toggler?.value();
+    if (pane_key === undefined || title === undefined) {
+        blueslip.warn("print_current_pane: no active pane found");
+        return;
+    }
+
+    const $pane = $(`#${CSS.escape(pane_key)} .overlay-scroll-container`);
+    if ($pane.length === 0) {
+        blueslip.warn("print_current_pane: scroll container not found", {pane_key});
+        return;
+    }
+
+    // Extract just the pane's content, leaving SimpleBar's wrapper and
+    // scrollbar elements out of the printed DOM.
+    const body_html = scroll_util.get_content_element($pane).html() ?? "";
+    const html = render_print_info_overlay({title, body_html});
+    const $container = $(html);
+    $("body").append($container);
+
+    const after_print = (): void => {
+        $container.remove();
+        window.removeEventListener("afterprint", after_print);
+    };
+    window.addEventListener("afterprint", after_print);
+
+    window.print();
+}
 
 function format_usage_html(...keys: string[]): string {
     return $t_html(
@@ -57,11 +93,11 @@ const markdown_help_rows = [
         usage_html: format_usage_html("Ctrl", "Shift", "L"),
     },
     {
-        markdown: `#**${$t({defaultMessage: "channel name"})}**`,
+        markdown: `#**${mock_sub.name}**`,
         effect_html: $t({defaultMessage: "(links to a channel)"}),
     },
     {
-        markdown: `#**${$t({defaultMessage: "channel name"})}>${$t({defaultMessage: "topic name"})}**`,
+        markdown: `#**${mock_sub.name}>${mock_topic}**`,
         effect_html: $t({defaultMessage: "(links to topic)"}),
     },
     {
@@ -102,6 +138,16 @@ const markdown_help_rows = [
 1. ${$t({defaultMessage: "Milk"})}
 1. ${$t({defaultMessage: "Tea"})}
 1. ${$t({defaultMessage: "Coffee"})}`,
+    },
+    {
+        markdown: "",
+        usage_html: `<kbd>Ctrl</kbd> + <kbd>]</kbd>`,
+        output_html: $t({defaultMessage: "Increase list indentation"}),
+    },
+    {
+        markdown: "",
+        usage_html: `<kbd>Ctrl</kbd> + <kbd>[</kbd>`,
+        output_html: $t({defaultMessage: "Reduce list indentation"}),
     },
     {
         markdown: `> ${$t({defaultMessage: "Quoted"})}`,
@@ -217,7 +263,7 @@ export function set_up_toggler(): void {
             return "";
         },
         get_stream_by_name(stream_name) {
-            return {stream_id: 0, name: stream_name};
+            return {stream_id: mock_sub.stream_id, name: stream_name};
         },
     };
     for (const row of markdown_help_rows) {
@@ -227,6 +273,21 @@ export function set_up_toggler(): void {
                 ...markdown.render(row.markdown, helper_config),
             };
             const rendered_content = new DOMParser().parseFromString(message.content, "text/html");
+            for (const elt of rendered_content.querySelectorAll<HTMLElement>("a[data-stream-id]")) {
+                const $elt = $(elt);
+                if ($elt.is("a.stream")) {
+                    rendered_markdown.update_stream_link_element($elt, mock_sub);
+                } else {
+                    const href = $elt.attr("href");
+                    assert(href !== undefined);
+                    rendered_markdown.update_topic_or_message_link_element(
+                        $elt,
+                        mock_sub,
+                        mock_topic,
+                        href,
+                    );
+                }
+            }
             // We remove all attributes from stream links in the markdown content since
             // we just want to display a mock template.
             for (const elt of rendered_content.querySelectorAll("a[data-stream-id]")) {
@@ -283,7 +344,6 @@ export function set_up_toggler(): void {
     });
 
     for (const $modal of modals) {
-        scroll_util.get_scroll_element($modal).prop("tabindex", 0);
         keydown_util.handle({
             $elem: $modal,
             handlers: {

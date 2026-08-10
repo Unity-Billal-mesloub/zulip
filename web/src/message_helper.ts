@@ -13,6 +13,7 @@ import * as reactions from "./reactions.ts";
 import * as recent_senders from "./recent_senders.ts";
 import * as stream_data from "./stream_data.ts";
 import * as stream_topic_history from "./stream_topic_history.ts";
+import * as submessage from "./submessage.ts";
 import * as user_status from "./user_status.ts";
 import * as util from "./util.ts";
 
@@ -84,7 +85,6 @@ export function process_new_message(opts: NewMessage): ProcessedMessage {
     people.extract_people_from_message(message_with_booleans.message);
 
     const sent_by_me = people.is_my_user_id(message_with_booleans.message.sender_id);
-    people.maybe_incr_recipient_count({...message_with_booleans.message, sent_by_me});
 
     let status_emoji_info;
     const sender = people.maybe_get_user_by_id(message_with_booleans.message.sender_id);
@@ -92,6 +92,10 @@ export function process_new_message(opts: NewMessage): ProcessedMessage {
         message_with_booleans.message.sender_full_name = sender.full_name;
         message_with_booleans.message.sender_email = sender.email;
         status_emoji_info = user_status.get_status_emoji(message_with_booleans.message.sender_id);
+    }
+
+    if (opts.raw_message.reactions) {
+        people.add_missing_people_for_message_reactions(opts.raw_message.reactions);
     }
 
     // TODO: Rather than adding this field to the message object, it
@@ -228,7 +232,7 @@ export function process_new_message(opts: NewMessage): ProcessedMessage {
 
         const message = processed_message.message;
 
-        pm_conversations.process_message(message);
+        pm_conversations.process_message(message, processed_message.type === "server_message");
         recent_senders.process_private_message({
             to_user_ids,
             sender_id: message.sender_id,
@@ -244,5 +248,6 @@ export function process_new_message(opts: NewMessage): ProcessedMessage {
 
     alert_words.process_message(processed_message.message);
     message_store.update_message_cache(processed_message);
+    submessage.process_submessages(processed_message.message);
     return processed_message;
 }

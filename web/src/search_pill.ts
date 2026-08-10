@@ -1,10 +1,11 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 
 import render_input_pill from "../templates/input_pill.hbs";
 import render_search_list_item from "../templates/search_list_item.hbs";
 import render_search_user_pill from "../templates/search_user_pill.hbs";
 
+import * as date_util from "./date_util.ts";
 import {Filter} from "./filter.ts";
 import {$t} from "./i18n.ts";
 import * as input_pill from "./input_pill.ts";
@@ -14,6 +15,7 @@ import type {User} from "./people.ts";
 import {type Suggestion, search_term_description_html} from "./search_suggestion.ts";
 import type {NarrowCanonicalTerm, NarrowTermSuggestion} from "./state_data.ts";
 import * as stream_data from "./stream_data.ts";
+import type {StreamSubscription} from "./sub_store.ts";
 import * as user_status from "./user_status.ts";
 import type {UserStatusEmojiInfo} from "./user_status.ts";
 import * as util from "./util.ts";
@@ -23,7 +25,7 @@ export type SearchUserPill = {
 } & SearchUserPillContext;
 
 export type SearchUserPillContext = {
-    operator: "dm" | "dm-including" | "sender";
+    operator: "dm" | "dm-including" | "mentions" | "sender";
     negated: boolean;
     users: {
         full_name: string;
@@ -48,7 +50,7 @@ type PillRenderData =
               topic_display_name?: string;
               description_html?: string;
               is_combined_channel_topic?: boolean;
-              combined_channel_name?: string;
+              stream?: StreamSubscription;
           })
     | SearchUserPill;
 
@@ -71,6 +73,7 @@ export function get_search_string_from_item(item: SearchPill): string {
     switch (item.operator) {
         case "dm":
         case "dm-including":
+        case "mentions":
         case "sender":
             assert(item.type === "search_user");
             operand = item.users.map((user) => user.email).join(",");
@@ -79,10 +82,10 @@ export function get_search_string_from_item(item: SearchPill): string {
             operand = util.get_final_topic_display_name(item.operand);
             break;
         case "channel":
-            if (item.operand === "") {
-                operand = "";
-            }
             operand = stream_data.get_valid_sub_by_id_string(item.operand).name;
+            break;
+        case "date":
+            operand = date_util.get_search_pill_value(item.operand);
             break;
         default:
             operand = item.operand;
@@ -165,11 +168,11 @@ function maybe_generate_combined_channel_topic_pill(
 
     const sign = search_pill.negated ? "-" : "";
     const channel_operand = search_terms[index - 1]!.operand;
-    const channel_name = stream_data.get_valid_sub_by_id_string(channel_operand).name;
+    const sub = stream_data.get_valid_sub_by_id_string(channel_operand);
     return {
         ...search_pill,
         sign,
-        combined_channel_name: channel_name,
+        stream: sub,
         is_combined_channel_topic: true,
         topic_display_name: util.get_final_topic_display_name(search_pill.operand),
         is_empty_string_topic: search_pill.operand === "",
@@ -207,6 +210,7 @@ export function generate_pills_html(suggestion: Suggestion, text_query: string):
         switch (search_pill.operator) {
             case "dm":
             case "dm-including":
+            case "mentions":
             case "sender":
                 return search_user_pill_data_from_term(narrow_term);
             case "topic": {
@@ -231,7 +235,7 @@ export function generate_pills_html(suggestion: Suggestion, text_query: string):
                         text_query === "" ||
                         index < search_terms.length - 1 ||
                         // case 2
-                        text_query.trim().endsWith("topic:")
+                        text_query.trimEnd().endsWith("topic:")
                     ) {
                         // We want to show a combined pill for the case
                         // where the preceding operator is a `channel`.
@@ -335,7 +339,8 @@ export function generate_pills_html(suggestion: Suggestion, text_query: string):
                 pills: pill_render_data,
                 description_html,
             });
-        } else if (render_data.type === "search_user" && is_sent_by_me_pill(render_data)) {
+        }
+        if (render_data.type === "search_user" && is_sent_by_me_pill(render_data)) {
             const description_html = render_data.negated
                 ? $t({defaultMessage: "Exclude messages you sent"})
                 : $t({defaultMessage: "Messages you sent"});
@@ -362,6 +367,7 @@ export function create_pills($pill_container: JQuery): SearchPillWidget {
             switch (item.operator) {
                 case "dm":
                 case "dm-including":
+                case "mentions":
                 case "sender":
                     assert(item.type === "search_user");
                     return render_search_user_pill(item);
@@ -392,7 +398,7 @@ export function create_pills($pill_container: JQuery): SearchPillWidget {
 }
 
 function get_user_ids_from_term_with_user_pill_operator(term: NarrowCanonicalTerm): number[] {
-    if (term.operator === "sender") {
+    if (term.operator === "sender" || term.operator === "mentions") {
         return [term.operand];
     }
 
@@ -402,7 +408,10 @@ function get_user_ids_from_term_with_user_pill_operator(term: NarrowCanonicalTer
 
 function search_user_pill_data_from_term(term: NarrowCanonicalTerm): SearchUserPill {
     assert(
-        term.operator === "dm" || term.operator === "dm-including" || term.operator === "sender",
+        term.operator === "dm" ||
+            term.operator === "dm-including" ||
+            term.operator === "mentions" ||
+            term.operator === "sender",
     );
     const user_ids = get_user_ids_from_term_with_user_pill_operator(term);
     const users = user_ids.map((user_id) => people.get_by_user_id(user_id));
@@ -419,7 +428,7 @@ function is_sent_by_me_pill(pill: SearchUserPill): boolean {
 
 function search_user_pill_data(
     users: User[],
-    operator: "dm" | "dm-including" | "sender",
+    operator: "dm" | "dm-including" | "mentions" | "sender",
     negated: boolean,
 ): SearchUserPill {
     return {
@@ -441,7 +450,7 @@ function search_user_pill_data(
 function append_user_pill(
     users: User[],
     pill_widget: SearchPillWidget,
-    operator: "dm" | "dm-including" | "sender",
+    operator: "dm" | "dm-including" | "mentions" | "sender",
     negated: boolean,
 ): void {
     const pill_data = search_user_pill_data(users, operator, negated);
@@ -496,6 +505,7 @@ export function set_search_bar_contents(
         switch (term.operator) {
             case "dm":
             case "dm-including":
+            case "mentions":
             case "sender": {
                 const user_ids = get_user_ids_from_term_with_user_pill_operator(narrow_term);
                 const users = user_ids.map((user_id) => people.get_by_user_id(user_id));
@@ -539,6 +549,7 @@ export function get_current_search_pill_terms(
                     negated: item.negated,
                 };
             case "sender":
+            case "mentions":
                 assert(item.type === "search_user");
                 return {
                     operator: item.operator,

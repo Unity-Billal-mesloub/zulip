@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 
 import render_reminder_list from "../templates/reminder_list.hbs";
@@ -47,7 +47,7 @@ export const keyboard_handling_context = {
 };
 
 function sort_reminders(reminders: Map<number, Reminder>): Reminder[] {
-    const sorted_reminders = [...reminders.values()];
+    const sorted_reminders = reminders.values().toArray();
     sorted_reminders.sort(
         (reminder1, reminder2) =>
             reminder1.scheduled_delivery_timestamp - reminder2.scheduled_delivery_timestamp,
@@ -90,6 +90,14 @@ export function launch(select_reminder_id?: number): void {
     });
     const $messages_list = $("#reminders-overlay .overlay-messages-list");
     $messages_list.append($(rendered_list));
+
+    const restore_id = messages_overlay_ui.get_and_clear_pending_restore_element_id();
+    if (
+        restore_id !== undefined &&
+        messages_overlay_ui.try_set_initial_element(restore_id, keyboard_handling_context)
+    ) {
+        return;
+    }
 
     if (select_reminder_id !== undefined) {
         // Check that the reminder to be focused exists.
@@ -152,5 +160,16 @@ export function initialize(): void {
         const reminder_id = $(this).attr("data-reminder-id");
         assert(reminder_id !== undefined);
         launch(Number.parseInt(reminder_id, 10));
+    });
+
+    $("body").on("click", ".reminder-row .restore-overlay-message", (e) => {
+        messages_overlay_ui.handle_overlay_media_click(
+            e,
+            "reminders",
+            keyboard_handling_context,
+            () => {
+                browser_history.go_to_location("#reminders");
+            },
+        );
     });
 }

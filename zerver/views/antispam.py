@@ -1,7 +1,7 @@
 import logging
 from datetime import timedelta
 
-from altcha import ChallengeOptions, create_challenge
+from altcha.v1 import ChallengeOptions, create_challenge
 from django.conf import settings
 from django.http import HttpRequest, HttpResponseBase
 from django.utils.timezone import now as timezone_now
@@ -48,6 +48,6 @@ def get_challenge(
             (challenge.challenge, expires.timestamp()),
         ]
         return json_success(request, data=challenge.__dict__)
-    except Exception as e:  # nocoverage
-        logging.exception(e)
+    except Exception:  # nocoverage
+        logging.exception("Error while generating challenge")
         raise JsonableError(_("Failed to generate challenge"))

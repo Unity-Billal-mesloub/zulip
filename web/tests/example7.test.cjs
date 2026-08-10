@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const {make_stream} = require("./lib/example_stream.cjs");
 const {mock_esm, set_global, zrequire} = require("./lib/namespace.cjs");
 const {run_test, noop} = require("./lib/test.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 
 /*
 
@@ -75,10 +75,6 @@ const denmark_stream = make_stream({
 });
 
 run_test("unread_ops", ({override}) => {
-    $("#message_feed_container").css = (property) => {
-        assert.equal(property, "display");
-        return "block";
-    };
     stream_data.clear_subscriptions();
     stream_data.add_sub_for_tests(denmark_stream);
     message_store.clear_for_testing();

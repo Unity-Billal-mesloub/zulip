@@ -1,10 +1,11 @@
 import ClipboardJS from "clipboard";
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
 import render_bot_api_key_details from "../templates/settings/bot_api_key_details.hbs";
 
+import * as banners from "./banners.ts";
 import * as bot_data from "./bot_data.ts";
 import type {Bot} from "./bot_data.ts";
 import * as buttons from "./buttons.ts";
@@ -13,9 +14,7 @@ import * as clipboard_handler from "./clipboard_handler.ts";
 import {show_copied_confirmation} from "./copied_tooltip.ts";
 import * as dialog_widget from "./dialog_widget.ts";
 import {$t_html} from "./i18n.ts";
-import * as scroll_util from "./scroll_util.ts";
 import {realm} from "./state_data.ts";
-import * as ui_report from "./ui_report.ts";
 
 export function validate_bot_short_name(value: string): boolean {
     // Adapted from Django's EmailValidator
@@ -33,34 +32,45 @@ export function encode_zuliprc_as_url(zuliprc: string): string {
     return "data:application/octet-stream;charset=utf-8," + encodeURIComponent(zuliprc);
 }
 
+export function get_outgoing_webhook_token(bot_user_id: number): string {
+    const services = bot_data.get_services(bot_user_id);
+    assert(services !== undefined);
+    const service = services[0];
+    assert(service && "token" in service);
+    return service.token;
+}
+
+export function generate_bot_config_file_content(
+    heading: string,
+    email: string,
+    api_key: string,
+    token?: string,
+): string {
+    const body = `
+${heading}
+email=${email}
+key=${api_key}
+site=${realm.realm_url}
+${token !== undefined ? `token=${token}` : ""}
+`.trim();
+
+    // Some tools would not work in files without a trailing new line.
+    return `${body}\n`;
+}
+
 export function generate_zuliprc_content(bot: {
     bot_type?: number;
     user_id: number;
     email: string;
     api_key: string;
 }): string {
-    let token;
+    let token: string | undefined;
     // For outgoing webhooks, include the token in the zuliprc.
     // It's needed for authenticating to the Botserver.
     if (bot.bot_type === 3) {
-        const services = bot_data.get_services(bot.user_id);
-        assert(services !== undefined);
-        const service = services[0];
-        assert(service && "token" in service);
-        token = service.token;
+        token = get_outgoing_webhook_token(bot.user_id);
     }
-    return (
-        "[api]" +
-        "\nemail=" +
-        bot.email +
-        "\nkey=" +
-        bot.api_key +
-        "\nsite=" +
-        realm.realm_url +
-        (token === undefined ? "" : "\ntoken=" + token) +
-        // Some tools would not work in files without a trailing new line.
-        "\n"
-    );
+    return generate_bot_config_file_content("[api]", bot.email, bot.api_key, token);
 }
 
 export async function fetch_bot_api_key(
@@ -76,7 +86,19 @@ export async function fetch_bot_api_key(
         const raw_data = await channel.get({
             url: `/json/bots/${bot_id}/api_key`,
             error(xhr) {
-                ui_report.error($t_html({defaultMessage: "Failed"}), xhr, $error_element);
+                const error_message = channel.xhr_error_message(
+                    $t_html({defaultMessage: "Failed"}),
+                    xhr,
+                );
+                banners.open(
+                    {
+                        intent: "danger",
+                        label: error_message,
+                        buttons: [],
+                        close_button: false,
+                    },
+                    $error_element,
+                );
             },
         });
 
@@ -134,10 +156,7 @@ export async function show_api_key_modal(bot_id: number): Promise<void> {
     );
 
     if (!api_key) {
-        scroll_util.scroll_element_into_container(
-            $("#bot-edit-form-error"),
-            $("#user-profile-modal .modal__body"),
-        );
+        $("#bot-edit-form").closest(".simplebar-content-wrapper").animate({scrollTop: 0}, "fast");
         return;
     }
 
@@ -200,6 +219,9 @@ export function initialize_bot_click_handlers(): void {
             const bot_email = $bot_info.attr("data-email");
             const api_key = await fetch_bot_api_key(bot_id, $("#bot-edit-form-error"), $(this));
             if (!api_key) {
+                $("#bot-edit-form")
+                    .closest(".simplebar-content-wrapper")
+                    .animate({scrollTop: 0}, "fast");
                 return;
             }
 
@@ -217,6 +239,9 @@ export function initialize_bot_click_handlers(): void {
             const bot = bot_data.get(bot_id)!;
             const api_key = await fetch_bot_api_key(bot_id, $("#bot-edit-form-error"), $(this));
             if (!api_key) {
+                $("#bot-edit-form")
+                    .closest(".simplebar-content-wrapper")
+                    .animate({scrollTop: 0}, "fast");
                 return;
             }
 

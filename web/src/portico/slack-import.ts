@@ -1,7 +1,7 @@
 import {Uppy} from "@uppy/core";
 import Dashboard from "@uppy/dashboard";
 import Tus from "@uppy/tus";
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -123,6 +123,10 @@ $(() => {
 
     $("#cancel-slack-import").on("click", () => {
         $("#cancel-slack-import-form").trigger("submit");
+    });
+
+    $("#slack-import-start-over").on("click", () => {
+        window.location.assign("/new/");
     });
 
     $("#slack-access-token").on("input", () => {

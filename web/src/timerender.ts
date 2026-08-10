@@ -9,7 +9,7 @@ import {
     parseISO,
     startOfToday,
 } from "date-fns";
-import $ from "jquery";
+import {$} from "jquery";
 
 import render_markdown_time_tooltip from "../templates/markdown_time_tooltip.hbs";
 
@@ -40,7 +40,13 @@ export function set_display_time_zone(time_zone: string): void {
     formatter_map.clear();
 }
 
-type DateFormat = "weekday" | "dayofyear" | "weekday_dayofyear_year" | "dayofyear_year";
+type DateFormat =
+    | "weekday"
+    | "dayofyear"
+    | "long_dayofyear"
+    | "weekday_dayofyear_year"
+    | "dayofyear_year"
+    | "long_dayofyear_year";
 type DateWithTimeFormat =
     | "dayofyear_time"
     | "dayofyear_year_time"
@@ -81,8 +87,16 @@ export function get_format_options_for_type(
     };
 
     const dayofyear_format_options: Intl.DateTimeFormatOptions = {day: "numeric", month: "short"};
+    const long_dayofyear_format_options: Intl.DateTimeFormatOptions = {
+        day: "numeric",
+        month: "long",
+    };
     const dayofyear_year_format_options: Intl.DateTimeFormatOptions = {
         ...dayofyear_format_options,
+        year: "numeric",
+    };
+    const long_dayofyear_year_format_options: Intl.DateTimeFormatOptions = {
+        ...long_dayofyear_format_options,
         year: "numeric",
     };
     const long_format_options: Intl.DateTimeFormatOptions = {
@@ -99,10 +113,14 @@ export function get_format_options_for_type(
             return weekday_format_options;
         case "dayofyear": // Jul 27
             return dayofyear_format_options;
+        case "long_dayofyear": // July 27
+            return long_dayofyear_format_options;
         case "dayofyear_time": // Jul 27, 01:30 PM
             return {...dayofyear_format_options, ...time_format_options};
         case "dayofyear_year": // Jul 27, 2016
             return dayofyear_year_format_options;
+        case "long_dayofyear_year": // July 27, 2016
+            return long_dayofyear_year_format_options;
         case "dayofyear_year_time": // Jul 27, 2016, 01:30 PM
             return {...dayofyear_year_format_options, ...time_format_options};
         case "weekday_dayofyear_year": // Wednesday, July 27, 2016
@@ -140,6 +158,15 @@ export function get_localized_date_or_time_for_format(
     return formatter_map.get(format_key)!.format(date);
 }
 
+// Returns the UTC offset of the given time zone at the given time,
+// formatted like "UTC+05:30".
+export function get_utc_offset_string(time_zone: string, time: Date): string {
+    const offset_minutes = tzOffset(time_zone, time);
+    return `UTC${offset_minutes < 0 ? "-" : "+"}${String(
+        Math.floor(Math.abs(offset_minutes) / 60),
+    ).padStart(2, "0")}:${String(Math.abs(offset_minutes) % 60).padStart(2, "0")}`;
+}
+
 // Exported for tests only.
 export function get_tz_with_UTC_offset(time: Date): string {
     let timezone = new Intl.DateTimeFormat(user_settings.default_language, {
@@ -158,10 +185,7 @@ export function get_tz_with_UTC_offset(time: Date): string {
     // show that along with (UTC+x:y)
     timezone = /GMT[+-][\d:]*/.test(timezone ?? "") ? "" : timezone;
 
-    const offset_minutes = tzOffset(display_time_zone, time);
-    const tz_UTC_offset = `(UTC${offset_minutes < 0 ? "-" : "+"}${String(
-        Math.floor(Math.abs(offset_minutes) / 60),
-    ).padStart(2, "0")}:${String(Math.abs(offset_minutes) % 60).padStart(2, "0")})`;
+    const tz_UTC_offset = `(${get_utc_offset_string(display_time_zone, time)})`;
 
     if (timezone) {
         return timezone + " " + tz_UTC_offset;
@@ -184,8 +208,8 @@ export type TimeRender = {
 };
 
 export function render_now(time: Date, today = new Date(), display_year?: boolean): TimeRender {
-    let time_str = "";
-    let needs_update = false;
+    let time_str;
+    let needs_update;
     // render formal time to be used for tippy tooltip
     const formal_time_str = get_localized_date_or_time_for_format(time, "weekday_dayofyear_year");
     // How many days old is 'time'? 0 = today, 1 = yesterday, 7 = a
@@ -221,13 +245,17 @@ export function render_now(time: Date, today = new Date(), display_year?: boolea
 }
 
 // Relative time rendering for use in most screens like Recent conversations.
-export function relative_time_string_from_date(date: Date): string {
+export function relative_time_string_from_date(date: Date, use_minutes_short_form = false): string {
     const current_date = new Date();
     const minutes = differenceInMinutes(current_date, date);
     if (minutes <= 2) {
         return $t({defaultMessage: "Just now"});
     }
     if (minutes < 60) {
+        if (use_minutes_short_form) {
+            return $t({defaultMessage: "{minutes} min ago"}, {minutes});
+        }
+
         return $t({defaultMessage: "{minutes} minutes ago"}, {minutes});
     }
 
@@ -247,11 +275,8 @@ export function relative_time_string_from_date(date: Date): string {
 
     if (days_old < 90) {
         return $t({defaultMessage: "{days_old} days ago"}, {days_old});
-    } else if (
-        days_old > 90 &&
-        days_old < 365 &&
-        date.getFullYear() === current_date.getFullYear()
-    ) {
+    }
+    if (days_old > 90 && days_old < 365 && date.getFullYear() === current_date.getFullYear()) {
         // Online more than 90 days ago, in the same year
         return get_localized_date_or_time_for_format(date, "dayofyear");
     }
@@ -289,7 +314,8 @@ export function last_seen_status_from_date(last_active_date: Date): string {
 
     if (days_old < 90) {
         return $t({defaultMessage: "Active {days_old} days ago"}, {days_old});
-    } else if (
+    }
+    if (
         days_old > 90 &&
         days_old < 365 &&
         last_active_date.getFullYear() === current_date.getFullYear()
@@ -472,13 +498,17 @@ export function format_time_modern(time: number | Date, today = new Date()): str
     if (time > today) {
         /* For timestamps in the future, we always show the year*/
         return get_localized_date_or_time_for_format(time, "dayofyear_year");
-    } else if (hours < 24) {
+    }
+    if (hours < 24) {
         return stringify_time(time);
-    } else if (days_old === 1) {
+    }
+    if (days_old === 1) {
         return $t({defaultMessage: "Yesterday"});
-    } else if (days_old < 7) {
+    }
+    if (days_old < 7) {
         return get_localized_date_or_time_for_format(time, "weekday");
-    } else if (days_old <= 180) {
+    }
+    if (days_old <= 180) {
         return get_localized_date_or_time_for_format(time, "dayofyear");
     }
 
@@ -490,7 +520,7 @@ export function format_time_modern(time: number | Date, today = new Date()): str
 export function absolute_time(timestamp: number): string {
     const today = new Date();
     const date = new Date(timestamp);
-    const is_older_year = today.getFullYear() - date.getFullYear() > 0;
+    const is_older_year = today.getFullYear() > date.getFullYear();
 
     return get_localized_date_or_time_for_format(
         date,

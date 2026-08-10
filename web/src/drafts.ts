@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
 import assert from "minimalistic-assert";
 import * as tippy from "tippy.js";
@@ -24,6 +24,7 @@ import * as util from "./util.ts";
 export function set_count(count: number): void {
     const $drafts_li = $(".top_left_drafts");
     ui_util.update_unread_count_in_dom($drafts_li, count);
+    $(".drafts-sidebar-menu-icon").toggleClass("hide", count === 0);
 }
 
 function getTimestamp(): number {
@@ -50,7 +51,6 @@ const draft_schema = z.intersection(
         }),
         z.object({
             type: z.literal("private"),
-            reply_to: z.string(),
             private_message_recipient_ids: z.array(z.number()),
         }),
     ]),
@@ -78,7 +78,6 @@ const possibly_buggy_draft_schema = z.intersection(
         }),
         z.object({
             type: z.literal("private"),
-            reply_to: z.string(),
             private_message_recipient: z.optional(z.string()),
             private_message_recipient_ids: z.optional(z.array(z.number())),
         }),
@@ -93,6 +92,7 @@ export const draft_model = (function () {
     const KEY = "drafts";
     const ls = localstorage();
     let fixed_buggy_drafts = false;
+    let fixed_private_draft_recipient_ids = false;
 
     function get(): Record<string, LocalStorageDraft> {
         let drafts = ls.get(KEY);
@@ -105,7 +105,34 @@ export const draft_model = (function () {
             drafts = ls.get(KEY);
         }
 
+        if (!fixed_private_draft_recipient_ids) {
+            fix_private_draft_recipient_ids();
+            drafts = ls.get(KEY);
+        }
+
         return drafts_schema.parse(drafts);
+    }
+
+    function fix_private_draft_recipient_ids(): void {
+        // This is needed to make sure that invalid users are removed from
+        // recipient list of DM drafts. We do not expect this to happen in
+        // production unless a UserProfile is manually deleted from
+        // the database, but this happens in development environment
+        // when the database is re-populated.
+        const drafts = drafts_schema.parse(ls.get(KEY));
+        for (const [draft_id, draft] of Object.entries(drafts)) {
+            if (draft.type !== "private") {
+                continue;
+            }
+            const valid_recipient_ids = draft.private_message_recipient_ids.filter((user_id) =>
+                people.is_valid_user_id(user_id),
+            );
+            if (valid_recipient_ids.length !== draft.private_message_recipient_ids.length) {
+                drafts[draft_id] = {...draft, private_message_recipient_ids: valid_recipient_ids};
+            }
+        }
+        ls.set(KEY, drafts);
+        fixed_private_draft_recipient_ids = true;
     }
 
     function fix_buggy_drafts(): void {
@@ -265,7 +292,7 @@ export function sync_count(): void {
 
 export function delete_all_drafts(): void {
     const drafts = draft_model.get();
-    for (const [id] of Object.entries(drafts)) {
+    for (const id of Object.keys(drafts)) {
         draft_model.deleteDrafts([id]);
     }
 }
@@ -324,11 +351,9 @@ export function snapshot_message(force_save = false): LocalStorageDraft | undefi
         updatedAt: getTimestamp(),
     };
     if (message.type === "private") {
-        const recipient_emails = compose_state.private_message_recipient_emails();
         return {
             ...message,
             type: "private",
-            reply_to: recipient_emails,
             private_message_recipient_ids: compose_state.private_message_recipient_ids(),
             is_sending_saving: false,
             drafts_version: CURRENT_DRAFT_VERSION,
@@ -500,7 +525,8 @@ export function current_recipient_data(): {
             topic: compose_state.topic(),
             private_recipient_ids: undefined,
         };
-    } else if (compose_state.get_message_type() === "private") {
+    }
+    if (compose_state.get_message_type() === "private") {
         return {
             stream_name: undefined,
             topic: undefined,
@@ -558,8 +584,7 @@ export function filter_drafts_by_compose_box_and_recipient(
 }
 
 export function get_last_restorable_draft_based_on_compose_state():
-    | LocalStorageDraftWithId
-    | undefined {
+    LocalStorageDraftWithId | undefined {
     const current_drafts = draft_model.get();
     const drafts_map_for_compose_state = filter_drafts_by_compose_box_and_recipient(current_drafts);
     const drafts_for_compose_state = Object.entries(drafts_map_for_compose_state).map(
@@ -579,6 +604,7 @@ export function get_last_restorable_draft_based_on_compose_state():
 export type FormattedDraft =
     | {
           is_stream: true;
+          is_sending_saving: boolean;
           draft_id: string;
           stream_name?: string | undefined;
           recipient_bar_color: string;
@@ -593,6 +619,7 @@ export type FormattedDraft =
       }
     | {
           is_stream: false;
+          is_sending_saving: boolean;
           is_dm_with_self?: boolean;
           draft_id: string;
           recipients: string;
@@ -667,6 +694,7 @@ export function format_draft(draft: LocalStorageDraftWithId): FormattedDraft | u
         return {
             draft_id: draft.id,
             is_stream: true,
+            is_sending_saving: draft.is_sending_saving,
             stream_name,
             recipient_bar_color: stream_color.get_recipient_bar_color(draft_stream_color),
             stream_privacy_icon_color:
@@ -687,6 +715,7 @@ export function format_draft(draft: LocalStorageDraftWithId): FormattedDraft | u
         return {
             draft_id: draft.id,
             is_stream: false,
+            is_sending_saving: draft.is_sending_saving,
             has_recipient_data: false,
             recipients: "",
             raw_content: draft.content,
@@ -702,6 +731,7 @@ export function format_draft(draft: LocalStorageDraftWithId): FormattedDraft | u
     return {
         draft_id: draft.id,
         is_stream: false,
+        is_sending_saving: draft.is_sending_saving,
         is_dm_with_self,
         recipients,
         raw_content: draft.content,

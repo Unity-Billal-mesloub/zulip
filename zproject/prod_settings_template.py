@@ -86,6 +86,13 @@ EXTERNAL_HOST = "zulip.example.com"
 # EMAIL_USE_TLS = True
 # EMAIL_PORT = 587
 
+## By default, Zulip will open a new SMTP connection for each outgoing email.
+## This has a small overhead, though not one which is relevant in most installs,
+## which send very low volumes of email. You can set to a positive number to
+## reuse SMTP connections for that many minutes; set to None to leave connections
+## open indefinitely.
+# EMAIL_MAX_CONNECTION_LIFETIME_IN_MINUTES = 0
+
 ## The noreply address to be used as the sender for certain generated
 ## emails.  Messages sent to this address could contain sensitive user
 ## data and should not be delivered anywhere.  The default is
@@ -159,6 +166,7 @@ AUTHENTICATION_BACKENDS: tuple[str, ...] = (
     # "zproject.backends.ZulipLDAPAuthBackend",  # LDAP, setup below
     # "zproject.backends.ZulipRemoteUserBackend",  # Local SSO, setup docs on readthedocs
     # "zproject.backends.GenericOpenIdConnectBackend",  # Generic OIDC integration, setup below
+    # "zproject.backends.DiscordAuthBackend",  # Discord auth, setup below
 )
 
 ## LDAP integration.
@@ -220,6 +228,10 @@ AUTH_LDAP_USER_SEARCH = LDAPSearch(
     "ou=users,dc=example,dc=com", ldap.SCOPE_SUBTREE, "(uid=%(user)s)"
 )
 
+## AUTH_LDAP_USERNAME_ATTR should be the Zulip username attribute
+## (defined in AUTH_LDAP_USER_SEARCH).
+# AUTH_LDAP_USERNAME_ATTR = "uid"
+
 ## Configuration to look up a user's LDAP data given their email address
 ## (for Zulip reverse mapping).  If users log in as e.g. "sam" when
 ## their email address is "sam@example.com", set LDAP_APPEND_DOMAIN to
@@ -234,14 +246,10 @@ AUTH_LDAP_USER_SEARCH = LDAPSearch(
 # LDAP_EMAIL_ATTR = None
 
 ## AUTH_LDAP_REVERSE_EMAIL_SEARCH works like AUTH_LDAP_USER_SEARCH and
-## should query an LDAP user given their email address.  It and
-## AUTH_LDAP_USERNAME_ATTR are required when LDAP_APPEND_DOMAIN is None.
+## should query an LDAP user given their email address.  It is required
+## when LDAP_APPEND_DOMAIN is None.
 # AUTH_LDAP_REVERSE_EMAIL_SEARCH = LDAPSearch("ou=users,dc=example,dc=com",
 #                                             ldap.SCOPE_SUBTREE, "(email=%(email)s)")
-
-## AUTH_LDAP_USERNAME_ATTR should be the Zulip username attribute
-## (defined in AUTH_LDAP_USER_SEARCH).
-# AUTH_LDAP_USERNAME_ATTR = "uid"
 
 ## This map defines how to populate attributes of a Zulip user from LDAP.
 ##
@@ -391,6 +399,20 @@ AUTH_LDAP_USER_ATTR_MAP = {
 # SOCIAL_AUTH_SUBDOMAIN = "auth"
 
 ########
+## Discord OAuth.
+## To set up Discord authentication, you'll need to do the following:
+## (1) Register a new application at the Discord Developer Portal:
+##     https://discord.com/developers/applications
+## (2) Navigate to the OAuth menu. Set the callback URI with value like:
+##      https://zulip.example.com/complete/discord/
+##     based on your value for EXTERNAL_HOST
+## (3) Note the Client ID and Secret for your new Discord application.
+##     Use the Client ID as `SOCIAL_AUTH_DISCORD_KEY` here, and
+##     put the Secret in zulip-secrets.conf as `social_auth_discord_secret`.
+#
+# SOCIAL_AUTH_DISCORD_KEY = "<your client ID from Discord>"
+
+########
 ## Generic OpenID Connect (OIDC).  See also documentation here:
 ##
 ##     https://zulip.readthedocs.io/en/latest/production/authentication-methods.html#openid-connect
@@ -422,7 +444,24 @@ SOCIAL_AUTH_OIDC_ENABLED_IDPS: dict[str, Any] = {
         ## default, Zulip asks the user whether they want to create an
         ## account or try to log in again using another method.
         # "auto_signup": False,
-    }
+        ## List of additional claims to fetch from the id_token or response
+        ## from the UserInfo endpoint.
+        ## These attributes will be available for synchronizing user
+        ## profile fields in SOCIAL_AUTH_SYNC_ATTRS_DICT.
+        # "extra_attrs": ["title", "mobilePhone", "zulip_role"],
+    },
+    ## Example: Microsoft Entra ID (AzureAD) OIDC configuration.
+    ## This is the recommended approach for Entra ID SSO on self-hosted servers.
+    ## See https://zulip.readthedocs.io/en/latest/production/authentication-methods.html#microsoft-entra-id
+    ##
+    # "entra": {
+    #    "oidc_url": "https://login.microsoftonline.com/YOUR_TENANT_ID/v2.0",
+    #    "display_name": "Microsoft",
+    #    "display_icon": "/static/images/authentication_backends/microsoft-icon.png",
+    #    "client_id": "YOUR_APPLICATION_ID",
+    #    "secret": get_secret("social_auth_oidc_secret"),
+    #    "auto_signup": True,
+    # },
 }
 
 ## For documentation on this setting, see the relevant part of
@@ -463,6 +502,10 @@ SOCIAL_AUTH_SAML_ENABLED_IDPS: dict[str, Any] = {
         "attr_user_permanent_id": "email",
         "attr_first_name": "first_name",
         "attr_last_name": "last_name",
+        ## If your IdP doesn't split the name into the first and last name, and instead sends
+        ## the full name in a single attribute, you can remove the above attr_*_name lines
+        ## and instead configure attr_full_name below.
+        # "attr_full_name": "fullname",
         "attr_username": "email",
         "attr_email": "email",
         ## List of additional attributes to fetch from the SAMLResponse.
@@ -535,13 +578,16 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
     "emailAddress": ZULIP_ADMINISTRATOR,
 }
 
-## Note: Any additional SAML attributes that'll be used here must be
-## listed in the "extra_attrs" field in the SOCIAL_AUTH_SAML_ENABLED_IDPS
-## configuration for your IdP.
+## Note: Any additional attributes used here must be listed in the "extra_attrs"
+## field in SOCIAL_AUTH_SAML_ENABLED_IDPS (SAML) or SOCIAL_AUTH_OIDC_ENABLED_IDPS (OIDC).
+## Sync for other backends is not currently supported.
 # SOCIAL_AUTH_SYNC_ATTRS_DICT = {
 #     "example_org": {
 #         "saml": {
-#             # role is currently the only supported major attribute.
+#             # No extra_attrs are required to enable syncing names, which will use
+#             # the standard SAML name attributes.
+#             "full_name": True,
+#             # role is the other supported major attribute.
 #             "role": "zulip_role",
 #             # Specify custom profile fields with a custom__ prefix for the
 #             # Zulip field name.
@@ -567,13 +613,20 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 # SOCIAL_AUTH_APPLE_KEY = "<your Key ID>"
 
 ########
-## Microsoft Entra ID (AzureAD) OAuth.
+## Microsoft Entra ID (AzureAD) OAuth (common tenant only).
+##
+## NOTE: For self-hosted servers that need to restrict authentication to a
+## specific Entra ID tenant, we recommend using the OIDC integration instead.
+## See the OpenID Connect section above.
+##
+## The backend below uses the Microsoft "common" tenant endpoint, which allows
+## any Microsoft account to authenticate rather than restricting logins to a
+## specific organization.
 ##
 ## To set up Microsoft Entra ID authentication, you'll need to do the following:
 ##
-## (1) Open "App registrations" at
-## https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade
-## and click "New registration".
+## (1) Sign in to the Microsoft Entra admin center at https://entra.microsoft.com,
+## browse to "Entra ID > App registrations", and click "New registration".
 ##
 ## (2) In the "Redirect URI (optional)" section, select Web as the platform
 ## and enter https://zulip.example.com/complete/azuread-oauth2/ as the redirect URI,
@@ -722,6 +775,7 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 ## https://zulip.readthedocs.io/en/latest/production/gif-picker-integrations.html
 # GIPHY_API_KEY = "<Your API key from GIPHY>"
 # TENOR_API_KEY = "<Your API key from Tenor>"
+# KLIPY_API_KEY = "<Your API key from KLIPY>"
 
 ################
 ## Video call integrations.
@@ -733,6 +787,12 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 ## Set these if using a Zoom host that is not https://zoom.us.
 # VIDEO_ZOOM_OAUTH_URL = "https://zoom.example.com"
 # VIDEO_ZOOM_API_URL = "https://api.zoom.example.com"
+
+## Controls the Webex video call integration.  See:
+## https://zulip.readthedocs.io/en/latest/production/video-calls.html
+## You must also set video_webex_client_secret in
+## /etc/zulip/zulip-secrets.conf to enable Webex as a call provider.
+# VIDEO_WEBEX_CLIENT_ID = "<your Webex client ID>"
 
 ## Controls the Jitsi Meet video call integration.  By default, the
 ## integration uses the SaaS https://meet.jit.si server.  You can specify
@@ -757,12 +817,17 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 ################
 ## AI Features
 ##
-## Specify the model and provider to use for topic summarization. The
-## `model` field from https://docs.litellm.ai/docs/providers specifies
-## your preferred provider/model combination.
-# TOPIC_SUMMARIZATION_MODEL = "huggingface/meta-llama/Meta-Llama-3-8B-Instruct"
-## Other configuration parameters, passed through to litellm's `completion` call
-## See https://docs.litellm.ai/docs/completion/input
+## Specify the model to use for topic summarization. Zulip uses the
+## OpenAI Python SDK, which supports OpenAI's API as well as any
+## OpenAI-compatible provider.
+# TOPIC_SUMMARIZATION_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
+## Override the API base URL when using an OpenAI-compatible provider
+## (e.g., Hugging Face, Groq, Together, or a self-hosted endpoint).
+## Leave unset to use OpenAI's default endpoint.
+# TOPIC_SUMMARIZATION_API_BASE = "https://router.huggingface.co/v1"
+## Other configuration parameters, passed through to the OpenAI SDK's
+## `chat.completions.create` call. See
+## https://platform.openai.com/docs/api-reference/chat/create
 # TOPIC_SUMMARIZATION_PARAMETERS = {}
 
 ## Set usage costs based on your model, and a maximum per-user monthly

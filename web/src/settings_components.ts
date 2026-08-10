@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
 import assert from "minimalistic-assert";
 import * as tippy from "tippy.js";
@@ -18,6 +18,7 @@ import type {
 } from "./group_permission_settings.ts";
 import * as group_setting_pill from "./group_setting_pill.ts";
 import {$t, get_language_list_columns} from "./i18n.ts";
+import {page_params} from "./page_params.ts";
 import * as people from "./people.ts";
 import {
     realm_default_settings_schema,
@@ -204,7 +205,7 @@ export function get_realm_default_setting_property_value(
 export function realm_authentication_methods_to_boolean_dict(): Record<string, boolean> {
     return Object.fromEntries(
         Object.entries(realm.realm_authentication_methods)
-            .toSorted()
+            .toSorted(([a], [b]) => Number(a > b) - Number(a < b))
             .map(([auth_method_name, auth_method_info]) => [
                 auth_method_name,
                 auth_method_info.enabled,
@@ -246,6 +247,7 @@ export function get_subsection_property_elements($subsection: JQuery): HTMLEleme
 
 export const simple_dropdown_realm_settings_schema = z.pick(realm_schema, {
     realm_org_type: true,
+    realm_media_preview_size: true,
     realm_message_edit_history_visibility_policy: true,
     realm_topics_policy: true,
 });
@@ -395,13 +397,13 @@ function get_message_retention_setting_value(
     return util.check_time_input(custom_input_val);
 }
 
-export const select_field_data_schema = z.record(
+export const custom_profile_field_choices_schema = z.record(
     z.string(),
     z.object({text: z.string(), order: z.string()}),
 );
-export type SelectFieldData = z.output<typeof select_field_data_schema>;
+export type SelectFieldData = z.output<typeof custom_profile_field_choices_schema>;
 
-function read_select_field_data_from_form(
+function read_custom_profile_field_choices_from_form(
     $profile_field_form: JQuery,
     old_field_data: unknown,
 ): SelectFieldData {
@@ -410,9 +412,8 @@ function read_select_field_data_from_form(
 
     const old_option_value_map = new Map<string, string>();
     if (old_field_data !== undefined) {
-        for (const [value, choice] of Object.entries(
-            select_field_data_schema.parse(old_field_data),
-        )) {
+        const choices = custom_profile_field_choices_schema.parse(old_field_data);
+        for (const [value, choice] of Object.entries(choices)) {
             assert(typeof choice !== "string");
             old_option_value_map.set(choice.text, value);
         }
@@ -483,9 +484,10 @@ export function read_field_data_from_form(
     const field_types = realm.custom_profile_field_types;
 
     // Only the following field types support associated field data.
-    if (field_type_id === field_types.SELECT.id) {
-        return read_select_field_data_from_form($profile_field_form, old_field_data);
-    } else if (field_type_id === field_types.EXTERNAL_ACCOUNT.id) {
+    if (field_type_id === field_types.DROPDOWN.id) {
+        return read_custom_profile_field_choices_from_form($profile_field_form, old_field_data);
+    }
+    if (field_type_id === field_types.EXTERNAL_ACCOUNT.id) {
         const parsed_old_field_data = old_field_data
             ? external_account_field_schema.parse(old_field_data)
             : undefined;
@@ -538,7 +540,7 @@ export function get_widget_for_dropdown_list_settings(
 }
 
 export function set_dropdown_setting_widget(property_name: string, widget: DropdownWidget): void {
-    if (dropdown_widget_map.get(property_name) === undefined) {
+    if (!dropdown_widget_map.has(property_name)) {
         blueslip.error("No dropdown list widget for property", {property_name});
         return;
     }
@@ -566,7 +568,11 @@ export function get_dropdown_list_widget_setting_value($input_elem: JQuery): num
     return setting_value;
 }
 
-export function change_save_button_state($element: JQuery, state: string): void {
+export function change_save_button_state(
+    $element: JQuery,
+    state: string,
+    error_callback?: () => void,
+): void {
     function show_hide_element(
         $element: JQuery,
         show: boolean,
@@ -604,6 +610,14 @@ export function change_save_button_state($element: JQuery, state: string): void 
         return;
     }
 
+    if (state === "failed") {
+        assert(error_callback !== undefined);
+        show_hide_element($element, false, 0, () => {
+            error_callback();
+        });
+        return;
+    }
+
     if (state === "succeeded" && $save_button.attr("data-status") === "unsaved") {
         // We don't show the "saved" state if the save button is in the "unsaved"
         // state, as that would indicate that user has made some other changes
@@ -634,10 +648,6 @@ export function change_save_button_state($element: JQuery, state: string): void 
 
             $element.find(".discard-button").hide();
             buttons.show_button_loading_indicator($save_button);
-            break;
-        case "failed":
-            data_status = "failed";
-            is_show = true;
             break;
         case "succeeded":
             button_text = $t({defaultMessage: "Saved"});
@@ -777,7 +787,8 @@ export function set_input_element_value(
             assert(typeof value === "boolean");
             $input_elem.prop("checked", value);
             return;
-        } else if (input_type === "string" || input_type === "number") {
+        }
+        if (input_type === "string" || input_type === "number") {
             assert(typeof value !== "boolean");
             $input_elem.val(value);
             return;
@@ -890,7 +901,8 @@ export function check_realm_settings_property_changed(elem: HTMLElement): boolea
         case "realm_can_summarize_topics_group":
         case "realm_create_multiuse_invite_group":
         case "realm_direct_message_initiator_group":
-        case "realm_direct_message_permission_group": {
+        case "realm_direct_message_permission_group":
+        case "realm_workplace_users_group": {
             const pill_widget = get_group_setting_widget(property_name);
             assert(pill_widget !== null);
             proposed_val = get_group_setting_widget_value(pill_widget);
@@ -988,8 +1000,8 @@ export function get_group_setting_widget_value(
         return direct_subgroups[0];
     }
 
-    direct_subgroups.sort();
-    direct_members.sort();
+    direct_subgroups.sort((a, b) => a - b);
+    direct_members.sort((a, b) => a - b);
     return {direct_subgroups, direct_members};
 }
 
@@ -1099,7 +1111,7 @@ export function populate_data_for_realm_settings_request(
         if (check_realm_settings_property_changed(input_elem)) {
             const input_value = get_input_element_value(input_elem);
             if (input_value !== undefined && input_value !== null) {
-                let property_name: string;
+                let match_array;
                 if ($input_elem.attr("id")!.startsWith("id_authmethod")) {
                     // Authentication Method component IDs include authentication method name
                     // for uniqueness, anchored to "id_authmethod" prefix, e.g. "id_authmethodapple_<property_name>".
@@ -1107,16 +1119,12 @@ export function populate_data_for_realm_settings_request(
                     // The [\da-z]+ part of the regexp covers the auth method name itself.
                     // We assume it's not an empty string and can contain only digits and lowercase ASCII letters,
                     // this is ensured by a respective allowlist-based filter in populate_auth_methods().
-                    const match_array = /^id_authmethod[\da-z]+_(.*)$/.exec(
-                        $input_elem.attr("id")!,
-                    );
-                    assert(match_array !== null);
-                    property_name = match_array[1]!;
+                    match_array = /^id_authmethod[\da-z]+_(.*)$/.exec($input_elem.attr("id")!);
                 } else {
-                    const match_array = /^id_realm_(.*)$/.exec($input_elem.attr("id")!);
-                    assert(match_array !== null);
-                    property_name = match_array[1]!;
+                    match_array = /^id_realm_(.*)$/.exec($input_elem.attr("id")!);
                 }
+                assert(match_array !== null);
+                const property_name = match_array[1]!;
 
                 if (property_name === "org_join_restrictions") {
                     assert(typeof input_value === "string");
@@ -1152,6 +1160,7 @@ export function populate_data_for_realm_settings_request(
                     "create_multiuse_invite_group",
                     "direct_message_initiator_group",
                     "direct_message_permission_group",
+                    "workplace_users_group",
                 ]);
                 if (realm_group_settings.has(property_name)) {
                     const old_value = get_realm_settings_property_value(
@@ -1303,7 +1312,7 @@ function switching_to_private(properties_elements: HTMLElement[]): boolean {
 }
 
 export function save_discard_realm_settings_widget_status_handler($subsection: JQuery): void {
-    $subsection.find(".subsection-failed-status p").hide();
+    $subsection.find(".alert-notification").hide();
     $subsection.find(".save-button").show();
     const properties_elements = get_subsection_property_elements($subsection);
     const show_change_process_button = properties_elements.some((elem) =>
@@ -1319,7 +1328,7 @@ export function save_discard_stream_settings_widget_status_handler(
     $subsection: JQuery,
     sub: StreamSubscription | undefined,
 ): void {
-    $subsection.find(".subsection-failed-status p").hide();
+    $subsection.find(".alert-notification").hide();
     $subsection.find(".save-button").show();
     const properties_elements = get_subsection_property_elements($subsection);
     let show_change_process_button = false;
@@ -1369,7 +1378,7 @@ export function save_discard_group_widget_status_handler(
     $subsection: JQuery,
     group: UserGroup,
 ): void {
-    $subsection.find(".subsection-failed-status p").hide();
+    $subsection.find(".alert-notification").hide();
     $subsection.find(".save-button").show();
     const properties_elements = get_subsection_property_elements($subsection);
     const show_change_process_button = properties_elements.some((elem) =>
@@ -1383,7 +1392,7 @@ export function save_discard_group_widget_status_handler(
 export function save_discard_default_realm_settings_widget_status_handler(
     $subsection: JQuery,
 ): void {
-    $subsection.find(".subsection-failed-status p").hide();
+    $subsection.find(".alert-notification").hide();
     $subsection.find(".save-button").show();
     const properties_elements = get_subsection_property_elements($subsection);
     const show_change_process_button = properties_elements.some((elem) =>
@@ -1623,14 +1632,20 @@ export function disable_opening_typeahead_on_clicking_label($container: JQuery):
     $group_setting_labels.off("click");
 }
 
-export function disable_group_permission_setting($containers: JQuery): void {
+export function disable_group_permission_setting($containers: JQuery, placeholder?: string): void {
     $containers.find(".input").prop("contenteditable", false);
+    if (placeholder !== undefined) {
+        $containers.find(".input").attr("data-placeholder", placeholder);
+    }
     $containers.closest(".input-group").addClass("group_setting_disabled");
     disable_opening_typeahead_on_clicking_label($containers.closest(".input-group"));
 }
 
-export function enable_group_permission_setting($containers: JQuery): void {
+export function enable_group_permission_setting($containers: JQuery, placeholder?: string): void {
     $containers.find(".input").prop("contenteditable", true);
+    if (placeholder !== undefined) {
+        $containers.find(".input").attr("data-placeholder", placeholder);
+    }
     $containers.closest(".input-group").removeClass("group_setting_disabled");
     enable_opening_typeahead_on_clicking_label($containers.closest(".input-group"));
 }
@@ -1674,6 +1689,7 @@ export const group_setting_widget_map = new Map<string, GroupSettingPillContaine
     ["realm_create_multiuse_invite_group", null],
     ["realm_direct_message_initiator_group", null],
     ["realm_direct_message_permission_group", null],
+    ["realm_workplace_users_group", null],
 ]);
 
 export function get_group_setting_widget(setting_name: string): GroupSettingPillContainer | null {
@@ -1932,6 +1948,13 @@ export function get_group_assigned_realm_permissions(group: UserGroup): {
     } of settings_config.realm_group_permission_settings) {
         const assigned_permission_objects = [];
         for (const setting_name of settings) {
+            if (
+                setting_name === "workplace_users_group" &&
+                (!page_params.development_environment ||
+                    !page_params.non_workplace_pricing_eligible)
+            ) {
+                continue;
+            }
             const setting_value = realm[z.keyof(realm_schema).parse("realm_" + setting_name)];
             const can_edit = settings_config.owner_editable_realm_group_permission_settings.has(
                 setting_name,
@@ -2093,7 +2116,7 @@ export let resize_textareas_in_subsection = ($subsection: JQuery): void => {
     }
 
     $textareas.each(function () {
-        const $el = $<HTMLTextAreaElement>(this);
+        const $el = $(this);
 
         const min_rows = 2;
         const max_rows = 5;

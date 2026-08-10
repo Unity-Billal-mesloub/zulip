@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
 
@@ -12,7 +12,7 @@ import * as keydown_util from "./keydown_util.ts";
 // https://stackoverflow.com/questions/4233265/contenteditable-set-caret-at-the-end-of-the-text-cross-browser
 export function place_caret_at_end(el: HTMLElement): void {
     el.focus();
-    if (el instanceof HTMLInputElement) {
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
         el.setSelectionRange(el.value.length, el.value.length);
     } else {
         const range = document.createRange();
@@ -144,8 +144,8 @@ export function potentially_collapse_quotes($element: JQuery): boolean {
     }
 
     for (const [index, element] of [...$children].entries()) {
-        if (collapsible_status[index]) {
-            if (index > 0 && collapsible_status[index - 1]) {
+        if (collapsible_status[index] ?? false) {
+            if (index > 0 && (collapsible_status[index - 1] ?? false)) {
                 // If the previous element was also collapsible, remove its text
                 // to have a single collapsed block instead of multiple in a row.
                 $(element).text("");
@@ -337,11 +337,31 @@ export function enable_element_and_remove_tooltip($element: JQuery): void {
     }
 }
 
-export function get_left_sidebar_search_term(): string {
+export let get_left_sidebar_search_term = function (): string {
     const $search_box = $<HTMLInputElement>("input.left-sidebar-search-input").expectOne();
     const search_term = $search_box.val();
     assert(search_term !== undefined);
     return search_term.trim();
+};
+
+export function rewire_get_left_sidebar_search_term(
+    value: typeof get_left_sidebar_search_term,
+): void {
+    get_left_sidebar_search_term = value;
+}
+
+export const TOPIC_SEARCH_PREFIX = "topic:";
+
+export function get_left_sidebar_topic_search_term(): string | undefined {
+    const search_term = get_left_sidebar_search_term();
+    if (search_term.toLowerCase().startsWith(TOPIC_SEARCH_PREFIX)) {
+        return search_term.slice(TOPIC_SEARCH_PREFIX.length).trim();
+    }
+    return undefined;
+}
+
+export function is_topic_search(): boolean {
+    return get_left_sidebar_topic_search_term() !== undefined;
 }
 
 export function disable_left_sidebar_search(): void {

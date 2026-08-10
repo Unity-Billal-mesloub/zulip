@@ -2,6 +2,7 @@ import base64
 import hashlib
 import uuid
 from datetime import timedelta
+from unittest import mock
 
 import orjson
 import responses
@@ -16,15 +17,20 @@ from zerver.lib.devices import b64decode_token_id_base64
 from zerver.lib.exceptions import (
     InvalidBouncerPublicKeyError,
     InvalidEncryptedPushRegistrationError,
+    JsonableError,
     RequestExpiredError,
 )
 from zerver.lib.push_registration import check_push_key
 from zerver.lib.queue import queue_event_on_commit
+from zerver.lib.remote_server import (
+    PushNotificationBouncerError,
+    PushNotificationBouncerRetryLaterError,
+)
 from zerver.lib.test_classes import BouncerTestCase
 from zerver.lib.test_helpers import activate_push_notification_service, mock_queue_publish
 from zerver.lib.timestamp import datetime_to_timestamp
-from zerver.models import Device, UserProfile
-from zilencer.models import RemotePushDevice, RemoteRealm
+from zerver.models import Device, PushDeviceToken, UserProfile
+from zilencer.models import RemotePushDevice, RemotePushDeviceToken, RemoteRealm
 
 
 class RegisterPushDeviceToBouncer(BouncerTestCase):
@@ -901,3 +907,273 @@ class RegisterPushDeviceToServer(BouncerTestCase):
             result = self.client_post("/json/mobile_push/register", payload)
         self.assert_json_error(result, "A registration for the device already in progress.")
         m.assert_not_called()
+
+    @activate_push_notification_service()
+    @override_settings(ZILENCER_ENABLED=False)
+    @responses.activate
+    def test_no_plan_purchased_registration_succeeds(self) -> None:
+        """Registration succeeds even when no plan is purchased.
+
+        The plan check only happens when sending push notifications,
+        not during device registration.
+        """
+        self.add_mock_response()
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+
+        payload = self.get_register_push_device_payload()
+
+        devices = Device.objects.all()
+        self.assert_length(devices, 1)
+        self.assert_push_fields_null(devices[0])
+
+        # Assert remote_realm is not on any plan.
+        remote_realm = RemoteRealm.objects.get(uuid=hamlet.realm.uuid)
+        self.assertEqual(remote_realm.plan_type, RemoteRealm.PLAN_TYPE_SELF_MANAGED)
+
+        time_now = now()
+        with (
+            time_machine.travel(time_now, tick=False),
+            self.capture_send_event_calls(expected_num_events=2) as events,
+        ):
+            result = self.client_post("/json/mobile_push/register", payload)
+        self.assert_json_success(result)
+
+        devices = Device.objects.all()
+        self.assert_length(devices, 1)
+        device = devices[0]
+        assert type(payload["token_id"]) is str  # for mypy
+        self.assertEqual(device.push_token_id, b64decode_token_id_base64(payload["token_id"]))
+        self.assertIsNone(device.pending_push_token_id)
+        self.assertIsNone(device.push_registration_error_code)
+        self.assertEqual(
+            events[0]["event"],
+            dict(
+                type="device",
+                op="update",
+                device_id=device.id,
+                push_key_id=device.push_key_id,
+                pending_push_token_id=payload["token_id"],
+                push_token_last_updated_timestamp=datetime_to_timestamp(time_now),
+                push_registration_error_code=None,
+            ),
+        )
+        self.assertEqual(
+            events[1]["event"],
+            dict(
+                type="device",
+                op="update",
+                device_id=device.id,
+                push_token_id=payload["token_id"],
+                pending_push_token_id=None,
+            ),
+        )
+
+    @activate_push_notification_service()
+    @override_settings(ZILENCER_ENABLED=False)
+    @responses.activate
+    def test_legacy_token_cleanup_on_e2ee_registration(self) -> None:
+        self.add_mock_response()
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+
+        token = "c0ffee"
+
+        # Create legacy tokens with a different value
+        # to verify they are NOT removed.
+        PushDeviceToken.objects.create(
+            user=hamlet,
+            token="different_token",
+            kind=PushDeviceToken.APNS,
+            ios_app_id="example.app",
+        )
+        PushDeviceToken.objects.create(
+            user=hamlet,
+            token="different_fcm_token",
+            kind=PushDeviceToken.FCM,
+        )
+
+        # Create legacy PushDeviceToken and RemotePushDeviceToken
+        # with the same token used for E2EE registration.
+        PushDeviceToken.objects.create(
+            user=hamlet,
+            token=token,
+            kind=PushDeviceToken.APNS,
+            ios_app_id="example.app",
+        )
+        RemotePushDeviceToken.objects.create(
+            server=self.server,
+            user_uuid=str(hamlet.uuid),
+            token=token,
+            kind=RemotePushDeviceToken.APNS,
+            ios_app_id="example.app",
+        )
+
+        self.assertEqual(PushDeviceToken.objects.count(), 3)
+        self.assertEqual(RemotePushDeviceToken.objects.count(), 1)
+
+        payload = self.get_register_push_device_payload(token=token)
+        with self.capture_send_event_calls(expected_num_events=2):
+            result = self.client_post("/json/mobile_push/register", payload)
+        self.assert_json_success(result)
+
+        # The matching legacy tokens should be removed
+        # on both server and bouncer.
+        remaining_tokens = PushDeviceToken.objects.filter(user=hamlet).order_by("token")
+        self.assert_length(remaining_tokens, 2)
+        self.assertEqual(remaining_tokens[0].token, "different_fcm_token")
+        self.assertEqual(remaining_tokens[1].token, "different_token")
+
+        self.assertEqual(RemotePushDeviceToken.objects.count(), 0)
+
+    @activate_push_notification_service()
+    @override_settings(ZILENCER_ENABLED=False)
+    @responses.activate
+    def test_legacy_apns_token_cleanup_is_case_insensitive(self) -> None:
+        # APNs treats its tokens as case-insensitive, and different
+        # client versions have sent the same token in different cases.
+        # When an E2EE registration comes in using one case, we still
+        # need to clean up a legacy registration using the other case;
+        # otherwise the device gets two copies of each notification.
+        self.add_mock_response()
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+
+        legacy_token = "abcdef0123456789"
+        e2ee_token = legacy_token.upper()
+
+        PushDeviceToken.objects.create(
+            user=hamlet,
+            token=legacy_token,
+            kind=PushDeviceToken.APNS,
+            ios_app_id="example.app",
+        )
+        RemotePushDeviceToken.objects.create(
+            server=self.server,
+            user_uuid=str(hamlet.uuid),
+            token=legacy_token,
+            kind=RemotePushDeviceToken.APNS,
+            ios_app_id="example.app",
+        )
+
+        payload = self.get_register_push_device_payload(token=e2ee_token)
+        with self.capture_send_event_calls(expected_num_events=2):
+            result = self.client_post("/json/mobile_push/register", payload)
+        self.assert_json_success(result)
+
+        self.assertEqual(PushDeviceToken.objects.filter(user=hamlet).count(), 0)
+        self.assertEqual(RemotePushDeviceToken.objects.count(), 0)
+
+        # Same scenario with the cases reversed: legacy token in
+        # uppercase and E2EE registration in lowercase.
+        PushDeviceToken.objects.create(
+            user=hamlet,
+            token=e2ee_token,
+            kind=PushDeviceToken.APNS,
+            ios_app_id="example.app",
+        )
+        RemotePushDeviceToken.objects.create(
+            server=self.server,
+            user_uuid=str(hamlet.uuid),
+            token=e2ee_token,
+            kind=RemotePushDeviceToken.APNS,
+            ios_app_id="example.app",
+        )
+
+        payload = self.get_register_push_device_payload(token=legacy_token)
+        with self.capture_send_event_calls(expected_num_events=2):
+            result = self.client_post("/json/mobile_push/register", payload)
+        self.assert_json_success(result)
+
+        self.assertEqual(PushDeviceToken.objects.filter(user=hamlet).count(), 0)
+        self.assertEqual(RemotePushDeviceToken.objects.count(), 0)
+
+        # Mixed-case legacy token matched by the E2EE client in the
+        # same mixed case: migration 0740 made the database constraint
+        # case-insensitive but didn't normalize the stored casing, so
+        # rows like this can still exist from before that migration.
+        mixed_case_token = "AbCdEf0123456789"
+        PushDeviceToken.objects.create(
+            user=hamlet,
+            token=mixed_case_token,
+            kind=PushDeviceToken.APNS,
+            ios_app_id="example.app",
+        )
+        RemotePushDeviceToken.objects.create(
+            server=self.server,
+            user_uuid=str(hamlet.uuid),
+            token=mixed_case_token,
+            kind=RemotePushDeviceToken.APNS,
+            ios_app_id="example.app",
+        )
+
+        payload = self.get_register_push_device_payload(token=mixed_case_token)
+        with self.capture_send_event_calls(expected_num_events=2):
+            result = self.client_post("/json/mobile_push/register", payload)
+        self.assert_json_success(result)
+
+        self.assertEqual(PushDeviceToken.objects.filter(user=hamlet).count(), 0)
+        self.assertEqual(RemotePushDeviceToken.objects.count(), 0)
+
+    @activate_push_notification_service()
+    @override_settings(ZILENCER_ENABLED=False)
+    @responses.activate
+    def test_legacy_token_cleanup_error_handling(self) -> None:
+        self.add_mock_response()
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+
+        token = "c0ffee"
+
+        def do_e2ee_registration_with_legacy_token(
+            error: Exception,
+        ) -> None:
+            # Reset
+            PushDeviceToken.objects.all().delete()
+
+            PushDeviceToken.objects.create(
+                user=hamlet,
+                token=token,
+                kind=PushDeviceToken.APNS,
+                ios_app_id="example.app",
+            )
+            payload = self.get_register_push_device_payload(token=token)
+            with (
+                mock.patch(
+                    "zerver.lib.push_notifications.send_to_push_bouncer",
+                    side_effect=error,
+                ),
+                self.capture_send_event_calls(expected_num_events=2),
+            ):
+                result = self.client_post("/json/mobile_push/register", payload)
+            self.assert_json_success(result)
+
+        # "Token does not exist" on bouncer, verify it gets deleted on server.
+        do_e2ee_registration_with_legacy_token(
+            error=JsonableError("Token does not exist"),
+        )
+        self.assertEqual(PushDeviceToken.objects.count(), 0)
+
+        # PushNotificationBouncerRetryLaterError: retries then logs warning.
+        with self.assertLogs("zerver.lib.push_registration", level="WARNING") as logs:
+            do_e2ee_registration_with_legacy_token(
+                error=PushNotificationBouncerRetryLaterError("5xx or Network error"),
+            )
+        self.assertEqual(
+            "WARNING:zerver.lib.push_registration:"
+            f"Failed to remove legacy push token from bouncer for user {hamlet.id} after retries: 5xx or Network error",
+            logs.output[0],
+        )
+        self.assertEqual(PushDeviceToken.objects.count(), 0)
+
+        # PushNotificationBouncerError: logged to notify server admin.
+        with self.assertLogs("zerver.lib.push_registration", level="ERROR") as logs:
+            do_e2ee_registration_with_legacy_token(
+                error=PushNotificationBouncerError("unexpected status code"),
+            )
+        self.assertEqual(
+            "ERROR:zerver.lib.push_registration:"
+            f"Bouncer error cleaning up legacy push token for user {hamlet.id}: unexpected status code",
+            logs.output[0],
+        )
+        self.assertEqual(PushDeviceToken.objects.count(), 0)

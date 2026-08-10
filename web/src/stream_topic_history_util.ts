@@ -1,9 +1,9 @@
-import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
 import * as channel from "./channel.ts";
+import * as message_util from "./message_util.ts";
+import {get_retry_backoff_seconds} from "./retry_backoff.ts";
 import * as stream_topic_history from "./stream_topic_history.ts";
-import * as util from "./util.ts";
 
 const stream_topic_history_response_schema = z.object({
     topics: z.array(
@@ -40,7 +40,7 @@ function fetch_channel_history_with_retry(stream_id: number, attempt = 1): void 
             pending_on_success_callbacks.delete(stream_id);
         },
         error(xhr) {
-            const retry_delay_secs = util.get_retry_backoff_seconds(xhr, attempt);
+            const retry_delay_secs = get_retry_backoff_seconds(xhr, attempt);
             setTimeout(() => {
                 fetch_channel_history_with_retry(stream_id, attempt + 1);
             }, retry_delay_secs * 1000);
@@ -71,45 +71,20 @@ export function update_topic_last_message_id(
     topic_name: string,
     update_dom_on_success: () => void,
 ): void {
-    void channel.get({
-        url: "/json/messages",
-        data: {
-            narrow: JSON.stringify([
-                {operator: "stream", operand: stream_id},
-                {operator: "topic", operand: topic_name},
-            ]),
-            anchor: "newest",
-            num_before: 1,
-            num_after: 0,
-            allow_empty_topic_name: true,
-        },
-        success(data) {
-            const {messages} = z
-                .object({
-                    messages: z.array(
-                        z.object({
-                            id: z.number(),
-                        }),
-                    ),
-                })
-                .parse(data);
-            if (messages.length !== 1) {
-                return;
-            }
-
-            const last_message = messages[0];
-            assert(last_message !== undefined);
+    message_util.get_last_message_id_in_narrow(
+        [
+            {operator: "channel", operand: stream_id},
+            {operator: "topic", operand: topic_name},
+        ],
+        (last_message_id) => {
             stream_topic_history.add_history(stream_id, [
                 {
                     name: topic_name,
-                    max_id: last_message.id,
+                    max_id: last_message_id,
                 },
             ]);
             update_dom_on_success();
         },
-        error() {
-            // Ideally we would retry since we should always be able to get a success response
-            // from the server for this request, but for now we just ignore the error.
-        },
-    });
+        {allow_empty_topic_name: true},
+    );
 }

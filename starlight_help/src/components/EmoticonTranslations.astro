@@ -1,30 +1,9 @@
 ---
-import EmojiCodes from "../../../static/generated/emoji/emoji_codes.json";
+import {getCollection} from "astro:content";
 
-const nameToCodePoint: Record<string, string> = EmojiCodes.name_to_codepoint;
-const emojiImageUrls: Record<string, {src: string}> = import.meta.glob(
-    "../../../static/generated/emoji/images-google-64/*.png",
-    {
-        eager: true,
-        import: "default",
-    },
+const emoticons = (await getCollection("emoticons")).toSorted(
+    (a, b) => a.data.order - b.data.order,
 );
-
-const rowHTML = (emoticon: string, emoji: string, imageSrc: string) => `
-<tr>
-    <td><code>${emoticon}</code></td>
-    <td><img src="${imageSrc}" alt="${emoji}" class="emoji-big"></td>
-</tr>
-`;
-let body = "";
-const emoticonConversions: Record<string, string> =
-    EmojiCodes.emoticon_conversions;
-for (const name of Object.keys(emoticonConversions)) {
-    const emoticon: string = emoticonConversions[name]!;
-    const codepoint = nameToCodePoint[emoticon.slice(1, -1)]!;
-    const imagePath = `../../../static/generated/emoji/images-google-64/${codepoint}.png`;
-    body += rowHTML(name, emoticon, emojiImageUrls[imagePath]!.src);
-}
 ---
 
 <table>
@@ -35,6 +14,17 @@ for (const name of Object.keys(emoticonConversions)) {
         </tr>
     </thead>
     <tbody>
-        <Fragment set:html={body} />
+        {
+            emoticons.map((entry) => (
+                <tr>
+                    <td>
+                        <code>{entry.id}</code>
+                    </td>
+                    <td>
+                        <img src={entry.data.image.src} alt={entry.data.emoji} class="emoji-big" />
+                    </td>
+                </tr>
+            ))
+        }
     </tbody>
 </table>

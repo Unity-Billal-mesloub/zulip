@@ -15,12 +15,13 @@ const {make_stream} = require("./lib/example_stream.cjs");
 const {make_bot, make_cross_realm_bot, make_user, Role} = require("./lib/example_user.cjs");
 const {mock_channel_get} = require("./lib/mock_channel.cjs");
 const {mock_esm, set_global, zrequire} = require("./lib/namespace.cjs");
-const {run_test} = require("./lib/test.cjs");
+const {run_test, noop} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
 const {page_params} = require("./lib/zpage_params.cjs");
 
 const channel = mock_esm("../src/channel");
 
+const {GENERIC_BOT_TYPE_INT, INCOMING_WEBHOOK_BOT_TYPE_INT} = zrequire("bot_type_values");
 const peer_data = zrequire("peer_data");
 const people = zrequire("people");
 const {set_current_user, set_realm} = zrequire("state_data");
@@ -72,7 +73,7 @@ function contains_sub(subs, sub) {
     return subs.some((s) => s.name === sub.name);
 }
 function test(label, f) {
-    run_test(label, ({override}) => {
+    run_test(label, ({override, override_rewire}) => {
         peer_data.clear_for_testing();
         stream_data.clear_subscriptions();
         people.init();
@@ -89,16 +90,17 @@ function test(label, f) {
         );
         override(realm, "realm_can_access_all_users_group", nobody_group.id);
 
-        return f({override});
+        return f({override, override_rewire});
     });
 }
 
-test("unsubscribe", () => {
+test("unsubscribe", ({override_rewire}) => {
     const devel = make_stream({
         name: "devel",
         subscribed: false,
         stream_id: 1,
     });
+
     stream_data.add_sub_for_tests(devel);
 
     // verify clean slate
@@ -111,6 +113,7 @@ test("unsubscribe", () => {
     // ensure our setup is accurate
     assert.ok(stream_data.is_subscribed(devel.stream_id));
 
+    override_rewire(stream_data, "set_max_channel_width_css_variable", noop);
     // DO THE UNSUBSCRIBE HERE
     stream_data.unsubscribe_myself(devel);
     assert.ok(!devel.subscribed);
@@ -321,7 +324,7 @@ test("maybe_fetch_stream_subscribers", async () => {
     blueslip.reset();
     assert.deepEqual(subscribers_before_fetch_completes, [7, 9]);
     const subscribers_after_fetch = await pending_promise;
-    assert.deepEqual([...subscribers_after_fetch.keys()], [1, 2, 4, 7, 9]);
+    assert.deepEqual(subscribers_after_fetch.keys().toArray(), [1, 2, 4, 7, 9]);
 
     peer_data.clear_for_testing();
     assert.equal(await peer_data.maybe_fetch_is_user_subscribed(india.stream_id, 2, false), true);
@@ -411,7 +414,7 @@ test("maybe_fetch_stream_subscribers", async () => {
     blueslip.expect("error", "Failure fetching channel subscribers");
     const subscribers = await peer_data.fetch_stream_subscribers_with_retry(india.stream_id);
     assert.equal(num_attempts, 2);
-    assert.deepEqual([...subscribers.keys()], [1, 2, 3, 4]);
+    assert.deepEqual(subscribers.keys().toArray(), [1, 2, 3, 4]);
     blueslip.reset();
 
     peer_data.clear_for_testing();
@@ -526,6 +529,46 @@ test("is_subscriber_subset", async () => {
             row[2],
         );
     }
+
+    // Create a mock Incoming Webhook bot
+    const webhook_bot = make_bot({
+        email: "webhook@zulip.com",
+        full_name: "Webhook Bot",
+        user_id: 105,
+        bot_type: INCOMING_WEBHOOK_BOT_TYPE_INT,
+    });
+    people.add_active_user(webhook_bot);
+
+    // Create a mock Generic Bot
+    const generic_bot = make_bot({
+        email: "generic@zulip.com",
+        full_name: "Generic Bot",
+        user_id: 106,
+        bot_type: GENERIC_BOT_TYPE_INT,
+    });
+    people.add_active_user(generic_bot);
+
+    const sub_with_webhook = make_sub(304, [1, 2, webhook_bot.user_id]);
+    const sub_with_generic = make_sub(305, [1, 2, generic_bot.user_id]);
+    const sub_with_unknown_user = make_sub(306, [1, 2, 9999]);
+
+    // Webhooks should be ignored.
+    assert.equal(
+        await peer_data.is_subscriber_subset(sub_with_webhook.stream_id, sub_a.stream_id),
+        true,
+    );
+
+    // Generic bots can read, so they are NOT ignored.
+    assert.equal(
+        await peer_data.is_subscriber_subset(sub_with_generic.stream_id, sub_a.stream_id),
+        false,
+    );
+
+    // Unknown users are treated conservatively (not ignored).
+    assert.equal(
+        await peer_data.is_subscriber_subset(sub_with_unknown_user.stream_id, sub_a.stream_id),
+        false,
+    );
 
     // Two untracked streams should never be passed into us.
     blueslip.expect(

@@ -14,9 +14,9 @@ if os.path.exists(zulip_git_version_file):
 ZULIP_VERSION = lines.pop(0).strip()
 ZULIP_MERGE_BASE = lines.pop(0).strip()
 
-LATEST_MAJOR_VERSION = "11.0"
-LATEST_RELEASE_VERSION = "11.5"
-LATEST_RELEASE_ANNOUNCEMENT = "https://blog.zulip.com/zulip-server-11-0"
+LATEST_MAJOR_VERSION = "12.0"
+LATEST_RELEASE_VERSION = "12.1"
+LATEST_RELEASE_ANNOUNCEMENT = "https://blog.zulip.com/zulip-server-12-0"
 
 # Versions of the desktop app below DESKTOP_MINIMUM_VERSION will be
 # prevented from connecting to the Zulip server.  Versions above
@@ -33,7 +33,7 @@ DESKTOP_WARNING_VERSION = "5.9.3"
 # https://zulip.readthedocs.io/en/latest/documentation/api.html#step-by-step-guide
 # Also available at docs/documentation/api.md.
 
-API_FEATURE_LEVEL = 468
+API_FEATURE_LEVEL = 507
 
 # Bump the minor PROVISION_VERSION to indicate that folks should provision
 # only when going from an old version of the code to a newer version. Bump
@@ -48,4 +48,4 @@ API_FEATURE_LEVEL = 468
 #   historical commits sharing the same major version, in which case a
 #   minor version bump suffices.
 
-PROVISION_VERSION = (369, 2)  # bumped 2026-02-09 to add jdenticon
+PROVISION_VERSION = (386, 0)  # bumped 2026-07-28 to upgrade JavaScript dependencies

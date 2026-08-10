@@ -170,6 +170,7 @@ def maybe_send_to_registration(
     email: str,
     *,
     desktop_flow_otp: str | None = None,
+    external_auth_id_dict_for_registration: dict[str, str] | None = None,
     full_name: str = "",
     full_name_validated: bool = False,
     group_memberships_sync_map: dict[str, bool] | None = None,
@@ -263,10 +264,45 @@ def maybe_send_to_registration(
     else:
         invited_as = PreregistrationUser.INVITE_AS["MEMBER"]
 
+    try:
+        # If there's an existing, valid PreregistrationUser for this
+        # user, we want to fetch it since some values from it will be used
+        # as defaults for creating the signed up user.
+        existing_prereg_user = filter_to_valid_prereg_users(
+            PreregistrationUser.objects.filter(email__iexact=email, realm=realm)
+        ).latest("invited_at")
+    except PreregistrationUser.DoesNotExist:
+        existing_prereg_user = None
+
+    if multiuse_obj is None and existing_prereg_user is not None:
+        # When the user is not signing up via a multiuse invite link,
+        # the existing PreregistrationUser tells us the role they were
+        # intended to have, when they were invited.
+        invited_as = existing_prereg_user.invited_as
+
+    # A valid pending email invitation for this user permits them to
+    # sign up even if the organization requires invitations to join;
+    # PreregistrationUser rows left over from the user's own earlier
+    # signup attempts are not invitations, and must not bypass the
+    # invite_required check.
+    has_pending_invitation = filter_to_valid_prereg_users(
+        PreregistrationUser.objects.filter(
+            email__iexact=email,
+            realm=realm,
+            # Only invitations have referred_by set. This condition is
+            # redundant with invitations_only below; we keep both as
+            # defense in depth to ensure we only look at the intended
+            # PreregistrationUser set.
+            referred_by__isnull=False,
+        ),
+        invitations_only=True,
+    ).exists()
+
     form = HomepageForm(
         {"email": email},
         realm=realm,
         from_multiuse_invite=from_multiuse_invite,
+        has_pending_invitation=has_pending_invitation,
         invited_as=role or invited_as,
     )
     if form.is_valid():
@@ -275,19 +311,10 @@ def maybe_send_to_registration(
         # Confirmation objects, and then send the user to account
         # creation or confirm-continue-registration depending on
         # is_signup.
-        try:
-            # If there's an existing, valid PreregistrationUser for this
-            # user, we want to fetch it since some values from it will be used
-            # as defaults for creating the signed up user.
-            existing_prereg_user = filter_to_valid_prereg_users(
-                PreregistrationUser.objects.filter(email__iexact=email, realm=realm)
-            ).latest("invited_at")
-        except PreregistrationUser.DoesNotExist:
-            existing_prereg_user = None
-
+        #
         # full_name data passed here as argument should take precedence
-        # over the defaults with which the existing PreregistrationUser that we've just fetched
-        # was created.
+        # over the defaults with which the existing PreregistrationUser
+        # fetched above was created.
         prereg_user = create_preregistration_user(
             email,
             realm,
@@ -315,7 +342,6 @@ def maybe_send_to_registration(
             include_realm_default_subscriptions = (
                 existing_prereg_user.include_realm_default_subscriptions
             )
-            invited_as = existing_prereg_user.invited_as
 
         if streams_to_subscribe:
             prereg_user.streams.set(streams_to_subscribe)
@@ -335,6 +361,13 @@ def maybe_send_to_registration(
         else:
             prereg_user.invited_as = invited_as
         prereg_user.multiuse_invite = multiuse_obj
+        if external_auth_id_dict_for_registration:
+            prereg_user.external_auth_method_name = external_auth_id_dict_for_registration[
+                "external_auth_method_name"
+            ]
+            prereg_user.external_auth_id = external_auth_id_dict_for_registration[
+                "external_auth_id"
+            ]
         prereg_user.save()
 
         confirmation_link = create_confirmation_link(prereg_user, Confirmation.USER_REGISTRATION)
@@ -385,6 +418,7 @@ def register_remote_user(request: HttpRequest, result: ExternalAuthResult) -> Ht
         "full_name_validated",
         "params_to_store_in_authenticated_session",
         "redirect_to",
+        "external_auth_id_dict_for_registration",
     ]
     for key in dict(kwargs):
         if key not in kwargs_to_pass:
@@ -756,7 +790,7 @@ def _start_social_auth_flow(
         return config_error(request, "apple")
 
     # TODO: Add AzureAD also.
-    if backend in ["github", "google", "gitlab"]:
+    if backend in ["github", "google", "gitlab", "discord"]:
         key_setting = "SOCIAL_AUTH_" + backend.upper() + "_KEY"
         secret_setting = "SOCIAL_AUTH_" + backend.upper() + "_SECRET"
         if not (getattr(settings, key_setting) and getattr(settings, secret_setting)):

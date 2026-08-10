@@ -2,19 +2,22 @@
 // server_events.js simple while breaking some circular
 // dependencies that existed when this code was in people.js.
 // (We should do bot updates here too.)
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
 import * as activity_ui from "./activity_ui.ts";
 import * as blueslip from "./blueslip.ts";
+import * as bot_data from "./bot_data.ts";
 import {buddy_list} from "./buddy_list.ts";
 import * as compose_pm_pill from "./compose_pm_pill.ts";
-import * as compose_state from "./compose_state.ts";
+import * as compose_recipient from "./compose_recipient.ts";
 import * as message_live_update from "./message_live_update.ts";
+import * as message_view_header from "./message_view_header.ts";
 import * as navbar_alerts from "./navbar_alerts.ts";
 import * as people from "./people.ts";
 import * as pm_list from "./pm_list.ts";
+import * as reactions from "./reactions.ts";
 import * as settings from "./settings.ts";
 import * as settings_account from "./settings_account.ts";
 import * as settings_bots from "./settings_bots.ts";
@@ -22,6 +25,8 @@ import * as settings_config from "./settings_config.ts";
 import * as settings_exports from "./settings_exports.ts";
 import * as settings_linkifiers from "./settings_linkifiers.ts";
 import * as settings_org from "./settings_org.ts";
+import * as settings_panel_menu from "./settings_panel_menu.ts";
+import * as settings_preferences from "./settings_preferences.ts";
 import * as settings_profile_fields from "./settings_profile_fields.ts";
 import * as settings_realm_user_settings_defaults from "./settings_realm_user_settings_defaults.ts";
 import * as settings_streams from "./settings_streams.ts";
@@ -72,7 +77,6 @@ export const update_person = function update(event: UserUpdate): void {
         const new_email = event.new_email;
 
         people.update_email(user_id, new_email);
-        compose_state.update_email(user_id, new_email);
 
         if (people.is_my_user_id(event.user_id)) {
             current_user.email = new_email;
@@ -89,6 +93,11 @@ export const update_person = function update(event: UserUpdate): void {
             current_user.delivery_email = delivery_email;
             settings_account.hide_confirm_email_banner();
         }
+
+        if (user.is_bot && bot_data.get(event.user_id) !== undefined) {
+            assert(delivery_email !== null);
+            bot_data.update(event.user_id, {user_id: event.user_id, email: delivery_email});
+        }
     }
 
     if ("full_name" in event) {
@@ -97,11 +106,18 @@ export const update_person = function update(event: UserUpdate): void {
         settings_users.update_user_data(event.user_id, event);
         activity_ui.redraw();
         message_live_update.update_user_full_name(event.user_id, event.full_name);
+        reactions.update_user_full_name(event.user_id);
         pm_list.update_private_messages();
+        message_view_header.maybe_update_navbar_title_for_user(event.user_id);
+        compose_recipient.update_user_name_in_compose(event.user_id, event.full_name);
         user_profile.update_profile_modal_ui(user, event);
         if (people.is_my_user_id(event.user_id)) {
             current_user.full_name = event.full_name;
             settings_account.update_full_name(event.full_name);
+            settings_preferences.update_user_list_style_preview_name(event.full_name);
+        }
+        if (user.is_bot && bot_data.get(event.user_id) !== undefined) {
+            bot_data.update(event.user_id, {user_id: event.user_id, full_name: event.full_name});
         }
     }
 
@@ -116,6 +132,13 @@ export const update_person = function update(event: UserUpdate): void {
         settings_users.update_user_data(event.user_id, event);
         user_profile.update_profile_modal_ui(user, event);
         settings_account.set_user_own_role_dropdown_value();
+
+        if (people.is_my_user_id(event.user_id) && current_user.is_guest !== user.is_guest) {
+            current_user.is_guest = user.is_guest;
+            if (current_user.is_guest) {
+                settings_panel_menu.hide_default_streams_list_for_guest();
+            }
+        }
 
         if (people.is_my_user_id(event.user_id)) {
             settings_account.update_role_text();
@@ -136,8 +159,8 @@ export const update_person = function update(event: UserUpdate): void {
             settings_org.maybe_disable_widgets();
             settings_org.enable_or_disable_group_permission_settings();
             settings_profile_fields.maybe_disable_widgets();
-            settings_streams.maybe_disable_widgets();
             settings_realm_user_settings_defaults.maybe_disable_widgets();
+            settings_streams.rerender_default_streams_for_role_change();
             settings_account.update_account_settings_display();
             settings.update_lock_icon_in_sidebar();
             settings_account.update_user_own_role_dropdown_state();
@@ -178,9 +201,13 @@ export const update_person = function update(event: UserUpdate): void {
             } else {
                 $("#user-avatar-source").hide();
             }
+            settings_preferences.update_user_list_style_preview_avatar(
+                people.small_avatar_url_for_person(user),
+            );
         }
 
         message_live_update.update_avatar(user.user_id, event.avatar_url);
+        buddy_list.insert_or_move([event.user_id]);
         user_profile.update_profile_modal_ui(user, event);
     }
 
@@ -224,10 +251,21 @@ export const update_person = function update(event: UserUpdate): void {
         assert(user.is_bot);
         user.bot_owner_id = event.bot_owner_id;
         user_profile.update_profile_modal_ui(user, event);
+        if (current_user.is_admin) {
+            // Non-admins only have bots they own in bot_data, and receive
+            // realm_bot/add or realm_bot/delete events when ownership changes,
+            // so their bot_data is already up to date at this point.
+            bot_data.update(event.user_id, {user_id: event.user_id, owner_id: event.bot_owner_id});
+        }
+        settings_bots.redraw_your_bots_list();
+        settings_bots.toggle_bot_config_download_container();
     }
 
     if ("is_active" in event) {
         const is_bot_user = user.is_bot;
+        if (is_bot_user && bot_data.get(event.user_id) !== undefined) {
+            bot_data.update(event.user_id, {user_id: event.user_id, is_active: event.is_active});
+        }
         if (event.is_active) {
             people.add_active_user(user);
             settings_users.update_view_on_reactivate(event.user_id, is_bot_user);
@@ -248,9 +286,18 @@ export const update_person = function update(event: UserUpdate): void {
         settings_account.maybe_update_deactivate_account_button();
         if (is_bot_user) {
             settings_bots.update_bot_data(event.user_id);
+            settings_bots.toggle_bot_config_download_container();
         } else if (!event.is_active) {
             // A human user deactivated, update 'Export permissions' table.
             settings_exports.remove_export_consent_data_and_redraw(event.user_id);
         }
+        if (user.is_imported_stub) {
+            settings_panel_menu.update_imported_users_tab();
+        }
+    }
+
+    if ("is_imported_stub" in event) {
+        user.is_imported_stub = false;
+        settings_panel_menu.update_imported_users_tab(true, true);
     }
 };

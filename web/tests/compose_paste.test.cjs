@@ -7,23 +7,66 @@ const {JSDOM} = require("jsdom");
 const katex_tests = require("../../zerver/tests/fixtures/katex_test_cases.json");
 const {parse} = require("../src/markdown.ts");
 
-const {zrequire, set_global} = require("./lib/namespace.cjs");
-const {run_test} = require("./lib/test.cjs");
+const {make_user_group} = require("./lib/example_group.cjs");
+const {make_stream} = require("./lib/example_stream.cjs");
+const {make_user} = require("./lib/example_user.cjs");
+const {mock_esm, zrequire, set_global} = require("./lib/namespace.cjs");
+const {run_test, noop} = require("./lib/test.cjs");
+const {$} = require("./lib/zjquery.cjs");
 
 const {window} = new JSDOM();
 
+const text_field_edit = mock_esm("text-field-edit", {insertTextIntoField: noop});
+
 const compose_paste = zrequire("compose_paste");
+const compose_ui = zrequire("compose_ui");
+const linkifiers = zrequire("linkifiers");
+const markdown = zrequire("markdown");
+const markdown_config = zrequire("markdown_config");
+const people = zrequire("people");
 const stream_data = zrequire("stream_data");
+const user_groups = zrequire("user_groups");
+const {initialize_user_settings} = zrequire("user_settings");
 
 set_global("document", {});
-stream_data.add_sub_for_tests({
-    stream_id: 4,
-    name: "Rome",
+class ClipboardEvent {
+    constructor({clipboardData} = {}) {
+        this.clipboardData = clipboardData;
+    }
+}
+set_global("ClipboardEvent", ClipboardEvent);
+initialize_user_settings({
+    user_settings: {
+        translate_emoticons: false,
+    },
 });
-stream_data.add_sub_for_tests({
-    stream_id: 5,
-    name: "Romeo`s lair",
-});
+markdown.initialize(markdown_config.get_helpers());
+
+// User and group ids match the ids used in the mention test fixtures
+// below.
+const king_hamlet = make_user({user_id: 10, full_name: "King Hamlet"});
+const desdemona = make_user({user_id: 9, full_name: "Desdemona"});
+const polonius = make_user({user_id: 13, full_name: "Polonius"});
+people.add_active_user(king_hamlet);
+people.add_active_user(desdemona);
+people.add_active_user(polonius);
+
+const hamletcharacters = make_user_group({name: "hamletcharacters", id: 24});
+const owners = make_user_group({name: "role:owners", id: 25, is_system_group: true});
+user_groups.initialize({realm_user_groups: [hamletcharacters, owners]});
+
+stream_data.add_sub_for_tests(
+    make_stream({
+        stream_id: 4,
+        name: "Rome",
+    }),
+);
+stream_data.add_sub_for_tests(
+    make_stream({
+        stream_id: 5,
+        name: "Romeo`s lair",
+    }),
+);
 
 run_test("try_stream_topic_syntax_text", () => {
     const test_cases = [
@@ -69,7 +112,7 @@ run_test("try_stream_topic_syntax_text", () => {
         ],
         [
             "http://zulip.zulipdev.com/#narrow/stream/4-Rome/topic/100.25.20*profits",
-            "[#Rome > 100% &#42;profits](#narrow/channel/4-Rome/topic/100.25.20*profits)",
+            "[#Rome > 100% &#42;profits](#narrow/channel/4-Rome/topic/100.25.20.2Aprofits)",
         ],
         [
             "http://zulip.zulipdev.com/#narrow/stream/4-Rome/topic/.24.24 100.25.20profits",
@@ -108,6 +151,138 @@ run_test("maybe_transform_html", () => {
     paste_html = "<div><div>Hello</div><div>World!</div></div>";
     paste_text = "Hello\nWorld!";
     assert.equal(compose_paste.maybe_transform_html(paste_html, paste_text), paste_html);
+});
+
+run_test("paste_handler reverse linkify", ({override, override_rewire}) => {
+    global.document = window.document;
+    global.window = window;
+    global.Node = window.Node;
+    global.HTMLElement = window.HTMLElement;
+    global.HTMLAnchorElement = window.HTMLAnchorElement;
+    global.HTMLTextAreaElement = window.HTMLTextAreaElement;
+
+    linkifiers.update_linkifier_rules([
+        {
+            id: 1,
+            pattern: "#D(?P<id>[0-9]{2,8})",
+            url_template: "https://github.com/zulip/zulip-desktop/pull/{id}",
+            reverse_template: "#D{id}",
+            alternative_url_templates: ["https://github.com/zulip/zulip-desktop/issues/{id}"],
+        },
+    ]);
+
+    let inserted_text;
+    let undo_texts;
+
+    override_rewire(compose_ui, "insert_and_scroll_into_view", (text) => {
+        inserted_text = text;
+    });
+
+    override(text_field_edit, "insertTextIntoField", (_textarea, text) => {
+        undo_texts.push(text);
+    });
+
+    const html_with_formatting = `
+        <p>
+        <span class="katex">
+            <span class="katex-mathml">
+            <math xmlns="http://www.w3.org/1998/Math/MathML">
+                <semantics>
+                <mrow>
+                    <mi>x</mi>
+                    <mo>+</mo>
+                    <mi>y</mi>
+                    <mn>2</mn>
+                </mrow>
+                <annotation encoding="application/x-tex">x + y2</annotation>
+                </semantics>
+            </math>
+            </span>
+            <span class="katex-html" aria-hidden="true">
+            <span class="base">
+                <span class="mord mathnormal">x</span>
+                <span class="mbin">+</span>
+            </span>
+            <span class="base">
+                <span class="mord mathnormal">y</span>
+                <span class="mord">2</span>
+            </span>
+            </span>
+        </span>
+        <del>test</del>
+        <a href="https://github.com/zulip/zulip-desktop/pull/1359">https://github.com/zulip/zulip-desktop/pull/1359</a>
+        </p>`;
+
+    const test_cases = [
+        {
+            // Reverse linkify should preserve formatting when pasting HTML.
+            paste_html: html_with_formatting,
+            paste_text:
+                "x\n+\ny\n2\nx + y2\nx+y2 test https://github.com/zulip/zulip-desktop/pull/1359",
+            expected: "$$x + y2$$ ~~test~~ #D1359",
+            // When paste_html is a real value, there are two undo states:
+            // first undo reverses the reverse linkify (back to formatted text),
+            // second undo reverses the formatting (back to plain text).
+            expected_undo_texts: [
+                "x\n+\ny\n2\nx + y2\nx+y2 test https://github.com/zulip/zulip-desktop/pull/1359",
+                "$$x + y2$$ ~~test~~ https://github.com/zulip/zulip-desktop/pull/1359",
+            ],
+        },
+        {
+            // Reverse linkify should work for URL only text.
+            paste_html: "",
+            paste_text: "https://github.com/zulip/zulip-desktop/pull/1359",
+            expected: "#D1359",
+            expected_undo_texts: ["https://github.com/zulip/zulip-desktop/pull/1359"],
+        },
+        {
+            // Reverse linkify should work in plain text with surrounding text.
+            paste_html: "",
+            paste_text: "https://github.com/zulip/zulip-desktop/pull/1359 dummy text.",
+            expected: "#D1359 dummy text.",
+            expected_undo_texts: ["https://github.com/zulip/zulip-desktop/pull/1359 dummy text."],
+        },
+        {
+            // Reverse linkify should work for alternative URL templates.
+            paste_html: "",
+            paste_text: "https://github.com/zulip/zulip-desktop/issues/42",
+            expected: "#D42",
+            expected_undo_texts: ["https://github.com/zulip/zulip-desktop/issues/42"],
+        },
+    ];
+
+    for (const test_case of test_cases) {
+        const $textarea = $("textarea#compose-textarea");
+        // Put the cursor at the start with no selected text.
+        // The URL paste path checks this before it reaches reverse-linkify.
+        $textarea[0] = window.document.createElement("textarea");
+        $textarea[0].value = "";
+        inserted_text = undefined;
+        undo_texts = [];
+
+        const event = {
+            originalEvent: new ClipboardEvent({
+                clipboardData: {
+                    getData(format) {
+                        if (format === "text/html") {
+                            return test_case.paste_html;
+                        }
+                        return test_case.paste_text;
+                    },
+                },
+            }),
+            preventDefault() {},
+            stopPropagation() {},
+        };
+
+        compose_paste.paste_handler.call($textarea, event, noop);
+        assert.equal(inserted_text, test_case.expected, test_case.paste_text);
+        assert.deepEqual(
+            undo_texts,
+            test_case.expected_undo_texts,
+            `undo texts for: ${test_case.paste_text}`,
+        );
+    }
 });
 
 run_test("paste_handler_converter", () => {
@@ -386,6 +561,35 @@ run_test("paste_handler_converter", () => {
     input = `<html><head><meta http-equiv="content-type" content="text/html; charset=utf-8"><title></title><meta name="generator" content="LibreOffice 25.2.3.2 (Windows)"><style type="text/css"> body,div,table,thead,tbody,tfoot,tr,th,td,p { font-family:"Arial"; font-size:x-small } a.comment-indicator:hover + comment { background:#ffd; position:absolute; display:block; border:1px solid black; padding:0.5em; } a.comment-indicator { background:red; display:inline-block; border:1px solid black; width:0.5em; height:0.5em; } comment { display:none; } </style></head><body><table cellspacing="0" border="0"><colgroup span="4" width="107"></colgroup><tbody><tr><td height="24" align="left" data-sheets-value="{ &quot;1&quot;: 2, &quot;2&quot;: &quot;Kathleen&quot;}">Kathleen</td><td align="left" data-sheets-value="{ &quot;1&quot;: 2, &quot;2&quot;: &quot;Hanner&quot;}">Hanner</td><td align="left" data-sheets-value="{ &quot;1&quot;: 2, &quot;2&quot;: &quot;Female&quot;}">Female</td><td align="left" data-sheets-value="{ &quot;1&quot;: 2, &quot;2&quot;: &quot;United States&quot;}">United States</td></tr><tr><td height="24" align="left" data-sheets-value="{ &quot;1&quot;: 2, &quot;2&quot;: &quot;Nereida&quot;}">Nereida</td><td align="left" data-sheets-value="{ &quot;1&quot;: 2, &quot;2&quot;: &quot;Magwood&quot;}">Magwood</td><td align="left" data-sheets-value="{ &quot;1&quot;: 2, &quot;2&quot;: &quot;Female&quot;}">Female</td><td align="left" data-sheets-value="{ &quot;1&quot;: 2, &quot;2&quot;: &quot;United States&quot;}">United States</td></tr></tbody></table></body></html>`;
     assert.ok(compose_paste.is_single_image(input));
 
+    // Pastes containing the `data-message-header-paragraph="true"` attribute should
+    // be formatted as per the custom turndown rule. The empty paragraph that
+    // copy_messages inserts between consecutive messages from the same recipient
+    // should render as a blank line separating them.
+    input = `<html><body><!--StartFragment--><p data-message-header-paragraph="true"><strong>test &gt; LAST API has been skipping erratically </strong><span>| Dec 20</span></p><b>Othello, the Moor of Venice: </b><div>When shall we three meet again In thunder, lightning, or in rain?</div><p></p><b>Othello, the Moor of Venice: </b><div>The second consecutive message.</div><p data-message-header-paragraph="true"><strong>test &gt; leased keurig wasn't loading </strong><span>| Dec 21</span></p><b>King Hamlet: </b><div>Sit down awhile; And let us once again assail your ears, That are so fortified against our story What we have two nights seen.</div><!--EndFragment--></body></html>`;
+    assert.equal(
+        compose_paste.paste_handler_converter(input),
+        "**test > LAST API has been skipping erratically** | Dec 20\n**Othello, the Moor of Venice:**\nWhen shall we three meet again In thunder, lightning, or in rain?\n\n**Othello, the Moor of Venice:**\nThe second consecutive message.\n\n**test > leased keurig wasn't loading** | Dec 21\n**King Hamlet:**\nSit down awhile; And let us once again assail your ears, That are so fortified against our story What we have two nights seen.",
+    );
+
+    // Copying a message that is a paragraph followed by a list: copy_messages
+    // unwraps only the leading paragraph into a div (so the sender name is
+    // separated from the body by a single newline), leaving the list intact.
+    // The list must stay on its own line and not get glued onto the paragraph.
+    input = `<html><body><!--StartFragment--><b>Desdemona: </b><div>intro text</div>\n<ul>\n<li>item one</li>\n<li>item two</li>\n<li>item three</li>\n</ul><!--EndFragment--></body></html>`;
+    assert.equal(
+        compose_paste.paste_handler_converter(input),
+        "**Desdemona:**\nintro text\n* item one\n* item two\n* item three",
+    );
+
+    // Partially selecting the first message inserts the "..." ellipsis inside
+    // the leading paragraph, so it stays glued to the start of the truncated
+    // text (on the same line) rather than landing on its own line.
+    input = `<html><body><!--StartFragment--><b>Iago: </b><div><span>...</span>of Nephelococcygia</div>\n<ul>\n<li>Myrmica ruginodis</li>\n<li>Myrmica kotokui</li>\n</ul><!--EndFragment--></body></html>`;
+    assert.equal(
+        compose_paste.paste_handler_converter(input),
+        "**Iago:**\n...of Nephelococcygia\n* Myrmica ruginodis\n* Myrmica kotokui",
+    );
+
     // This contains three child elements inside the body tag, pasted
     // from LibreOffice Writer, which is correctly classified as not an image.
     input = `<html><head><meta http-equiv="content-type" content="text/html; charset=utf-8"/><title></title><meta name="generator" content="LibreOffice 25.2.3.2 (Windows)"/><style type="text/css">@page { size: 8.5in 11in; margin: 0.79in }td p { orphans: 0; widows: 0; background: transparent }p { line-height: 115%; margin-bottom: 0.1in; background: transparent }</style></head><body lang="en-US" link="#000080" vlink="#800000" dir="ltr"><p style="line-height: 100%; margin-bottom: 0in">ello world</p><table width="100%" cellpadding="0" cellspacing="0"><col width="51*"/><col width="51*"/><col width="51*"/><col width="51*"/><col width="51*"/><tr valign="top"><td width="20%" style="border: none; padding: 0in"><p>X</p></td><td width="20%" style="border: none; padding: 0in"><p>as</p></td><td width="20%" style="border: none; padding: 0in"><p>Jak</p></td><td width="20%" style="border: none; padding: 0in"><p>J</p></td><td width="20%" style="border: none; padding: 0in"><p>Nm</p></td></tr><tr valign="top"><td width="20%" style="border: none; padding: 0in"><p>,mn</p></td><td width="20%" style="border: none; padding: 0in"><p>,nnf</p></td><td width="20%" style="border: none; padding: 0in"><p>Adlk</p></td><td width="20%" style="border: none; padding: 0in"><p>Asn</p></td><td width="20%" style="border: none; padding: 0in"><p>,amns</p></td></tr><tr valign="top"><td width="20%" style="border: none; padding: 0in"><p>Nm</p></td><td width="20%" style="border: none; padding: 0in"><p>Oi</p></td><td width="20%" style="border: none; padding: 0in"><p>Poi</p></td><td width="20%" style="border: none; padding: 0in"><p>B</p></td><td width="20%" style="border: none; padding: 0in"><p>Ijo</p></td></tr><tr valign="top"><td width="20%" style="border: none; padding: 0in"><p>,mn,</p></td><td width="20%" style="border: none; padding: 0in"><p>;ih</p></td><td width="20%" style="border: none; padding: 0in"><p>Oug</p></td><td width="20%" style="border: none; padding: 0in"><p>Iu</p></td><td width="20%" style="border: none; padding: 0in"><p>G</p></td></tr><tr valign="top"><td width="20%" style="border: none; padding: 0in"><p>Ug</p></td><td width="20%" style="border: none; padding: 0in"><p>Bkjb</p></td><td width="20%" style="border: none; padding: 0in"><p>Kjbk</p></td><td width="20%" style="border: none; padding: 0in"><p>;jbj</p></td><td width="20%" style="border: none; padding: 0in"><p>;jb;</p></td></tr><tr valign="top"><td width="20%" style="border: none; padding: 0in"><p>Bkjb</p></td><td width="20%" style="border: none; padding: 0in"><p>Ugug</p></td><td width="20%" style="border: none; padding: 0in"><p>I9</p></td><td width="20%" style="border: none; padding: 0in"><p>68</p></td><td width="20%" style="border: none; padding: 0in"><p>0</p></td></tr><tr valign="top"><td width="20%" style="border: none; padding: 0in"><p>90kjb</p></td><td width="20%" style="border: none; padding: 0in"><p>,bnbiu</p></td><td width="20%" style="border: none; padding: 0in"><p>Ofif</p></td><td width="20%" style="border: none; padding: 0in"><p>P8gp</p></td><td width="20%" style="border: none; padding: 0in"><p>pugp</p></td></tr></table><p style="line-height: 100%; margin-bottom: 0in"><br/></p></body></html>`;
@@ -411,6 +615,24 @@ run_test("paste_handler_converter", () => {
     input =
         '<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd"><html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><meta http-equiv="Content-Style-Type" content="text/css"><title></title><meta name="Generator" content="Cocoa HTML Writer"><meta name="CocoaVersion" content="2575.4"><style type="text/css">p.p1 {margin: 0.0px 0.0px 0.0px 0.0px; font: 11.0px Menlo; color: #000000}span.s1 {font-variant-ligatures: no-common-ligatures}</style></head><body><p class="p1"><span class="s1">insertions</span></p></body></html>';
     assert.equal(compose_paste.paste_handler_converter(input), "insertions");
+
+    // Zulip timestamp followed by text.
+    input =
+        '<meta charset=\'utf-8\'><time datetime="2026-05-29T16:30:00Z" style="background: rgba(0, 0, 0, 0.2); border-radius: 3px; box-shadow: rgba(0, 0, 0, 0.4) 0px 0px 0px 1px; white-space: nowrap; margin: 0px 2px; font-size: 0.95em; color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif;"><span class="timestamp-content-wrapper" style="font-size: 1.0526em; padding: 0px 0.2em; display: inline-flex; align-items: baseline; gap: 3px;"><span></span>May 29, 2026, 10:00 PM</span></time><span style="color: rgb(222, 222, 222); display: inline !important; float: none;"><span> </span>good better<span> </span></span>';
+    assert.equal(
+        compose_paste.paste_handler_converter(input),
+        "<time:2026-05-29T16:30:00Z> good better",
+    );
+
+    // Chrome-stripped timestamp: Chrome's clipboard serializer removes the <time>
+    // wrapper, leaving only the clock icon <i> and the <span data-datetime> fallback.
+    input =
+        '<meta charset=\'utf-8\'><br class="Apple-interchange-newline"><i class="zulip-icon zulip-icon-clock markdown-timestamp-icon" style="text-transform: none; font-size: 15.9995px; line-height: 15.9995px; text-decoration-line: inherit; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline-block; speak: none; font-family: zulip-icons !important; font-style: normal !important; font-weight: 400; font-variant-ligatures: normal; font-variant-caps: normal; font-variant-numeric: normal !important; font-variant-east-asian: normal !important; font-variant-alternates: normal !important; font-variant-position: normal !important; font-variant-emoji: normal !important; align-self: center; color: rgb(222, 222, 222); letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: nowrap; background-color: rgba(0, 0, 0, 0.2);"></i><span data-datetime="2026-05-23T17:30:00Z" style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 15.9995px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: nowrap; background-color: rgba(0, 0, 0, 0.2); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;">Sat, May 23, 2026, 11:00 PM</span>';
+    assert.equal(compose_paste.paste_handler_converter(input), "<time:2026-05-23T17:30:00Z>");
+
+    // Non-Zulip <time datetime> elements, should not be converted.
+    input = "<meta charset='utf-8'><time datetime=\"2024-06-01T09:00:00Z\">June 1, 2024</time>";
+    assert.equal(compose_paste.paste_handler_converter(input), "June 1, 2024");
 
     // Math block tests
 
@@ -457,4 +679,166 @@ run_test("paste_handler_converter", () => {
             span_conversion_test.expected_output,
         );
     }
+    const meta = '<meta http-equiv="content-type" content="text/html; charset=utf-8">';
+
+    let firefox_input;
+
+    // Non-silent user mention
+    firefox_input =
+        meta +
+        '<p><span class="user-mention" data-user-id="10">' +
+        '<span class="mention-content-wrapper">@King Hamlet</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@**King Hamlet|10**");
+
+    // Guest user mention: rendered_markdown.ts adds a "(guest)" suffix
+    // to the display name (commit 70c9d0765f). The people-store lookup
+    // returns the canonical full_name, so the suffix is dropped naturally.
+    firefox_input =
+        meta +
+        '<p><span class="user-mention" data-user-id="13">' +
+        '<span class="mention-content-wrapper">@Polonius (guest)</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@**Polonius|13**");
+
+    // Silent user mention
+    firefox_input =
+        meta +
+        '<p><span class="user-mention silent" data-user-id="10">' +
+        '<span class="mention-content-wrapper">King Hamlet</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@_**King Hamlet|10**");
+
+    // Self-mention adds a `user-mention-me` modifier class.
+    firefox_input =
+        meta +
+        '<p><span class="user-mention user-mention-me" data-user-id="9">' +
+        '<span class="mention-content-wrapper">@Desdemona</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@**Desdemona|9**");
+
+    // Non-silent group mention (single-asterisk syntax)
+    firefox_input =
+        meta +
+        '<p><span class="user-group-mention" data-user-group-id="24">' +
+        '<span class="mention-content-wrapper">@hamletcharacters</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@*hamletcharacters*");
+
+    // Silent group mention
+    firefox_input =
+        meta +
+        '<p><span class="user-group-mention silent" data-user-group-id="24">' +
+        '<span class="mention-content-wrapper">hamletcharacters</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@_*hamletcharacters*");
+
+    // System group mention: the pill's display text ("Owners") differs from
+    // the mention name ("role:owners"), so we resolve the name by group id.
+    firefox_input =
+        meta +
+        '<p><span class="user-group-mention" data-user-group-id="25">' +
+        '<span class="mention-content-wrapper">@Owners</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@*role:owners*");
+
+    // Non-silent topic mention
+    firefox_input =
+        meta +
+        '<p><span class="topic-mention">' +
+        '<span class="mention-content-wrapper">@topic</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@**topic**");
+
+    // Silent topic mention
+    firefox_input =
+        meta +
+        '<p><span class="topic-mention silent">' +
+        '<span class="mention-content-wrapper">topic</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@_**topic**");
+
+    // Non-silent channel wildcard mention (no |user_id suffix)
+    firefox_input =
+        meta +
+        '<p><span class="user-mention channel-wildcard-mention" data-user-id="*">' +
+        '<span class="mention-content-wrapper">@all</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@**all**");
+
+    // Silent channel wildcard mention
+    firefox_input =
+        meta +
+        '<p><span class="user-mention channel-wildcard-mention silent" data-user-id="*">' +
+        '<span class="mention-content-wrapper">all</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@_**all**");
+
+    // Mention inline with surrounding text.
+    firefox_input =
+        meta +
+        '<p>Hey <span class="user-mention" data-user-id="10">' +
+        '<span class="mention-content-wrapper">@King Hamlet</span></span>, how are you?</p>';
+    assert.equal(
+        compose_paste.paste_handler_converter(firefox_input),
+        "Hey @**King Hamlet|10**, how are you?",
+    );
+
+    // Lone mention without ancestor wrapper (bare span), as can happen
+    // when keyboard selection contains only the mention element.
+    firefox_input =
+        meta +
+        '<span class="user-mention" data-user-id="10">' +
+        '<span class="mention-content-wrapper">@King Hamlet</span></span>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@**King Hamlet|10**");
+
+    // Unknown user (not in the people store) falls back to the id-only
+    // @**|id** syntax; the backend resolves it on send.
+    firefox_input =
+        meta +
+        '<p><span class="user-mention" data-user-id="9999">' +
+        '<span class="mention-content-wrapper">@Unknown</span></span></p>';
+    assert.equal(compose_paste.paste_handler_converter(firefox_input), "@**|9999**");
+
+    let chrome_input;
+
+    // Non-silent user mention.
+    chrome_input = `<html><body><!--StartFragment--><span class="user-mention" data-user-id="10" style="padding: 0px 3px; border-radius: 3px; white-space: nowrap; font-size: 0.95em; color: rgba(255, 255, 255, 0.8); background-color: rgba(100, 100, 206, 0.25); cursor: pointer; font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;"><span class="mention-content-wrapper" style="font-size: 1.0526em;">@King Hamlet</span></span><span style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 16px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(31, 40, 40); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;">, how are you?</span><!--EndFragment--></body></html>`;
+    assert.equal(
+        compose_paste.paste_handler_converter(chrome_input),
+        "@**King Hamlet|10**, how are you?",
+    );
+
+    // Silent user mention.
+    chrome_input = `<html><body><!--StartFragment--><span class="user-mention silent" data-user-id="10" style="padding: 0px 3px; border-radius: 3px; white-space: nowrap; font-size: 0.95em; color: rgba(255, 255, 255, 0.8); background-color: rgba(100, 100, 206, 0.45); cursor: pointer; font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;"><span class="mention-content-wrapper" style="font-size: 1.0526em;">King Hamlet</span></span><span style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 16px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(31, 40, 40); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;">, silent test</span><!--EndFragment--></body></html>`;
+    assert.equal(
+        compose_paste.paste_handler_converter(chrome_input),
+        "@_**King Hamlet|10**, silent test",
+    );
+
+    // Self-mention adds a user-mention-me modifier class.
+    chrome_input = `<html><body><!--StartFragment--><span class="user-mention user-mention-me" data-user-id="9" style="padding: 0px 3px; border-radius: 3px; white-space: nowrap; font-size: 0.95em; color: rgb(194, 194, 255); background-color: rgba(100, 100, 206, 0.45); cursor: pointer; font-weight: 600; font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;"><span class="mention-content-wrapper" style="font-size: 1.0526em;">@Desdemona</span></span><span style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 16px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(35, 35, 46); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;"> hello</span><!--EndFragment--></body></html>`;
+    assert.equal(compose_paste.paste_handler_converter(chrome_input), "@**Desdemona|9** hello");
+
+    // Guest user mention: rendered_markdown.ts adds a "(guest)" suffix to
+    // the display name (commit 70c9d0765f). The people-store lookup returns
+    // the canonical full_name, so the suffix is dropped naturally.
+    chrome_input = `<html><body><!--StartFragment--><span class="user-mention" data-user-id="13" style="padding: 0px 3px; border-radius: 3px; white-space: nowrap; font-size: 0.95em; color: rgba(255, 255, 255, 0.8); background-color: rgba(100, 100, 206, 0.45); cursor: pointer; font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;"><span class="mention-content-wrapper" style="font-size: 1.0526em;">@Polonius (guest)</span></span><span style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 16px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(34, 34, 34); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;"><span> </span>guest</span><!--EndFragment--></body></html>`;
+    assert.equal(compose_paste.paste_handler_converter(chrome_input), "@**Polonius|13** guest");
+
+    // Non-silent group mention (single-asterisk syntax).
+    chrome_input = `<html><body><!--StartFragment--><span class="user-group-mention user-mention-me" data-user-group-id="35" style="padding: 0px 3px; border-radius: 3px; white-space: nowrap; font-size: 0.95em; cursor: pointer; color: rgb(112, 203, 210); background-color: rgba(49, 150, 155, 0.2); font-weight: 600; font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;"><span class="mention-content-wrapper" style="font-size: 1.0526em;">@announce</span></span><span style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 16px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(31, 40, 40); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;"> group ping</span><!--EndFragment--></body></html>`;
+    assert.equal(compose_paste.paste_handler_converter(chrome_input), "@*announce* group ping");
+
+    // Silent group mention.
+    chrome_input = `<html><body><!--StartFragment--><span class="user-group-mention silent" data-user-group-id="24" style="padding: 0px 3px; border-radius: 3px; white-space: nowrap; font-size: 0.95em; cursor: pointer; color: rgba(255, 255, 255, 0.8); background-color: rgba(49, 150, 155, 0.3); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;"><span class="mention-content-wrapper" style="font-size: 1.0526em;">hamletcharacters</span></span><span style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 16px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(31, 40, 40); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;">, silent group</span><!--EndFragment--></body></html>`;
+    assert.equal(
+        compose_paste.paste_handler_converter(chrome_input),
+        "@_*hamletcharacters*, silent group",
+    );
+
+    // Non-silent topic mention.
+    chrome_input = `<html><body><!--StartFragment--><span class="topic-mention user-mention-me" style="padding: 0px 3px; border-radius: 3px; white-space: nowrap; font-size: 0.95em; color: rgb(112, 203, 210); background-color: rgba(49, 150, 155, 0.2); font-weight: 600; font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;"><span class="mention-content-wrapper" style="font-size: 1.0526em;">@topic</span></span><span style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 16px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(31, 40, 40); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;"> topic test</span><!--EndFragment--></body></html>`;
+    assert.equal(compose_paste.paste_handler_converter(chrome_input), "@**topic** topic test");
+
+    // Silent topic mention.
+    chrome_input = `<html><body><!--StartFragment--><span class="topic-mention silent" style="padding: 0px 3px; border-radius: 3px; white-space: nowrap; font-size: 0.95em; color: rgba(255, 255, 255, 0.8); background-color: rgba(49, 150, 155, 0.2); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;"><span class="mention-content-wrapper" style="font-size: 1.0526em;">topic</span></span><span style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 16px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(34, 34, 34); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;"> silent topic</span><!--EndFragment--></body></html>`;
+    assert.equal(compose_paste.paste_handler_converter(chrome_input), "@_**topic** silent topic");
+
+    // Non-silent channel wildcard mention (no |user_id suffix).
+    chrome_input = `<html><body><!--StartFragment--><span class="user-mention channel-wildcard-mention user-mention-me" data-user-id="*" style="padding: 0px 3px; border-radius: 3px; white-space: nowrap; font-size: 0.95em; color: rgb(112, 203, 210); background-color: rgba(49, 150, 155, 0.2); cursor: pointer; font-weight: 600; font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;"><span class="mention-content-wrapper" style="font-size: 1.0526em;">@all</span></span><span style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 16px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(31, 40, 40); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;"> wildcard</span><!--EndFragment--></body></html>`;
+    assert.equal(compose_paste.paste_handler_converter(chrome_input), "@**all** wildcard");
+
+    // Silent channel wildcard mention.
+    chrome_input = `<html><body><!--StartFragment--><span class="user-mention channel-wildcard-mention silent user-mention-me" data-user-id="*" style="padding: 0px 3px; border-radius: 3px; white-space: nowrap; font-size: 0.95em; color: rgb(112, 203, 210); background-color: rgba(49, 150, 155, 0.2); cursor: pointer; font-weight: 600; font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;"><span class="mention-content-wrapper" style="font-size: 1.0526em;">all</span></span><span style="color: rgb(222, 222, 222); font-family: &quot;Source Sans 3 VF&quot;, sans-serif; font-size: 16px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(31, 40, 40); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;"> silently</span><!--EndFragment--></body></html>`;
+    assert.equal(compose_paste.paste_handler_converter(chrome_input), "@_**all** silently");
 });

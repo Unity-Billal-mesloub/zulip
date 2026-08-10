@@ -2,7 +2,6 @@ import base64
 import random
 import re
 from collections.abc import Sequence
-from datetime import timedelta
 from email.headerregistry import Address
 from unittest import mock
 from unittest.mock import patch
@@ -13,7 +12,6 @@ from django.conf import settings
 from django.core import mail
 from django.core.mail.message import EmailMultiAlternatives
 from django.test import override_settings
-from django.utils.timezone import now as timezone_now
 from django_stubs_ext import StrPromise
 
 from zerver.actions.create_user import do_create_user
@@ -96,19 +94,13 @@ class TestMessageNotificationEmails(ZulipTestCase):
         m.assert_not_called()
 
     def test_demo_organization_owner_email_not_set(self) -> None:
-        realm = get_realm("zulip")
-        realm.demo_organization_scheduled_deletion_date = timezone_now() + timedelta(days=30)
-        realm.save()
-
-        # Demo organization owner's don't have an email address set initially
-        desdemona = self.example_user("desdemona")
-        desdemona.delivery_email = ""
-        desdemona.save()
+        demo_organization_owner = self.create_demo_organization_owner()
+        realm = demo_organization_owner.realm
 
         notification_bot = self.notification_bot(realm)
         internal_send_private_message(
             sender=notification_bot,
-            recipient_user=desdemona,
+            recipient_user=demo_organization_owner,
             content="Notification bot message",
         )
         message = self.get_last_message()
@@ -119,7 +111,7 @@ class TestMessageNotificationEmails(ZulipTestCase):
             "zerver.lib.email_notifications.do_send_missedmessage_events_reply_in_zulip"
         ) as m:
             handle_missedmessage_emails(
-                desdemona.id,
+                demo_organization_owner.id,
                 {message.id: MissedMessageData(trigger=NotificationTriggers.DIRECT_MESSAGE)},
             )
         m.assert_not_called()
@@ -1130,10 +1122,10 @@ class TestMessageNotificationEmails(ZulipTestCase):
         self._resolved_topic_missed_stream_messages_thread_friendly()
 
     @override_settings(EMAIL_GATEWAY_PATTERN="")
-    def test_reply_warning_in_missed_personal_messages(self) -> None:
+    def test_reply_warning_in_missed_personal_messages_with_direct_message_group(self) -> None:
         self._reply_warning_in_missed_personal_messages()
 
-    def test_extra_context_in_missed_personal_messages(self) -> None:
+    def test_extra_context_in_missed_personal_messages_with_direct_message_group(self) -> None:
         self._extra_context_in_missed_personal_messages()
 
     def test_extra_context_in_missed_group_direct_messages_two_others(self) -> None:
@@ -1291,26 +1283,6 @@ class TestMessageNotificationEmails(ZulipTestCase):
         email_subject = "Group DMs with iago and Iago"
         self._test_cases(msg_id, verify_body_include, email_subject)
 
-    @override_settings(PREFER_DIRECT_MESSAGE_GROUP=True)
-    def test_pm_link_in_missed_message_header_using_direct_message_group(self) -> None:
-        cordelia = self.example_user("cordelia")
-        hamlet = self.example_user("hamlet")
-
-        get_or_create_direct_message_group(id_list=[cordelia.id, hamlet.id])
-
-        msg_id = self.send_personal_message(
-            cordelia,
-            hamlet,
-            "Let's test a direct message link in email notifications",
-        )
-
-        encoded_name = "Cordelia,-Lear's-daughter"
-        verify_body_include = [
-            f"view it in Zulip Dev Zulip: http://zulip.testserver/#narrow/dm/{cordelia.id}-{encoded_name}"
-        ]
-        email_subject = "DMs with Cordelia, Lear's daughter"
-        self._test_cases(msg_id, verify_body_include, email_subject)
-
     def test_group_dm_link_in_missed_message(self) -> None:
         cordelia = self.example_user("cordelia")
         hamlet = self.example_user("hamlet")
@@ -1375,8 +1347,7 @@ class TestMessageNotificationEmails(ZulipTestCase):
             mail.outbox[2].alternatives[0][0],
         )
 
-    @override_settings(PREFER_DIRECT_MESSAGE_GROUP=True)
-    def test_sender_name_in_missed_pm_using_direct_message_group(self) -> None:
+    def test_sender_name_in_missed_pm(self) -> None:
         hamlet = self.example_user("hamlet")
         iago = self.example_user("iago")
 
@@ -1398,8 +1369,7 @@ class TestMessageNotificationEmails(ZulipTestCase):
             mail.outbox[0].alternatives[0][0],
         )
 
-    @override_settings(PREFER_DIRECT_MESSAGE_GROUP=True)
-    def test_your_name_in_missed_pm_to_self_using_direct_message_group(self) -> None:
+    def test_your_name_in_missed_pm_to_self(self) -> None:
         hamlet = self.example_user("hamlet")
 
         get_or_create_direct_message_group(id_list=[hamlet.id])
@@ -1468,8 +1438,10 @@ class TestMessageNotificationEmails(ZulipTestCase):
         self.assertEqual(
             m.output,
             [
-                "WARNING:zerver.lib.email_notifications:Failed to convert time element "
-                "'2025-09-30T16:30:00Z': Invalid datetime format",
+                (
+                    "WARNING:zerver.lib.email_notifications:Failed to convert time element "
+                    "'2025-09-30T16:30:00Z': Invalid datetime format"
+                ),
             ],
         )
 
@@ -1720,6 +1692,60 @@ class TestMessageNotificationEmails(ZulipTestCase):
             ' target="_blank" title="https://www.google.com/images/srpr/logo4w.png">'
             "https://www.google.com/images/srpr/logo4w.png</a></p></div>"
         )
+        self.assertEqual(actual_output, expected_output)
+
+        # `![alt](url)` markdown renders as a bare <img class="inline-image">,
+        # not wrapped in a `message_inline_image` div. We synthesize a link
+        # from `data-original-src` for emails. Verify different cases:
+
+        # Message with only an uploaded image as content.
+        test_data = (
+            '<p><img alt="chart.png" class="inline-image"'
+            ' data-original-content-type="image/png" data-original-dimensions="1900x1062"'
+            ' data-original-src="/user_uploads/{realm_id}/43/K8YE1_LG9a4n_oILSgtpoCf0/chart.png"'
+            ' src="/user_uploads/thumbnail/{realm_id}/43/K8YE1_LG9a4n_oILSgtpoCf0/chart.png/840x560.webp"></p>'
+        )
+        test_data = test_data.format(realm_id=zulip_realm.id)
+        actual_output = convert(test_data)
+        expected_output = (
+            '<div><p><a href="http://example.com/user_uploads/{realm_id}/43/K8YE1_LG9a4n_oILSgtpoCf0/chart.png"'
+            ' target="_blank">chart.png</a></p></div>'
+        )
+        expected_output = expected_output.format(realm_id=zulip_realm.id)
+        self.assertEqual(actual_output, expected_output)
+
+        # Uploaded image with surrounding text.
+        test_data = (
+            "<p>Before <br>"
+            ' <img alt="logo.png" class="inline-image"'
+            ' data-original-content-type="image/png" data-original-dimensions="385x156"'
+            ' data-original-src="/user_uploads/{realm_id}/dd/5_wtVM7mYODx9_m5vXHoE92_/logo.png"'
+            ' src="/user_uploads/thumbnail/{realm_id}/dd/5_wtVM7mYODx9_m5vXHoE92_/logo.png/840x560.webp"><br>'
+            " after</p>"
+        )
+        test_data = test_data.format(realm_id=zulip_realm.id)
+        actual_output = convert(test_data)
+        expected_output = (
+            '<div><p>Before <br> <a href="http://example.com/user_uploads/{realm_id}/dd/5_wtVM7mYODx9_m5vXHoE92_/logo.png"'
+            ' target="_blank">logo.png</a><br> after</p></div>'
+        )
+        expected_output = expected_output.format(realm_id=zulip_realm.id)
+        self.assertEqual(actual_output, expected_output)
+
+        # Empty `alt` falls back to the URL-decoded basename of `data-original-src`.
+        test_data = (
+            '<p><img alt="" class="inline-image"'
+            ' data-original-content-type="image/png" data-original-dimensions="1900x1062"'
+            ' data-original-src="/user_uploads/{realm_id}/ab/cd/My%20Chart.png"'
+            ' src="/user_uploads/thumbnail/{realm_id}/ab/cd/My%20Chart.png/840x560.webp"></p>'
+        )
+        test_data = test_data.format(realm_id=zulip_realm.id)
+        actual_output = convert(test_data)
+        expected_output = (
+            '<div><p><a href="http://example.com/user_uploads/{realm_id}/ab/cd/My%20Chart.png"'
+            ' target="_blank">My Chart.png</a></p></div>'
+        )
+        expected_output = expected_output.format(realm_id=zulip_realm.id)
         self.assertEqual(actual_output, expected_output)
 
     def test_spoilers_in_html_emails(self) -> None:
@@ -2010,16 +2036,16 @@ class TestMessageNotificationEmails(ZulipTestCase):
         message_id = self.send_personal_message(aaron, hamlet)
         recipient_id = Message.objects.get(id=message_id).recipient_id
         synthetic_root_message_id = prepare_synthetic_root_message_id(
-            Recipient.PERSONAL, recipient_id, dm_sender_id=aaron.id
+            Recipient.DIRECT_MESSAGE_GROUP, recipient_id
         )
-        self.assertEqual(synthetic_root_message_id, f"<{recipient_id}.{aaron.id}@testserver>")
+        self.assertEqual(synthetic_root_message_id, f"<{recipient_id}@testserver>")
 
         message_id = self.send_personal_message(cordelia, hamlet)
         recipient_id = Message.objects.get(id=message_id).recipient_id
         synthetic_root_message_id = prepare_synthetic_root_message_id(
-            Recipient.PERSONAL, recipient_id, dm_sender_id=cordelia.id
+            Recipient.DIRECT_MESSAGE_GROUP, recipient_id
         )
-        self.assertEqual(synthetic_root_message_id, f"<{recipient_id}.{cordelia.id}@testserver>")
+        self.assertEqual(synthetic_root_message_id, f"<{recipient_id}@testserver>")
 
         # Verify different `synthetic_root_message_id` for different group-DM to hamlet.
         message_id = self.send_group_direct_message(aaron, [hamlet, cordelia], "Group DM!")

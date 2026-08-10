@@ -29,14 +29,11 @@ export type PresenceInfoFromEvent = z.output<typeof presence_info_from_event_sch
 export const user_last_seen_response_schema = z.object({
     result: z.string(),
     msg: z.optional(z.string()),
+    server_timestamp: z.optional(z.number()),
     presence: z.optional(
         z.object({
-            /* We ignore the keys other than aggregated, since they just contain
-               duplicate data. */
-            aggregated: z.object({
-                status: z.enum(["active", "idle", "offline"]),
-                timestamp: z.number(),
-            }),
+            active_timestamp: z.optional(z.number()),
+            idle_timestamp: z.optional(z.number()),
         }),
     ),
 });
@@ -83,11 +80,11 @@ export function get_status(user_id: number): PresenceStatus["status"] {
 }
 
 export function get_user_ids(): number[] {
-    return [...presence_info.keys()];
+    return presence_info.keys().toArray();
 }
 
 export function get_active_or_idle_user_ids(): number[] {
-    return [...presence_info.entries()]
+    return [...presence_info]
         .filter((entry) => entry[1].status !== "offline")
         .map((entry) => entry[0]);
 }

@@ -55,10 +55,6 @@ kbd {
     }
 }
 
-.light {
-    font-weight: 300;
-}
-
 .highlighted-element {
     font-weight: 600;
 }
@@ -247,6 +243,10 @@ div.overlay {
     .overlay-container {
         background-color: var(--color-background-modal);
     }
+
+    &:focus {
+        outline: none;
+    }
 }
 
 .input-append {
@@ -349,10 +349,10 @@ input.settings_text_input {
     line-height: 38px;
 }
 
-.tip,
-.invite-stream-notice {
+.tip {
     position: relative;
     display: block;
+    margin: 10px 0;
     background-color: var(--color-background-tip);
     border: 1px solid var(--color-border-tip);
     border-radius: 4px;
@@ -363,15 +363,13 @@ input.settings_text_input {
     color: hsl(0deg 0% 40%);
 
     &::before {
+        content: "\f0a2";
         display: inline;
+        margin-right: 8px;
 
         font-family: FontAwesome;
         font-weight: 600;
     }
-}
-
-.tip {
-    margin: 10px 0;
 }
 
 .demo-organization-add-email-banner {
@@ -403,15 +401,6 @@ input.settings_text_input {
             flex-wrap: nowrap;
         }
     }
-}
-
-.invite-stream-notice {
-    margin-bottom: 20px;
-}
-
-.tip::before {
-    content: "\f0a2";
-    margin-right: 8px;
 }
 
 .demo-organization-warning {
@@ -753,11 +742,41 @@ input.settings_text_input {
     }
 }
 
-.channel-privacy-type-icon {
+.decorated-channel-name-wrapper:not(.inline-decorated-channel-name) {
+    display: flex;
+    gap: var(--decorated-channel-name-privacy-icon-gap);
+    flex-wrap: nowrap;
+    align-items: baseline;
+
+    .channel-privacy-type-icon .zulip-icon {
+        /* Calculated from visual inspection
+           to look good for 12px-20px font sizes. */
+        top: 0.1467em; /* 2.2px at 15px/1em */
+        font-size: 0.9375em; /* 15px at 16px/1em */
+
+        &.zulip-icon-lock {
+            /* Calculated from visual inspection
+               to look good for 12px-20px font sizes. */
+            top: 0.08em; /* 1.2px at 15px/1em */
+        }
+    }
+}
+
+.inline-decorated-channel-name {
+    white-space: nowrap;
+    display: inline;
+    padding-left: var(--inline-decorated-channel-name-padding-left);
+
+    .decorated-channel-name {
+        margin-left: var(--inline-decorated-channel-name-privacy-icon-gap);
+    }
+}
+
+.channel-privacy-type-icon .zulip-icon {
     position: relative;
-    top: 0.06rem;
-    padding-right: 1px;
-    width: 12px;
+    /* Calculated from visual inspection
+        to look good for 12px-20px font sizes. */
+    top: 0.0688em; /* 1.1px at 16px/1em */
 
     &.zulip-icon-globe,
     &.zulip-icon-archive,
@@ -777,16 +796,6 @@ input.settings_text_input {
        uniform margin throughout the UI. */
     /* 3.5px at 16px/1em */
     margin-top: -0.2188em !important;
-}
-
-.dropdown-list-container
-    .dropdown-list
-    .dropdown-list-item-common-styles
-    .zulip-icon-lock {
-    /* We do not need to pull up lock icons in dropdowns
-       so we reset their margin-top to the original value
-       for a dropdown's .zulip-icon */
-    margin-top: 0 !important;
 }
 
 /* This includes css needed to display messages in an overlay. */
@@ -819,6 +828,8 @@ input.settings_text_input {
         & h1 {
             margin: 0;
             font-size: 1.1em;
+            font-weight: bold;
+            line-height: var(--header-line-height);
             text-transform: uppercase;
         }
 
@@ -867,17 +878,29 @@ input.settings_text_input {
     display: grid;
     grid-template-rows: auto minmax(0, 1fr);
 
+    /* min-height: 0 lets the tab pane shrink inside the 1fr grid row
+       (grid items default to min-height: auto). */
+    .drafts-tab-pane {
+        min-height: 0;
+    }
+
     .overlay-messages-list {
         /* We unset the `overflow` value so SimpleBar
            can manage scrolling. */
         overflow: unset;
-        /* We don't need to set a height value; the
-           1fr grid row will occupy the available height. */
-        height: auto;
+        /* border-box + height: 100% makes the list fill (not overflow) the
+           tab pane, which the 1fr grid row bounds, so SimpleBar has a
+           definite height to scroll within. */
+        box-sizing: border-box;
+        height: 100%;
         /* And therefore we don't need to worry about padding,
            so that the scrollbar appears to reach all the way
            to the bottom of the content. */
         padding-bottom: 0;
+        /* Override the `min-width: auto` default for grid
+           items so the SimpleBar container can shrink on
+           window resize. */
+        min-width: 0;
     }
 }
 
@@ -1023,12 +1046,7 @@ div.overlay .flex.overlay-content > .overlay-container,
 
 .dropdown-current-value-not-in-options,
 .setting-disabled-option {
-    color: hsl(38deg 46% 54%);
-
-    .setting-disabled-option-text,
-    .setting-disabled-option-icon {
-        color: hsl(38deg 46% 54%);
-    }
+    font-style: italic;
 
     .setting-disabled-option-icon {
         align-self: center;
@@ -1239,27 +1257,42 @@ div.overlay .flex.overlay-content > .overlay-container,
 .sticky-bottom-option-button {
     width: 100%;
     display: flex;
+    position: relative;
     padding: 7px 14px;
-    background-color: var(--color-background-zulip-button);
+    background-color: var(--color-background-neutral-subtle-action-button);
     justify-content: flex-start;
     color: var(--color-dropdown-item);
-    border: none;
-    border-top: 1px solid var(--color-border-zulip-button);
-    border-bottom-left-radius: 4px;
-    border-bottom-right-radius: 4px;
+    border: 1px solid var(--color-border-zulip-button);
+    border-radius: 4px;
     font-family: inherit;
     font-size: inherit;
 
     &:hover {
         color: var(--color-dropdown-item);
-        background-color: var(--background-color-active-dropdown-item);
+        background-color: var(
+            --color-background-neutral-subtle-action-button-hover
+        );
         border-color: var(--color-border-zulip-button-interactive);
     }
 
     &:focus,
     &.current_selection {
-        background-color: var(--background-color-active-dropdown-item);
+        background-color: var(
+            --color-background-neutral-subtle-action-button-hover
+        );
         outline: none;
+    }
+
+    &:focus::before,
+    &.current_selection::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 1px;
+        bottom: 2px;
+        width: 3px;
+        background-color: var(--color-outline-focus);
+        border-radius: 4px;
     }
 }
 

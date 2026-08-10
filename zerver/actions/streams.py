@@ -62,6 +62,7 @@ from zerver.lib.users import (
     get_subscribers_of_target_user_subscriptions,
     get_users_involved_in_dms_with_target_users,
 )
+from zerver.lib.utils import assert_is_not_none
 from zerver.models import (
     ArchivedAttachment,
     Attachment,
@@ -231,7 +232,10 @@ def do_unarchive_stream(stream: Stream, new_name: str, *, acting_user: UserProfi
 
     if not stream.deactivated:
         raise JsonableError(_("Channel is not currently deactivated"))
-    if stream.name != new_name and Stream.objects.filter(realm=realm, name=new_name).exists():
+    if (
+        stream.name != new_name
+        and Stream.objects.filter(realm=realm, name__iexact=new_name).exists()
+    ):
         raise JsonableError(
             _("Channel named {channel_name} already exists").format(channel_name=new_name)
         )
@@ -264,7 +268,9 @@ def do_unarchive_stream(stream: Stream, new_name: str, *, acting_user: UserProfi
         realm_id=realm.id,
         recipient_id=stream.recipient_id,
     ).only("id")
-    cache_delete_many(to_dict_cache_key_id(message.id) for message in messages)
+    transaction.on_commit(
+        lambda: cache_delete_many(to_dict_cache_key_id(message.id) for message in messages)
+    )
 
     # Unset the is_web_public and is_realm_public cache on attachments,
     # since the stream is now private.
@@ -476,6 +482,7 @@ def send_subscription_add_events(
                 is_web_public=stream_dict["is_web_public"],
                 message_retention_days=stream_dict["message_retention_days"],
                 name=stream_dict["name"],
+                default_push_notifications=stream_dict["default_push_notifications"],
                 rendered_description=stream_dict["rendered_description"],
                 stream_id=stream_dict["stream_id"],
                 stream_post_policy=stream_dict["stream_post_policy"],
@@ -767,8 +774,8 @@ def bulk_add_subscriptions(
     for user in users:
         assert user.realm_id == realm.id
 
-    recipient_ids = [stream.recipient_id for stream in streams]
-    recipient_id_to_stream = {stream.recipient_id: stream for stream in streams}
+    recipient_ids = [assert_is_not_none(stream.recipient_id) for stream in streams]
+    recipient_id_to_stream = {assert_is_not_none(stream.recipient_id): stream for stream in streams}
 
     recipient_color_map = {}
     recipient_ids_set: set[int] = set()
@@ -826,6 +833,12 @@ def bulk_add_subscriptions(
                 color=color,
                 recipient_id=recipient_id,
             )
+            # The channel default only applies to brand-new subscriptions.
+            # Users who previously unsubscribed and are being resubscribed
+            # (subs_to_activate) keep the push notification preference stored
+            # on their existing subscription.
+            if stream.default_push_notifications:
+                sub.push_notifications = True
             sub_info = SubInfo(user_profile, sub, stream)
             subs_to_add.append(sub_info)
 
@@ -1519,7 +1532,9 @@ def do_rename_stream(stream: Stream, new_name: str, user_profile: UserProfile) -
     # Delete cache entries for everything else, which is cheaper and
     # clearer than trying to set them. display_recipient is the out of
     # date field in all cases.
-    cache_delete_many(to_dict_cache_key_id(message.id) for message in messages)
+    transaction.on_commit(
+        lambda: cache_delete_many(to_dict_cache_key_id(message.id) for message in messages)
+    )
 
     # We want to key these updates by id, not name, since id is
     # the immutable primary key, and obviously name is not.
@@ -1742,6 +1757,9 @@ def do_set_stream_property(stream: Stream, name: str, value: Any, acting_user: U
 
     send_event_on_commit(stream.realm, event, can_access_stream_metadata_user_ids(stream))
 
+    if name != "topics_policy":
+        return
+
     sender = get_system_bot(settings.NOTIFICATION_BOT, stream.realm_id)
 
     empty_topic_display_name = get_topic_display_name("", stream.realm.default_language)
@@ -1774,6 +1792,7 @@ def do_set_stream_property(stream: Stream, name: str, value: Any, acting_user: U
                 sender,
                 stream,
                 NOTIFICATION_MESSAGES[name],
+                archived_channel_notice=stream.deactivated,
             )
 
 
@@ -1809,7 +1828,7 @@ def do_change_stream_group_based_setting(
         )
 
     setattr(stream, setting_name, user_group)
-    stream.save(update_fields=[setting_name, "name"])
+    stream.save(update_fields=[setting_name])
 
     new_setting_api_value = get_group_setting_value_for_api(user_group)
     RealmAuditLog.objects.create(

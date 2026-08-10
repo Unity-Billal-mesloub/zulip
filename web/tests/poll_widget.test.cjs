@@ -7,7 +7,7 @@ const {make_user} = require("./lib/example_user.cjs");
 const {mock_esm, zrequire} = require("./lib/namespace.cjs");
 const {run_test} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 
 mock_esm("../src/settings_data", {
     user_can_access_all_other_users: () => true,
@@ -144,7 +144,6 @@ run_test("PollData my question", () => {
 
     blueslip.expect("warn", `unknown key for poll: ${invalid_vote_event.key}`);
     data_holder.handle_vote_event(me.user_id, invalid_vote_event);
-    data = data_holder.get_widget_data();
 
     const option_outbound_event = data_holder.new_option_event("new option");
     assert.deepEqual(option_outbound_event, {
@@ -226,9 +225,7 @@ run_test("activate another person poll", ({mock_template}) => {
         out_data = data;
     };
 
-    const opts = {
-        $elem: $widget_elem,
-        callback,
+    const activate_opts = {
         message: {
             sender_id: alice.user_id,
         },
@@ -262,7 +259,18 @@ run_test("activate another person poll", ({mock_template}) => {
     set_widget_find_result("button.poll-question-remove");
     set_widget_find_result("input.poll-question");
 
-    const handle_events = poll_widget.activate(opts);
+    const {inbound_events_handler, widget_data} = poll_widget.activate(activate_opts);
+    const render_opts = {
+        $elem: $widget_elem,
+        callback,
+        message: {
+            sender_id: alice.user_id,
+        },
+        widget_data,
+        rerender: false,
+    };
+
+    poll_widget.render(render_opts);
 
     assert.ok($poll_option_container.visible());
     assert.ok($poll_question_header.visible());
@@ -308,7 +316,7 @@ run_test("activate another person poll", ({mock_template}) => {
         },
     ];
 
-    handle_events(vote_events);
+    inbound_events_handler(vote_events);
 
     {
         /* Testing data sent to server on voting */
@@ -328,7 +336,7 @@ run_test("activate another person poll", ({mock_template}) => {
         },
     ];
 
-    handle_events(add_question_event);
+    inbound_events_handler(add_question_event);
 });
 
 run_test("activate own poll", ({mock_template}) => {
@@ -340,9 +348,7 @@ run_test("activate own poll", ({mock_template}) => {
     const callback = (data) => {
         out_data = data;
     };
-    const opts = {
-        $elem: $widget_elem,
-        callback,
+    const activate_opts = {
         message: {
             sender_id: me.user_id,
         },
@@ -384,7 +390,17 @@ run_test("activate own poll", ({mock_template}) => {
         assert.ok(!$poll_please_wait.visible());
     }
 
-    poll_widget.activate(opts);
+    const {widget_data} = poll_widget.activate(activate_opts);
+    const render_opts = {
+        $elem: $widget_elem,
+        callback,
+        message: {
+            sender_id: me.user_id,
+        },
+        widget_data,
+        rerender: false,
+    };
+    poll_widget.render(render_opts);
 
     assert_visibility();
     assert.ok(!$poll_question_submit.visible());

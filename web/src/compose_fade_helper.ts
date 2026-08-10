@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 
 import type {Message} from "./message_store.ts";
 import * as stream_data from "./stream_data.ts";
@@ -47,5 +47,5 @@ export function want_normal_display(): boolean {
         }
     }
 
-    return focused_recipient.type === "private" && focused_recipient.reply_to === "";
+    return focused_recipient.type === "private" && !focused_recipient.to_user_ids;
 }

@@ -37,6 +37,8 @@ from zerver.lib.utils import optional_bytes_to_mib
 from zerver.models import (
     ArchivedAttachment,
     Attachment,
+    DirectMessageGroup,
+    ImageAttachment,
     Message,
     NamedUserGroup,
     Realm,
@@ -94,6 +96,12 @@ def do_set_realm_property(
         realm.save(update_fields=[name, "rendered_description", "rendered_description_version"])
     else:
         realm.save(update_fields=[name])
+
+    if name == "enable_spectator_access":
+        Attachment.objects.filter(realm=realm).update(is_web_public=None)
+        # We need to do the same for ArchivedAttachment to avoid
+        # bugs if deleted attachments are later restored.
+        ArchivedAttachment.objects.filter(realm=realm).update(is_web_public=None)
 
     event = dict(
         type="realm",
@@ -264,6 +272,22 @@ def do_change_realm_permission_group_setting(
             "property": setting_name,
         },
     )
+
+    if setting_name == "workplace_users_group":
+        RealmAuditLog.objects.create(
+            realm=realm,
+            event_type=AuditLogEventType.WORKPLACE_USERS_COUNT_CHANGED,
+            event_time=event_time,
+            acting_user=acting_user,
+            extra_data={
+                RealmAuditLog.ROLE_COUNT: realm_user_count_by_role(realm),
+                "trigger": "setting_changed",
+            },
+        )
+
+        from zerver.lib.remote_server import maybe_enqueue_audit_log_upload
+
+        maybe_enqueue_audit_log_upload(realm)
 
 
 def parse_and_set_setting_value_if_required(
@@ -710,23 +734,71 @@ def do_add_deactivated_redirect(realm: Realm, redirect_url: str) -> None:
     realm.save(update_fields=["deactivated_redirect"])
 
 
-def do_delete_all_realm_attachments(realm: Realm, *, batch_size: int = 1000) -> None:
+def do_delete_all_realm_attachments(realm: Realm) -> None:
     # Delete attachment files from the storage backend, so that we
     # don't leave them dangling.
-    for obj_class in Attachment, ArchivedAttachment:
-        last_id = 0
-        while True:
+    with delete_message_attachments(delete_from=(ImageAttachment,)) as delete_one:
+        for obj_class in Attachment, ArchivedAttachment:
             to_delete = (
-                obj_class._default_manager.filter(realm_id=realm.id, pk__gt=last_id)
+                obj_class._default_manager.filter(realm_id=realm.id)
                 .order_by("pk")
-                .values_list("pk", "path_id")[:batch_size]
+                .select_for_update(no_key=False)
+                .values_list("path_id", flat=True)
             )
-            if len(to_delete) > 0:
-                delete_message_attachments([row[1] for row in to_delete])
-                last_id = to_delete[len(to_delete) - 1][0]
-            if len(to_delete) < batch_size:
-                break
-        obj_class._default_manager.filter(realm=realm).delete()
+            for path_id in to_delete.iterator():
+                delete_one(path_id)
+            obj_class._default_manager.filter(realm_id=realm.id).delete()
+
+
+@transaction.atomic(durable=True)
+def do_delete_realm(realm: Realm) -> None:
+    """Permanently delete a Realm.
+
+    Prefer do_deactivate_realm + do_scrub_realm for production use;
+    they preserve UserProfile rows.
+    """
+    realm = Realm.objects.select_for_update(no_key=False).get(id=realm.id)
+    do_delete_all_realm_attachments(realm)
+
+    # realm.delete() leaves DirectMessageGroup and Recipient rows
+    # behind (no FK back to Realm), and for DMGs with cross-realm
+    # bot subs the bot Subscription survives too.  Human-to-human
+    # cross-realm DMs aren't currently possible, so every DMG our
+    # users were in becomes orphan on realm.delete(): any survivor
+    # must be a system bot.  Snapshot the Recipients now, while
+    # the Subscription join still exists.
+    #
+    # TODO: if cross-realm human DMs become possible, this has to
+    # filter out DMGs that still have a non-bot subscriber from
+    # another realm.
+    orphan_dmg_recipient_ids = set(
+        Subscription.objects.filter(
+            recipient__type=Recipient.DIRECT_MESSAGE_GROUP,
+            user_profile__realm_id=realm.id,
+        )
+        .distinct("recipient_id")
+        .values_list("recipient_id", flat=True)
+    )
+    orphan_huddle_ids = set(
+        Recipient.objects.filter(id__in=orphan_dmg_recipient_ids).values_list("type_id", flat=True)
+    )
+
+    # Stream Recipients have no FK back to Stream either, so the
+    # realm's Stream cascade strands them in the same way.  Capture
+    # them alongside the DMG Recipients.
+    orphan_stream_recipient_ids = set(
+        Stream.objects.filter(realm=realm)
+        .exclude(recipient__isnull=True)
+        .values_list("recipient_id", flat=True)
+    )
+
+    realm.delete()
+
+    # Recipient.delete() cascades Subscription and Message;
+    # DirectMessageGroup.recipient is SET_NULL, so the DMG row
+    # needs an explicit delete.
+    Recipient.objects.filter(id__in=orphan_dmg_recipient_ids | orphan_stream_recipient_ids).delete()
+    DirectMessageGroup.objects.filter(id__in=orphan_huddle_ids).delete()
 
 
 @transaction.atomic(durable=True)
@@ -759,7 +831,6 @@ def do_scrub_realm(realm: Realm, *, acting_user: UserProfile | None) -> None:
         Stream.objects.filter(realm=realm)
         .values_list("recipient_id", flat=True)
         .union(
-            UserProfile.objects.filter(realm=realm).values_list("recipient_id", flat=True),
             Subscription.objects.filter(
                 recipient__type=Recipient.DIRECT_MESSAGE_GROUP, user_profile__realm=realm
             ).values_list("recipient_id", flat=True),

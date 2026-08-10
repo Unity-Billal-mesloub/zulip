@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import type * as tippy from "tippy.js";
 
 import render_announce_stream_checkbox from "../templates/stream_settings/announce_stream_checkbox.hbs";
@@ -229,13 +229,13 @@ export function update_settings_button_for_sub(sub: StreamSubscription): void {
     }
 
     if (sub.subscribed) {
+        $settings_button.find(".action-button-label").text($t({defaultMessage: "Unsubscribe"}));
         $settings_button
-            .text($t({defaultMessage: "Unsubscribe"}))
             .removeClass("unsubscribed action-button-subtle-brand")
             .addClass("action-button-subtle-neutral");
     } else {
+        $settings_button.find(".action-button-label").text($t({defaultMessage: "Subscribe"}));
         $settings_button
-            .text($t({defaultMessage: "Subscribe"}))
             .addClass("unsubscribed action-button-subtle-brand")
             .removeClass("action-button-subtle-neutral");
     }
@@ -354,6 +354,17 @@ export function enable_or_disable_permission_settings_in_edit_panel(
     $stream_settings
         .find(".channel-folder-widget-container button")
         .prop("disabled", !sub.can_change_stream_permissions_requiring_metadata_access);
+
+    const $default_push_notifications_setting = $stream_settings
+        .find("input[name='default_push_notifications']")
+        .closest(".settings-checkbox-wrapper");
+    const disable_push_notifications =
+        !realm.realm_push_notifications_enabled || !current_user.is_admin;
+    $default_push_notifications_setting.toggleClass(
+        "control-label-disabled",
+        disable_push_notifications,
+    );
+    $default_push_notifications_setting.find("input").prop("disabled", disable_push_notifications);
 
     if (!sub.can_change_stream_permissions_requiring_metadata_access) {
         settings_components.disable_group_permission_setting($permission_pill_container_elements);
@@ -493,10 +504,15 @@ export function update_add_subscriptions_elements(sub: SettingsSubscription): vo
     }
 
     // We are only concerned with the Subscribers tab for editing streams.
-    const $add_subscribers_container = $(".edit_subscribers_for_stream .subscriber_list_settings");
+    const $add_subscribers_container = $(".edit_subscribers_for_stream .add_subscribers_container");
 
     if (current_user.is_guest) {
         // For guest users, we just hide the add_subscribers feature.
+        $(".subscriber_list_settings_container .add-subscribers-heading").hide();
+        $(
+            ".subscriber_list_settings_container .send_notification_to_new_subscribers_container",
+        ).hide();
+        $(".subscriber_list_settings_container .add-subscribers-subtitle").hide();
         $add_subscribers_container.hide();
         return;
     }
@@ -546,17 +562,15 @@ export function enable_or_disable_add_subscribers_elements(
     stream_creation = false,
 ): void {
     const $input_element = $container_elem.find(".input").expectOne();
-    const $add_subscribers_container = $<tippy.PopperElement>(
-        ".edit_subscribers_for_stream .subscriber_list_settings",
-    );
 
     $input_element.prop("contenteditable", enable_elem);
 
     if (enable_elem) {
-        $add_subscribers_container[0]?._tippy?.destroy();
-        $container_elem.find(".add_subscribers_container").removeClass("add_subscribers_disabled");
+        const tippy_container: tippy.ReferenceElement = $container_elem[0]!;
+        tippy_container._tippy?.destroy();
+        $container_elem.removeClass("add_subscribers_disabled");
     } else {
-        $container_elem.find(".add_subscribers_container").addClass("add_subscribers_disabled");
+        $container_elem.addClass("add_subscribers_disabled");
     }
 
     if (!stream_creation) {

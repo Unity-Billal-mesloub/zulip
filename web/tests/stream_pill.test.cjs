@@ -72,12 +72,10 @@ const germany = make_stream({
 const denmark_pill = {
     type: "stream",
     stream_id: denmark.stream_id,
-    show_subscriber_count: true,
 };
 const sweden_pill = {
     type: "stream",
     stream_id: sweden.stream_id,
-    show_subscriber_count: true,
 };
 
 const subs = [denmark, sweden, germany];
@@ -124,8 +122,6 @@ run_test("create_item", ({override}) => {
 run_test("display_value", () => {
     assert.deepEqual(stream_pill.get_display_value_from_item(denmark_pill), "Denmark");
     assert.deepEqual(stream_pill.get_display_value_from_item(sweden_pill), "Sweden");
-    sweden_pill.show_subscriber_count = false;
-    assert.deepEqual(stream_pill.get_display_value_from_item(sweden_pill), "Sweden");
 });
 
 run_test("get_stream_id", () => {
@@ -154,10 +150,9 @@ run_test("generate_pill_html", () => {
         "<div class='pill 'data-stream-id=\"101\" tabindex=0>\n" +
             '    <span class="pill-label">\n' +
             '        <span class="pill-value">\n' +
-            '<i class="zulip-icon zulip-icon-hashtag channel-privacy-type-icon" aria-hidden="true"></i>            Denmark\n' +
-            "        </span></span>\n" +
+            '                <span class="decorated-channel-name-wrapper"><span class="channel-privacy-type-icon"><i class="zulip-icon zulip-icon-hashtag" aria-hidden="true"></i></span><span class="decorated-channel-name">Denmark</span></span>        </span></span>\n' +
             '    <div class="exit">\n' +
-            '        <a role="button" class="zulip-icon zulip-icon-close pill-close-button"></a>\n' +
+            '        <i role="button" class="zulip-icon zulip-icon-close pill-close-button" aria-label="translated: Remove"></i>\n' +
             "    </div>\n" +
             "</div>\n",
     );

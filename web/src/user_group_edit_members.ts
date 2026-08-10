@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -186,8 +186,7 @@ export function rerender_members_list({
 }
 
 type MemberLinkContext =
-    | {type: "user"; user: User}
-    | {type: "user_group"; id: number; name: string};
+    {type: "user"; user: User} | {type: "user_group"; id: number; name: string};
 
 function generate_members_added_contexts(
     newly_added_users: User[],
@@ -546,6 +545,7 @@ function remove_member({
     }
 
     function do_remove_user_from_group(): void {
+        buttons.show_button_loading_indicator($remove_button);
         edit_user_group_membership({
             group,
             removed: [target_user_id],
@@ -630,7 +630,6 @@ export function initialize(): void {
             const target_user_id = Number.parseInt($list_entry.attr("data-subscriber-id")!, 10);
             const group_id = current_group_id;
             const $remove_button = $(this).closest(".remove-subscriber-button");
-            buttons.show_button_loading_indicator($remove_button);
             remove_member({group_id, target_user_id, $list_entry, $remove_button});
         },
     );

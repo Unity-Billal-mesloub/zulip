@@ -1,4 +1,5 @@
-import $ from "jquery";
+import {$} from "jquery";
+import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
 import * as about_zulip from "./about_zulip.ts";
@@ -34,6 +35,7 @@ import * as ui_report from "./ui_report.ts";
 import * as user_group_edit from "./user_group_edit.ts";
 import * as user_profile from "./user_profile.ts";
 import {user_settings} from "./user_settings.ts";
+import * as util from "./util.ts";
 
 // Read https://zulip.readthedocs.io/en/latest/subsystems/hashchange-system.html
 // or locally: docs/subsystems/hashchange-system.md
@@ -72,24 +74,35 @@ function is_somebody_else_profile_open(): boolean {
     );
 }
 
-function handle_invalid_section_url(section: "bots" | "users", settings_tab: string): string {
-    const valid_tab_values = {
-        users: new Set(["active", "deactivated", "invitations"]),
-        bots: new Set(["all-bots", "your-bots"]),
-    };
-
-    if (!valid_tab_values[section].has(settings_tab)) {
-        const valid_section_url = `#organization/${section}/${[...valid_tab_values[section]][0]}`;
-        browser_history.update(valid_section_url);
-        return [...valid_tab_values[section]][0]!;
+// The first slot of a channels-settings hash is overloaded:
+//   - "subscribed" / "available" / "all" → left-panel tab
+//   - "new"                              → create-channel form
+//   - a stream-id string                 → that channel's settings
+// Disentangle it into the right-panel state and the left-side tab key
+// that stream_settings_ui expects.
+function channels_overlay_state_from_hash(): {
+    right_panel: "new" | number | undefined;
+    left_side_tab: string | undefined;
+} {
+    const hash_section = hash_parser.get_current_hash_section();
+    if (hash_section === "new") {
+        return {right_panel: "new", left_side_tab: undefined};
     }
-    return settings_tab;
+    if (util.is_numeric_string(hash_section)) {
+        return {right_panel: Number.parseInt(hash_section, 10), left_side_tab: undefined};
+    }
+    // validate_channels_settings_hash has already constrained
+    // hash_section, so anything else is one of "subscribed" /
+    // "available" / "all".
+    return {right_panel: undefined, left_side_tab: hash_section};
 }
 
 function get_settings_tab(section: string): string | undefined {
     if (section === "users" || section === "bots") {
         const current_settings_tab = hash_parser.get_current_nth_hash_section(2);
-        return handle_invalid_section_url(section, current_settings_tab);
+        // URL will be updated in hash_util.validate_settings_hash to contain
+        // the correct tab value.
+        return current_settings_tab;
     }
     return undefined;
 }
@@ -289,61 +302,48 @@ function do_hashchange_overlay(old_hash: string | undefined): void {
     }
 
     const coming_from_overlay = hash_parser.is_overlay_hash(old_hash);
-    if (section === "display-settings") {
-        // Since display-settings was deprecated and replaced with preferences
-        // #settings/display-settings is being redirected to #settings/preferences.
-        section = "preferences";
-    }
-    if (section === "bot-list-admin") {
-        // #organization/bot-list-admin is being redirected to #organization/bots.
-        section = "bots";
-        base = "organization";
-    }
-    if (section === "user-list-admin") {
-        // #settings/user-list-admin is being redirected to #settings/users after it was renamed.
-        section = "users";
-    }
-    if (section === "your-bots") {
-        // #settings/your-bots is being redirected to #organization/bots/your-bots.
-        section = "bots";
-        base = "organization";
-        window.history.replaceState(null, "", "#organization/bots/your-bots");
-    }
-    if ((base === "settings" || base === "organization") && !section) {
-        let settings_panel_object = settings_panel_menu.normal_settings;
-        if (base === "organization") {
-            settings_panel_object = settings_panel_menu.org_settings;
-        }
-        window.history.replaceState(
-            null,
-            "",
-            browser_history.get_full_url(base + "/" + settings_panel_object.current_tab),
-        );
-    }
+    switch (base) {
+        case "settings":
+        case "organization": {
+            let settings_panel_object = settings_panel_menu.normal_settings;
+            if (base === "organization") {
+                settings_panel_object = settings_panel_menu.org_settings;
+            }
+            const valid_hash = hash_util.validate_settings_hash(
+                window.location.hash,
+                settings_panel_object,
+            );
 
-    // In 2024, stream was renamed to channel in the Zulip API and UI.
-    // Because pre-change Welcome Bot and Notification Bot messages
-    // included links to "/#streams/all" and "/#streams/new", we'll
-    // need to support "streams" as an overlay hash as an alias for
-    // "channels" permanently.
-    if (base === "streams" || base === "channels") {
-        const valid_hash = hash_util.validate_channels_settings_hash(window.location.hash);
-        // Here valid_hash will always return "channels" as the base.
-        // So, if we update the history because the valid hash does
-        // not match the window.location.hash, then we also reset the
-        // base string we're tracking for the hash.
-        if (valid_hash !== window.location.hash) {
-            window.history.replaceState(null, "", browser_history.get_full_url(valid_hash));
-            section = hash_parser.get_current_hash_section();
-            base = hash_parser.get_current_hash_category();
-        }
-    }
+            if (valid_hash !== window.location.hash) {
+                window.history.replaceState(null, "", browser_history.get_full_url(valid_hash));
+                section = hash_parser.get_hash_section(valid_hash);
+            }
 
-    if (base === "groups") {
-        const valid_hash = hash_util.validate_group_settings_hash(window.location.hash);
-        if (valid_hash !== window.location.hash) {
-            window.history.replaceState(null, "", browser_history.get_full_url(valid_hash));
-            section = hash_parser.get_current_hash_section();
+            break;
+        }
+        case "streams":
+        case "channels": {
+            const valid_hash = hash_util.validate_channels_settings_hash(window.location.hash);
+            // Here valid_hash will always return "channels" as the base.
+            // So, if we update the history because the valid hash does
+            // not match the window.location.hash, then we also reset the
+            // base string we're tracking for the hash.
+            if (valid_hash !== window.location.hash) {
+                window.history.replaceState(null, "", browser_history.get_full_url(valid_hash));
+                section = hash_parser.get_current_hash_section();
+                base = hash_parser.get_current_hash_category();
+            }
+
+            break;
+        }
+        case "groups": {
+            const valid_hash = hash_util.validate_group_settings_hash(window.location.hash);
+            if (valid_hash !== window.location.hash) {
+                window.history.replaceState(null, "", browser_history.get_full_url(valid_hash));
+                section = hash_parser.get_current_hash_section();
+            }
+
+            break;
         }
     }
 
@@ -353,50 +353,55 @@ function do_hashchange_overlay(old_hash: string | undefined): void {
     // In most situations we skip by this logic and load
     // the new overlay.
     if (coming_from_overlay && base === old_base) {
-        if (base === "channels") {
-            if (hash_parser.get_current_nth_hash_section(1) === "folders") {
-                const folder_id = hash_parser.get_current_nth_hash_section(2);
-                stream_settings_ui.change_state(
-                    "new",
-                    undefined,
-                    "",
-                    Number.parseInt(folder_id, 10),
+        switch (base) {
+            case "channels": {
+                if (hash_parser.get_current_nth_hash_section(1) === "folders") {
+                    const folder_id = hash_parser.get_current_nth_hash_section(2);
+                    // Folder-create: show create form; left tab unchanged.
+                    stream_settings_ui.change_state(
+                        "new",
+                        undefined,
+                        undefined,
+                        Number.parseInt(folder_id, 10),
+                    );
+                    return;
+                }
+
+                // e.g. #channels/29/social/subscribers
+                const {right_panel, left_side_tab} = channels_overlay_state_from_hash();
+                const right_side_tab = hash_parser.get_current_nth_hash_section(3);
+                stream_settings_ui.change_state(right_panel, left_side_tab, right_side_tab);
+                return;
+            }
+            case "groups": {
+                const right_side_tab = hash_parser.get_current_nth_hash_section(3);
+                user_group_edit.change_state(section, undefined, right_side_tab);
+                break;
+            }
+            case "settings": {
+                if (!section) {
+                    // We may be on a really old browser or somebody
+                    // hand-typed a hash.
+                    blueslip.warn("missing section for settings");
+                }
+                settings_panel_menu.normal_settings.activate_section_or_default(
+                    section,
+                    get_settings_tab(section),
                 );
                 return;
             }
-
-            // e.g. #channels/29/social/subscribers
-            const right_side_tab = hash_parser.get_current_nth_hash_section(3);
-            stream_settings_ui.change_state(section, undefined, right_side_tab);
-            return;
-        }
-
-        if (base === "groups") {
-            const right_side_tab = hash_parser.get_current_nth_hash_section(3);
-            user_group_edit.change_state(section, undefined, right_side_tab);
-        }
-
-        if (base === "settings") {
-            if (!section) {
-                // We may be on a really old browser or somebody
-                // hand-typed a hash.
-                blueslip.warn("missing section for settings");
+            case "organization": {
+                if (!section) {
+                    // We may be on a really old browser or somebody
+                    // hand-typed a hash.
+                    blueslip.warn("missing section for organization");
+                }
+                settings_panel_menu.org_settings.activate_section_or_default(
+                    section,
+                    get_settings_tab(section),
+                );
+                return;
             }
-            settings_panel_menu.normal_settings.activate_section_or_default(section);
-            return;
-        }
-
-        if (base === "organization") {
-            if (!section) {
-                // We may be on a really old browser or somebody
-                // hand-typed a hash.
-                blueslip.warn("missing section for organization");
-            }
-            settings_panel_menu.org_settings.activate_section_or_default(
-                section,
-                get_settings_tab(section),
-            );
-            return;
         }
 
         // TODO: handle other cases like internal settings
@@ -414,12 +419,21 @@ function do_hashchange_overlay(old_hash: string | undefined): void {
     if (is_hashchange_internal) {
         if (base === "settings") {
             settings_panel_menu.normal_settings.set_current_tab(section);
+            if (section === "bots") {
+                settings_panel_menu.normal_settings.set_bot_settings_tab(
+                    get_settings_tab(section)!,
+                    "personal",
+                );
+            }
         } else {
             settings_panel_menu.org_settings.set_current_tab(section);
             if (section === "users") {
                 settings_panel_menu.org_settings.set_user_settings_tab(get_settings_tab(section));
             } else if (section === "bots") {
-                settings_panel_menu.org_settings.set_bot_settings_tab(get_settings_tab(section));
+                settings_panel_menu.org_settings.set_bot_settings_tab(
+                    get_settings_tab(section)!,
+                    "org",
+                );
             }
         }
         settings_toggle.goto(base);
@@ -443,23 +457,25 @@ function do_hashchange_overlay(old_hash: string | undefined): void {
     if (base === "channels") {
         if (hash_parser.get_current_nth_hash_section(1) === "folders") {
             const folder_id = hash_parser.get_current_nth_hash_section(2);
-            stream_settings_ui.launch("new", undefined, "", Number.parseInt(folder_id, 10));
+            stream_settings_ui.launch("new", undefined, undefined, Number.parseInt(folder_id, 10));
             return;
         }
 
         // e.g. #channels/29/social/subscribers
+        const {right_panel, left_side_tab} = channels_overlay_state_from_hash();
         const right_side_tab = hash_parser.get_current_nth_hash_section(3);
 
-        if (is_somebody_else_profile_open()) {
-            stream_settings_ui.launch(section, "all-streams", right_side_tab);
+        // When somebody else's profile is open and we're navigating to
+        // a specific channel, default the left tab to "All" instead of
+        // inferring from subscription. URLs with a channel ID never
+        // carry an explicit left tab, so this overrides nothing.
+        if (is_somebody_else_profile_open() && typeof right_panel === "number") {
+            assert(left_side_tab === undefined);
+            stream_settings_ui.launch(right_panel, "all", right_side_tab);
             return;
         }
 
-        // We pass left_side_tab as undefined in change_state to
-        // select the tab based on user's subscriptions. "Subscribed" is
-        // selected if user is subscribed to the stream being edited.
-        // Otherwise "All streams" is selected.
-        stream_settings_ui.launch(section, undefined, right_side_tab);
+        stream_settings_ui.launch(right_panel, left_side_tab, right_side_tab);
         return;
     }
 
@@ -487,7 +503,7 @@ function do_hashchange_overlay(old_hash: string | undefined): void {
     if (base === "settings") {
         settings.build_page();
         admin.build_page();
-        settings.launch(section);
+        settings.launch(section, get_settings_tab(section));
         return;
     }
 
@@ -533,8 +549,7 @@ function do_hashchange_overlay(old_hash: string | undefined): void {
         if (!people.is_known_user_id(user_id)) {
             user_profile.show_user_profile_access_error_modal();
         } else {
-            const user = people.get_by_user_id(user_id);
-            user_profile.show_user_profile(user);
+            user_profile.show_user_profile(user_id);
         }
         return;
     }

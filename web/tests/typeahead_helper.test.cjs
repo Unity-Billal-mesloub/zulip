@@ -203,7 +203,6 @@ function test(label, f) {
         pm_conversations.clear_for_testing();
         recent_senders.clear_for_testing();
         peer_data.clear_for_testing();
-        people.clear_recipient_counts_for_testing();
         helpers.override(current_user, "is_admin", false);
 
         f(helpers);
@@ -280,10 +279,10 @@ test("sort_streams", ({override}) => {
     test_streams = th.sort_streams(test_streams, "d");
     assert.deepEqual(test_streams[0].name, "Dev"); // Stream being composed to
     assert.deepEqual(test_streams[1].name, "Denmark"); // Pinned stream
-    assert.deepEqual(test_streams[2].name, "Docs"); // Active stream
-    assert.deepEqual(test_streams[3].name, "dead (almost)"); // Relatively inactive stream
-    assert.deepEqual(test_streams[4].name, "dead"); // Completely inactive stream
-    assert.deepEqual(test_streams[5].name, "Derp"); // Muted stream last
+    assert.deepEqual(test_streams[2].name, "Docs"); // Active stream, more traffic
+    assert.deepEqual(test_streams[3].name, "dead (almost)"); // Active stream, less traffic
+    assert.deepEqual(test_streams[4].name, "Derp"); // Active but muted stream
+    assert.deepEqual(test_streams[5].name, "dead"); // Inactive stream last
 
     // Sort streams by name
     test_streams = th.sort_streams_by_name(test_streams, "d");
@@ -389,6 +388,63 @@ test("sort_streams", ({override}) => {
     assert.deepEqual(test_streams[3].name, "Ether"); // Unsubscribed and description starts with query
     assert.deepEqual(test_streams[4].name, "New"); // Subscribed and no match
     assert.deepEqual(test_streams[5].name, "Mew"); // Unsubscribed and no match
+
+    // Unsubscribed channels are ordered by recent traffic, then name.
+    // "Dusk" sorts after "Dawn" by name, so leading with it confirms
+    // traffic takes precedence over the name tiebreaker.
+    test_streams = [
+        {
+            stream_id: 401,
+            name: "Dawn",
+            subscribed: false,
+            stream_weekly_traffic: 5,
+        },
+        {
+            stream_id: 402,
+            name: "Dusk",
+            subscribed: false,
+            stream_weekly_traffic: 50,
+        },
+    ];
+
+    test_streams = th.sort_streams(test_streams, "d");
+    assert.deepEqual(test_streams[0].name, "Dusk"); // More traffic
+    assert.deepEqual(test_streams[1].name, "Dawn"); // Less traffic
+
+    // Archived channels sort below all unarchived channels, and within
+    // each group subscribed channels sort above unsubscribed ones.
+    test_streams = [
+        {
+            stream_id: 403,
+            name: "archived and subscribed",
+            subscribed: true,
+            is_archived: true,
+        },
+        {
+            stream_id: 404,
+            name: "unarchived and subscribed",
+            subscribed: true,
+            is_archived: false,
+        },
+        {
+            stream_id: 405,
+            name: "archived and unsubscribed",
+            subscribed: false,
+            is_archived: true,
+        },
+        {
+            stream_id: 406,
+            name: "unarchived and unsubscribed",
+            subscribed: false,
+            is_archived: false,
+        },
+    ];
+
+    test_streams = th.sort_streams(test_streams, "and");
+    assert.deepEqual(test_streams[0].name, "unarchived and subscribed");
+    assert.deepEqual(test_streams[1].name, "unarchived and unsubscribed");
+    assert.deepEqual(test_streams[2].name, "archived and subscribed");
+    assert.deepEqual(test_streams[3].name, "archived and unsubscribed");
 });
 
 function language_items(languages) {
@@ -545,49 +601,46 @@ function get_typeahead_result(query, current_stream_id, current_topic) {
 test("sort_recipients", () => {
     // Typeahead for recipientbox [query, "", undefined]
     assert.deepEqual(get_typeahead_result("b", ""), [
-        "b_user_1@zulip.net",
-        "b_user_2@zulip.net",
-        "b_user_3@zulip.net",
-        "b_bot@example.com",
-        "a_bot@zulip.com",
-        "a_user@zulip.org",
-        "zman@test.net",
+        "b_user_1@zulip.net", // Bob 1 (name prefix match)
+        "b_user_2@zulip.net", // Bob 2 (name prefix match)
+        "b_user_3@zulip.net", // Bob 3 (name prefix match)
+        "b_bot@example.com", // B bot (name prefix match, bot after humans)
+        "a_bot@zulip.com", // A Zulip test bot (matches "b" in "bot")
+        // "Zman" and "A Zulip user" match neither name nor email, so they
+        // tie on relevance; the non-empty query then orders them by name
+        // length, shorter first.
+        "zman@test.net", // Zman (4)
+        "a_user@zulip.org", // A Zulip user (12)
     ]);
 
     // Test match by email (To get coverage for ok_users and ok_bots)
     assert.deepEqual(get_typeahead_result("b_user_1@zulip.net", ""), [
         "b_user_1@zulip.net",
-        "a_user@zulip.org",
+        "zman@test.net",
         "b_user_2@zulip.net",
         "b_user_3@zulip.net",
-        "zman@test.net",
-        "a_bot@zulip.com",
+        "a_user@zulip.org",
         "b_bot@example.com",
+        "a_bot@zulip.com",
     ]);
 
     // Typeahead for direct message [query, "", ""]
     assert.deepEqual(get_typeahead_result("a", "", ""), [
         "a_user@zulip.org",
         "a_bot@zulip.com",
+        "zman@test.net",
         "b_user_1@zulip.net",
         "b_user_2@zulip.net",
         "b_user_3@zulip.net",
-        "zman@test.net",
         "b_bot@example.com",
     ]);
 
     const subscriber_email_1 = "b_user_2@zulip.net";
     const subscriber_email_2 = "b_user_3@zulip.net";
     const subscriber_email_3 = "b_bot@example.com";
-    peer_data.add_subscriber(1, people.get_user_id(subscriber_email_1));
-    peer_data.add_subscriber(1, people.get_user_id(subscriber_email_2));
-    peer_data.add_subscriber(1, people.get_user_id(subscriber_email_3));
-
-    // For splitting based on whether a direct message was sent
-    pm_conversations.set_partner(5);
-    pm_conversations.set_partner(6);
-    pm_conversations.set_partner(2);
-    pm_conversations.set_partner(7);
+    peer_data.add_subscriber(1, b_user_2.user_id);
+    peer_data.add_subscriber(1, b_user_3.user_id);
+    peer_data.add_subscriber(1, b_bot.user_id);
 
     // For splitting based on recency
     recent_senders.process_stream_message({
@@ -640,8 +693,8 @@ test("sort_recipients", () => {
         "a_user@zulip.org",
         "b_user_1@zulip.net",
         "b_user_2@zulip.net",
-        "b_bot@example.com",
         "a_bot@zulip.com",
+        "b_bot@example.com",
     ]);
 });
 
@@ -675,14 +728,10 @@ test("sort_recipients all mention", () => {
     ]);
 });
 
-test("sort_recipients pm counts", () => {
-    // Test sort_recipients with pm counts
-    people.set_recipient_count_for_testing(a_bot.user_id, 50);
-    people.set_recipient_count_for_testing(a_user.user_id, 2);
-    people.set_recipient_count_for_testing(b_user_1.user_id, 32);
-    people.set_recipient_count_for_testing(b_user_2.user_id, 42);
-    people.set_recipient_count_for_testing(b_user_3.user_id, 0);
-    people.set_recipient_count_for_testing(b_bot.user_id, 1);
+test("sort_recipients recent dms", () => {
+    // A more recent direct message ranks the user higher.
+    pm_conversations.recent.insert([b_user_2.user_id], 200);
+    pm_conversations.recent.insert([b_user_1.user_id], 100);
 
     assert.deepEqual(get_typeahead_result("b"), [
         "b_user_2@zulip.net",
@@ -690,11 +739,14 @@ test("sort_recipients pm counts", () => {
         "b_user_3@zulip.net",
         "b_bot@example.com",
         "a_bot@zulip.com",
-        "a_user@zulip.org",
+        // Neither of these matches "b" or has DM history; with a non-empty
+        // query the DM comparator prefers the shorter name, so "Zman" sorts
+        // before "A Zulip user".
         "zman@test.net",
+        "a_user@zulip.org",
     ]);
 
-    // Now prioritize stream membership over pm counts.
+    // Now prioritize stream membership over recent direct messages.
     peer_data.add_subscriber(linux_sub.stream_id, b_user_3.user_id);
 
     assert.deepEqual(get_typeahead_result("b", linux_sub.stream_id, "Linux topic"), [
@@ -707,18 +759,23 @@ test("sort_recipients pm counts", () => {
         "zman@test.net",
     ]);
 
-    /* istanbul ignore next */
-    function compare() {
-        throw new Error("We do not expect to need a tiebreaker here.");
-    }
-
     // get some line coverage
     assert.equal(
-        th.compare_people_for_relevance(b_user_1_item, b_user_3_item, compare, linux_sub.stream_id),
+        th.compare_people_for_relevance(
+            b_user_1_item,
+            b_user_3_item,
+            linux_sub.stream_id,
+            "Linux topic",
+        ),
         1,
     );
     assert.equal(
-        th.compare_people_for_relevance(b_user_3_item, b_user_1_item, compare, linux_sub.stream_id),
+        th.compare_people_for_relevance(
+            b_user_3_item,
+            b_user_1_item,
+            linux_sub.stream_id,
+            "Linux topic",
+        ),
         -1,
     );
 });
@@ -740,8 +797,8 @@ test("sort_recipients dup bots", () => {
         "b_bot@example.com",
         "a_bot@zulip.com",
         "a_bot@zulip.com",
-        "a_user@zulip.org",
         "zman@test.net",
+        "a_user@zulip.org",
     ];
     assert.deepEqual(recipients_email, expected);
 });
@@ -774,7 +831,7 @@ test("sort_recipients dup alls direct message", () => {
         query: "a",
     });
 
-    const expected = [a_user_item, all_obj_item];
+    const expected = [all_obj_item, a_user_item];
     assertSameEmails(recipients, expected);
 });
 
@@ -794,8 +851,8 @@ test("sort_recipients subscribers", () => {
 });
 
 test("sort_recipients recent senders", () => {
-    // b_user_2 is the only recent sender, b_user_3 is the only pm partner
-    // and all are subscribed to the stream Linux.
+    // b_user_2 is the only recent sender, b_user_3 is the only recent direct
+    // message recipient, and all are subscribed to the stream Linux.
     peer_data.add_subscriber(linux_sub.stream_id, b_user_1.user_id);
     peer_data.add_subscriber(linux_sub.stream_id, b_user_2.user_id);
     peer_data.add_subscriber(linux_sub.stream_id, b_user_3.user_id);
@@ -805,7 +862,7 @@ test("sort_recipients recent senders", () => {
         topic: "Linux topic",
         id: (next_id += 1),
     });
-    pm_conversations.set_partner(b_user_3.user_id);
+    pm_conversations.recent.insert([b_user_3.user_id], 100);
     const user_items = [b_user_1_item, b_user_2_item, b_user_3_item];
     const recipients = th.sort_recipients({
         users: user_items,
@@ -814,15 +871,15 @@ test("sort_recipients recent senders", () => {
         current_topic: "Linux topic",
     });
     const recipients_email = recipients.map((person) => person.user.email);
-    // Prefer recent sender over pm partner
+    // Prefer recent sender over recent direct message recipient.
     const expected = ["b_user_2@zulip.net", "b_user_3@zulip.net", "b_user_1@zulip.net"];
     assert.deepEqual(recipients_email, expected);
 });
 
-test("sort_recipients pm partners", () => {
-    // b_user_3 is a pm partner and b_user_2 is not and
+test("sort_recipients recent direct messages", () => {
+    // b_user_3 has a recent direct message and b_user_2 does not, and
     // both are not subscribed to the stream Linux.
-    pm_conversations.set_partner(b_user_3.user_id);
+    pm_conversations.recent.insert([b_user_3.user_id], 100);
     const user_items = [b_user_3_item, b_user_2_item];
     const recipients = th.sort_recipients({
         users: user_items,
@@ -843,7 +900,7 @@ test("sort broadcast mentions for stream message type", () => {
     compose_state.set_message_type("stream");
     const mentions = ct.broadcast_mentions().toReversed();
     const broadcast_items = mentions.map((broadcast) => broadcast_item(broadcast));
-    const results = th.sort_people_for_relevance(broadcast_items, "", "");
+    const results = th.sort_people_for_relevance(broadcast_items, dev_sub.stream_id, "Dev topic");
 
     assert.deepEqual(
         results.map((r) => r.user.email),
@@ -852,7 +909,9 @@ test("sort broadcast mentions for stream message type", () => {
 
     // Reverse the list to test actual sorting
     // and ensure test coverage for the defensive
-    // code.  Also, add in some people users.
+    // code.  Also, add in some people users with
+    // no stream/topic relevance, who should sort
+    // after the wildcard mentions.
     const user_or_mention_items = [
         zman_item,
         ...ct
@@ -861,7 +920,11 @@ test("sort broadcast mentions for stream message type", () => {
             .toReversed(),
         a_user_item,
     ];
-    const results2 = th.sort_people_for_relevance(user_or_mention_items, "", "");
+    const results2 = th.sort_people_for_relevance(
+        user_or_mention_items,
+        dev_sub.stream_id,
+        "Dev topic",
+    );
 
     assert.deepEqual(
         results2.map((r) => r.user.email),
@@ -873,13 +936,15 @@ test("sort broadcast mentions for direct message type", () => {
     compose_state.set_message_type("private");
     const mentions = ct.broadcast_mentions().toReversed();
     const broadcast_items = mentions.map((broadcast) => broadcast_item(broadcast));
-    const results = th.sort_people_for_relevance(broadcast_items, "", "");
+    const results = th.sort_people_for_relevance(broadcast_items);
 
     assert.deepEqual(
         results.map((r) => r.user.email),
         ["all", "everyone"],
     );
 
+    // With no stream context and no direct message history for these
+    // users, the wildcard mentions sort before them.
     const user_or_mention_items = [
         zman_item,
         ...ct
@@ -888,35 +953,26 @@ test("sort broadcast mentions for direct message type", () => {
             .toReversed(),
         a_user_item,
     ];
-    const results2 = th.sort_people_for_relevance(user_or_mention_items, "", "");
+    const results2 = th.sort_people_for_relevance(user_or_mention_items);
 
     assert.deepEqual(
         results2.map((r) => r.user.email),
-        [a_user.email, zman.email, "all", "everyone"],
+        ["all", "everyone", a_user.email, zman.email],
     );
 });
 
-test("test compare directly for stream message type", () => {
+test("test compare directly for broadcast vs user", () => {
     // This is important for ensuring test coverage.
     // We don't technically need it now, but our test
     // coverage is subject to the whims of how JS sorts.
-    compose_state.set_message_type("stream");
     const all_obj = ct.broadcast_mentions()[0];
     const all_obj_item = broadcast_item(all_obj);
 
     assert.equal(th.compare_people_for_relevance(all_obj_item, all_obj_item), 0);
+    // Without stream context, broadcasts come before users with no
+    // direct message history.
     assert.equal(th.compare_people_for_relevance(all_obj_item, zman_item), -1);
     assert.equal(th.compare_people_for_relevance(zman_item, all_obj_item), 1);
-});
-
-test("test compare directly for direct message", () => {
-    compose_state.set_message_type("private");
-    const all_obj = ct.broadcast_mentions()[0];
-    const all_obj_item = broadcast_item(all_obj);
-
-    assert.equal(th.compare_people_for_relevance(all_obj_item, all_obj_item), 0);
-    assert.equal(th.compare_people_for_relevance(all_obj_item, zman_item), 1);
-    assert.equal(th.compare_people_for_relevance(zman_item, all_obj_item), -1);
 });
 
 test("render_person when emails hidden", ({mock_template, override}) => {
@@ -953,8 +1009,6 @@ test("render_person", ({mock_template, override}) => {
 });
 
 test("render_person special_item_text", ({mock_template}) => {
-    let rendered = false;
-
     // Test render_person with special_item_text person
     const special_person = {
         email: "special@example.com",
@@ -965,7 +1019,7 @@ test("render_person special_item_text", ({mock_template}) => {
         special_item_text: "special_text",
     };
 
-    rendered = false;
+    let rendered = false;
     mock_template("typeahead_list_item.hbs", false, (args) => {
         assert.equal(args.primary, special_person.special_item_text);
         rendered = true;
@@ -1122,10 +1176,44 @@ test("compare_language", () => {
     assert.equal(th.compare_language("custom_a", "custom_b"), util.strcmp("custom_a", "custom_b"));
 });
 
-// TODO: This is incomplete for testing this function, and
-// should be filled out more. This case was added for codecov.
-test("compare_by_pms", () => {
-    assert.equal(th.compare_by_pms(a_user, a_user), 0);
+test("compare_users_for_dms", () => {
+    // Same user should return 0
+    assert.equal(th.compare_users_for_dms(a_user, a_user), 0);
+
+    // Alphabetical fallback when neither user has direct message history
+    assert.equal(
+        th.compare_users_for_dms(a_user, b_user_1),
+        util.strcmp(a_user.full_name, b_user_1.full_name),
+    );
+
+    // Reverse order should match strcmp behavior
+    assert.equal(
+        th.compare_users_for_dms(b_user_1, a_user),
+        util.strcmp(b_user_1.full_name, a_user.full_name),
+    );
+
+    // A more recent direct message conversation takes priority.
+    pm_conversations.recent.insert([a_user.user_id], 200);
+    pm_conversations.recent.insert([b_user_1.user_id], 100);
+
+    assert.equal(th.compare_users_for_dms(a_user, b_user_1), -1);
+    assert.equal(th.compare_users_for_dms(b_user_1, a_user), 1);
+
+    // Any direct message history ranks above none.
+    pm_conversations.clear_for_testing();
+    pm_conversations.recent.insert([b_user_1.user_id], 100);
+
+    assert.equal(th.compare_users_for_dms(a_user, b_user_1), 1);
+    assert.equal(th.compare_users_for_dms(b_user_1, a_user), -1);
+
+    // Equally recent direct messages fall back to alphabetical order.
+    pm_conversations.clear_for_testing();
+    pm_conversations.recent.insert([a_user.user_id, b_user_1.user_id], 100);
+
+    assert.equal(
+        th.compare_users_for_dms(a_user, b_user_1),
+        util.strcmp(a_user.full_name, b_user_1.full_name),
+    );
 });
 
 test("sort_group_setting_options", ({override_rewire}) => {
@@ -1693,7 +1781,10 @@ test("render_person shows value of custom profile fields in secondary", ({
         return "typeahead-item-stub";
     });
 
-    assert.equal(th.render_person(a_user_item, "Alpha"), "typeahead-item-stub");
+    assert.equal(
+        th.render_person(a_user_item, {query: "Alpha", should_remove_diacritics: true}),
+        "typeahead-item-stub",
+    );
     assert.ok(rendered);
 });
 
@@ -1727,7 +1818,10 @@ test("render_person shows both email and custom profile fields as secondary if b
         return "typeahead-item-stub";
     });
 
-    assert.equal(th.render_person(a_user_item, "a_user"), "typeahead-item-stub");
+    assert.equal(
+        th.render_person(a_user_item, {query: "a_user", should_remove_diacritics: true}),
+        "typeahead-item-stub",
+    );
     assert.ok(rendered);
 });
 
@@ -1762,7 +1856,51 @@ test("render_person skips custom profile fields not used for user matching", ({
         return "typeahead-item-stub";
     });
 
-    assert.equal(th.render_person(a_user_item, "Alpha"), "typeahead-item-stub");
+    assert.equal(
+        th.render_person(a_user_item, {query: "Alpha", should_remove_diacritics: true}),
+        "typeahead-item-stub",
+    );
+    assert.ok(rendered);
+});
+
+test("render_person with matching custom profile field but email hidden", ({
+    mock_template,
+    override,
+}) => {
+    override(realm, "custom_profile_field_types", {
+        SHORT_TEXT: {id: 1, name: "Short text"},
+        PRONOUNS: {id: 3, name: "Pronouns"},
+    });
+
+    override(realm, "custom_profile_fields", [
+        {
+            id: 1,
+            name: "Alpha field",
+            type: realm.custom_profile_field_types.SHORT_TEXT.id,
+            use_for_user_matching: true,
+        },
+    ]);
+
+    b_user_1.delivery_email = null;
+
+    people.set_custom_profile_field_data(b_user_1.user_id, {
+        id: 1,
+        value: "Alpha",
+    });
+
+    let rendered = false;
+    mock_template("typeahead_list_item.hbs", false, (args) => {
+        // When email is null and custom field matches,
+        // secondary should only show the custom field value, not "null, value"
+        assert.equal(args.secondary, "Alpha");
+        rendered = true;
+        return "typeahead-item-stub";
+    });
+
+    assert.equal(
+        th.render_person(b_user_1_item, {query: "", should_remove_diacritics: true}),
+        "typeahead-item-stub",
+    );
     assert.ok(rendered);
 });
 

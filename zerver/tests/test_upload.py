@@ -227,13 +227,9 @@ class FileUploadTest(UploadSerializeMixin, ZulipTestCase):
         tests = [
             ("No high bytes in this string", "ascii", "ascii"),  # Explicit ASCII encoding
             ("नाम में क्या रक्खा हे", "utf-8", "utf-8"),  # Enough to get 99% confidence UTF-8
-            ("日本語", "iso2022_jp", "ISO-2022-JP"),  # Non-UTF-8 99% confidence
-            ("日本語", "utf-8", "utf-8"),  # UTF-8 is only 87% confident
-            (
-                "Min svävare är full av ålar.",
-                "iso-8859-1",
-                "ISO-8859-1",
-            ),  # iso-8859-1 maxes out at 73%, but we'll still guess it
+            ("日本語", "iso2022_jp", "ISO-2022-JP"),  # Non-UTF-8 95% confidence
+            ("\xa0" + " " * 30, "utf-8", "utf-8"),  # UTF-8 is only 87% confident
+            ("· ar aitheach a le chan ir ana s din tag", "L1", "ISO-8859-1"),  # 76% confidence
             ("Aucune idée", "mac-roman", None),  # Short text in obscure formats is left unguessed
         ]
         self.login("hamlet")
@@ -1041,6 +1037,63 @@ class FileUploadTest(UploadSerializeMixin, ZulipTestCase):
             self.assertEqual(response.getvalue(), b"zulip!")
             self.logout()
 
+    def test_file_download_authorization_attachment_deleted_concurrently(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+        fp = StringIO("zulip!")
+        fp.name = "zulip.txt"
+        result = self.client_post("/json/user_uploads", {"file": fp})
+        url = self.assert_json_success(result)["url"]
+        fp_path_id = re.sub(r"/user_uploads/", "", url)
+        body = f"First message ...[zulip.txt](http://{hamlet.realm.host}/user_uploads/{fp_path_id})"
+        self.send_stream_message(hamlet, "Denmark", body, "test")
+
+        # Message edits/moves invalidate the is_realm_public cache; the
+        # next access then refills it and refreshes the attachment.
+        Attachment.objects.filter(path_id=fp_path_id).update(is_realm_public=None)
+
+        # If the attachment is deleted concurrently between the initial
+        # fetch and that refresh, the attachment should be reported as
+        # not existing rather than raising an unhandled exception.
+        with mock.patch.object(Attachment, "refresh_from_db", side_effect=Attachment.DoesNotExist):
+            self.assertEqual(validate_attachment_request(hamlet, fp_path_id), (False, None))
+
+            # The call above refilled the is_realm_public cache; invalidate
+            # it again so the file-serving request also takes the refresh
+            # code path.
+            Attachment.objects.filter(path_id=fp_path_id).update(is_realm_public=None)
+            response = self.client_get(url)
+            self.assertEqual(response.status_code, 404)
+            self.assert_in_response("This file does not exist or has been deleted.", response)
+
+    def test_spectator_file_access_attachment_deleted_concurrently(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+        fp = StringIO("zulip!")
+        fp.name = "zulip.txt"
+        result = self.client_post("/json/user_uploads", {"file": fp})
+        url = self.assert_json_success(result)["url"]
+        fp_path_id = re.sub(r"/user_uploads/", "", url)
+
+        self.make_stream("web-public-stream", is_web_public=True)
+        self.subscribe(hamlet, "web-public-stream")
+        body = f"First message ...[zulip.txt](http://{hamlet.realm.host}/user_uploads/{fp_path_id})"
+        self.send_stream_message(hamlet, "web-public-stream", body, "test")
+        self.logout()
+
+        # Sending the message above filled the is_web_public cache; the
+        # spectator code path only refreshes the attachment when that
+        # cache is unset, so invalidate it to exercise the refresh.
+        Attachment.objects.filter(path_id=fp_path_id).update(is_web_public=None)
+
+        # If the attachment is deleted concurrently between the initial
+        # fetch and that refresh, a spectator should get a 404 rather
+        # than an unhandled exception.
+        with mock.patch.object(Attachment, "refresh_from_db", side_effect=Attachment.DoesNotExist):
+            response = self.client_get(url)
+            self.assertEqual(response.status_code, 404)
+            self.assert_in_response("This file does not exist or has been deleted.", response)
+
     def test_serve_local(self) -> None:
         def check_xsend_links(
             name: str,
@@ -1610,10 +1663,36 @@ class AvatarTest(UploadSerializeMixin, ZulipTestCase):
 
         do_scrub_avatar_images(user, acting_user=user)
 
-        self.assertEqual(user.avatar_source, UserProfile.AVATAR_FROM_GRAVATAR)
+        self.assertEqual(user.avatar_source, UserProfile.AVATAR_FROM_JDENTICON)
         self.assertFalse(os.path.isfile(avatar_path_id))
         self.assertFalse(os.path.isfile(avatar_original_path_id))
         self.assertFalse(os.path.isfile(avatar_medium_path_id))
+
+    def test_avatar_empty_content_type(self) -> None:
+        """
+        An avatar upload with an empty content type should succeed by
+        guessing the type from the filename.
+        """
+        self.login("hamlet")
+        with get_test_image_file("img.png") as fp:
+            uploaded_file = SimpleUploadedFile("img.png", fp.read(), content_type="")
+        result = self.client_post("/json/users/me/avatar", {"file": uploaded_file})
+        response_dict = self.assert_json_success(result)
+        self.assertIn("avatar_url", response_dict)
+
+        # With no filename extension to guess from, the upload is rejected.
+        with get_test_image_file("img.png") as fp:
+            uploaded_file = SimpleUploadedFile("img", fp.read(), content_type="")
+        result = self.client_post("/json/users/me/avatar", {"file": uploaded_file})
+        self.assert_json_error(result, "Invalid image format")
+
+        # A non-empty content type is used as-is, not overridden by the guess.
+        with get_test_image_file("img.png") as fp:
+            uploaded_file = SimpleUploadedFile(
+                "img.png", fp.read(), content_type="application/octet-stream"
+            )
+        result = self.client_post("/json/users/me/avatar", {"file": uploaded_file})
+        self.assert_json_error(result, "Invalid image format")
 
     def test_invalid_avatars(self) -> None:
         """

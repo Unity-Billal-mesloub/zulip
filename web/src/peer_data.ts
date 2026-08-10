@@ -2,13 +2,14 @@ import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
 import * as blueslip from "./blueslip.ts";
+import {INCOMING_WEBHOOK_BOT_TYPE_INT} from "./bot_type_values.ts";
 import * as channel from "./channel.ts";
 import {LazySet} from "./lazy_set.ts";
 import {page_params} from "./page_params.ts";
 import type {User} from "./people.ts";
 import * as people from "./people.ts";
+import {get_retry_backoff_seconds} from "./retry_backoff.ts";
 import * as sub_store from "./sub_store.ts";
-import * as util from "./util.ts";
 
 // Maps stream_id to the number of subscribers in that stream.
 // Note: These counts can sometimes be wrong due to races on the backend,
@@ -77,21 +78,23 @@ const fetch_user_subscriptions_response_schema = z.object({
 // delay each time) if the server keeps returning non-400 errors.
 export async function fetch_stream_subscribers_with_retry(
     stream_id: number,
-    num_attempts = 1,
 ): Promise<LazySet | null> {
-    const subscribers = await fetch_stream_subscribers(stream_id);
-    // Bad request, so just give up here.
-    if (subscribers === false) {
-        return null;
+    let num_attempts = 1;
+    while (true) {
+        const subscribers = await fetch_stream_subscribers(stream_id);
+        // Bad request, so just give up here.
+        if (subscribers === false) {
+            return null;
+        }
+        // Failed request, retry.
+        if (subscribers === null) {
+            num_attempts += 1;
+            const retry_delay_secs = get_retry_backoff_seconds(undefined, num_attempts);
+            await new Promise((resolve) => setTimeout(resolve, retry_delay_secs * 1000));
+            continue;
+        }
+        return subscribers;
     }
-    // Failed request, retry.
-    if (subscribers === null) {
-        num_attempts += 1;
-        const retry_delay_secs = util.get_retry_backoff_seconds(undefined, num_attempts);
-        await new Promise((resolve) => setTimeout(resolve, retry_delay_secs * 1000));
-        return fetch_stream_subscribers_with_retry(stream_id, num_attempts);
-    }
-    return subscribers;
 }
 
 // This function either waits for an existing pending request or kicks off
@@ -204,7 +207,7 @@ async function get_full_subscriber_set(
         if (fetched_subscribers === null || fetched_subscribers === false) {
             return null;
         }
-        set_subscribers(stream_id, [...fetched_subscribers.keys()]);
+        set_subscribers(stream_id, fetched_subscribers.keys().toArray());
     }
     return get_loaded_subscriber_subset(stream_id);
 }
@@ -217,12 +220,31 @@ export async function is_subscriber_subset(
     const sub2_promise = get_full_subscriber_set(stream_id2, false);
     const sub1_set = await sub1_promise;
     const sub2_set = await sub2_promise;
-    // This happens if we encountered an error feteching subscribers.
+    // This happens if we encountered an error fetching subscribers.
     if (sub1_set === null || sub2_set === null) {
         return null;
     }
 
-    return [...sub1_set.keys()].every((key) => sub2_set.has(key));
+    return sub1_set.keys().every((key) => {
+        // If the user is in the linked stream, the check passes.
+        if (sub2_set.has(key)) {
+            return true;
+        }
+
+        // Use ignore_missing=true because subscribers may include users
+        // inaccessible to the current viewer (e.g., guest-visibility limits);
+        // those will return undefined and fall through to the non-subset case.
+        const user = people.maybe_get_user_by_id(key, true);
+
+        // Incoming webhook bots are write-only and can't read messages, so a
+        // private channel containing them as the only "extra" subscriber
+        // doesn't expose anything.
+        if (user?.bot_type === INCOMING_WEBHOOK_BOT_TYPE_INT) {
+            return true;
+        }
+
+        return false;
+    });
 }
 
 export function potential_subscribers(stream_id: number): User[] {
@@ -328,7 +350,7 @@ export function set_subscriber_count(stream_id: number, count: number): void {
     subscriber_counts.set(stream_id, count);
 }
 
-export function clear_subscriber_counts_for_tests(): void {
+export function clear_subscriber_counts(): void {
     subscriber_counts.clear();
 }
 
@@ -345,7 +367,7 @@ export function get_subscriber_ids_assert_loaded(stream_id: number): number[] {
     // want an array of user_ids who are subscribed to a stream.
     const subscribers = get_loaded_subscriber_subset(stream_id);
 
-    return [...subscribers.keys()];
+    return subscribers.keys().toArray();
 }
 
 export async function get_subscribers_with_possible_fetch(
@@ -360,7 +382,7 @@ export async function get_subscribers_with_possible_fetch(
     if (subscribers === null) {
         return null;
     }
-    return [...subscribers.keys()];
+    return subscribers.keys().toArray();
 }
 
 export function set_subscribers(stream_id: number, user_ids: number[], full_data = true): void {
@@ -563,11 +585,10 @@ export async function fetch_subscriptions_for_user(user_id: number): Promise<voi
                 break;
             }
             // Failed request, so try again (unless we've reached the retry limit)
-            else if (result === null) {
+            if (result === null) {
                 num_attempts += 1;
-                const retry_delay_secs = util.get_retry_backoff_seconds(undefined, num_attempts);
+                const retry_delay_secs = get_retry_backoff_seconds(undefined, num_attempts);
                 await new Promise((resolve) => setTimeout(resolve, retry_delay_secs * 1000));
-                continue;
             }
             // Success
             else {

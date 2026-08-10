@@ -18,6 +18,7 @@ function make_tab(i) {
 
     $self.stub = true;
     $self.class = [];
+    $self.visible = true;
 
     $self.addClass = (c) => {
         $self.class += " " + c;
@@ -33,6 +34,14 @@ function make_tab(i) {
     $self.hasClass = (c) => {
         const tokens = $self.class.trim().split(/ +/);
         return tokens.includes(c);
+    };
+
+    $self.css = (prop) => {
+        assert.equal(prop, "display");
+        if ($self.visible) {
+            return "";
+        }
+        return "none";
     };
 
     $self.attr = (name) => {
@@ -54,8 +63,7 @@ function make_tab(i) {
     $self.trigger = (type) => {
         if (type === "focus") {
             env.focused_tab = i;
-        }
-        if (type === "click") {
+        } else if (type === "click") {
             env.click_f.call(env.tabs[i]);
         }
     };
@@ -222,6 +230,7 @@ run_test("basics", () => {
     assert.equal(env.tabs[2].class, "last");
     assert.deepEqual(callback_args, ["translated: Keyboard shortcuts", "keyboard-shortcuts"]);
     assert.equal(widget.value(), "translated: Keyboard shortcuts");
+    assert.equal(widget.key(), "keyboard-shortcuts");
 
     callback_args = undefined;
 
@@ -232,6 +241,7 @@ run_test("basics", () => {
     assert.equal(env.tabs[2].class, "last");
     assert.deepEqual(callback_args, ["translated: Message formatting", "message-formatting"]);
     assert.equal(widget.value(), "translated: Message formatting");
+    assert.equal(widget.key(), "message-formatting");
 
     // Go to same tab twice and make sure we get callback.
     callback_args = undefined;
@@ -285,6 +295,13 @@ run_test("basics", () => {
     assert.equal(widget.value(), "translated: Search filters");
 
     widget.enable_tab("message-formatting");
+
+    callback_args = undefined;
+    env.tabs[1].visible = false;
+    env.keydown_f.call(env.tabs[env.focused_tab], LEFT_KEY);
+    assert.equal(widget.value(), "translated: Keyboard shortcuts");
+
+    env.tabs[1].visible = true;
 
     callback_args = undefined;
 

@@ -23,7 +23,7 @@ from zerver.lib.response import json_success
 from zerver.lib.typed_endpoint import PathOnly, typed_endpoint
 from zerver.lib.types import ProfileDataElementUpdateDict, ProfileFieldData
 from zerver.lib.users import validate_user_custom_profile_data
-from zerver.lib.validator import check_capped_string, validate_select_field_data
+from zerver.lib.validator import check_capped_string, validate_custom_profile_field_choices
 from zerver.models import CustomProfileField, Realm, UserProfile
 from zerver.models.custom_profile_fields import custom_profile_fields_for_realm
 
@@ -52,11 +52,11 @@ def validate_field_name_and_hint(name: str, hint: str) -> None:
 
 def validate_custom_field_data(field_type: int, field_data: ProfileFieldData) -> None:
     try:
-        if field_type == CustomProfileField.SELECT:
+        if field_type == CustomProfileField.DROPDOWN:
             # Choice type field must have at least have one choice
             if len(field_data) < 1:
                 raise JsonableError(_("Field must have at least one choice."))
-            validate_select_field_data(field_data)
+            validate_custom_profile_field_choices(field_data)
         elif field_type == CustomProfileField.EXTERNAL_ACCOUNT:
             validate_external_account_field_data(field_data)
     except ValidationError as error:
@@ -69,10 +69,8 @@ def validate_display_in_profile_summary_field(
     if not display_in_profile_summary:
         return
 
-    # The LONG_TEXT field type doesn't make sense visually for profile
-    # field summaries. The USER field type will require some further
-    # client support.
-    if field_type in (CustomProfileField.LONG_TEXT, CustomProfileField.USER):
+    # The USER field type will require some further client support.
+    if field_type == CustomProfileField.USER:
         raise JsonableError(_("Field type not supported for display in profile summary."))
 
 

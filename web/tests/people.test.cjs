@@ -4,13 +4,12 @@ const assert = require("node:assert/strict");
 
 const {parseISO} = require("date-fns");
 const _ = require("lodash");
-const MockDate = require("mockdate");
 
 const {make_user_group} = require("./lib/example_group.cjs");
 const {make_realm} = require("./lib/example_realm.cjs");
 const {make_bot, make_cross_realm_bot, make_user, Role} = require("./lib/example_user.cjs");
 const {$t} = require("./lib/i18n.cjs");
-const {mock_esm, zrequire, set_global} = require("./lib/namespace.cjs");
+const {clock, mock_esm, zrequire, set_global} = require("./lib/namespace.cjs");
 const {run_test, noop} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
 const {page_params} = require("./lib/zpage_params.cjs");
@@ -18,6 +17,9 @@ const {page_params} = require("./lib/zpage_params.cjs");
 const message_user_ids = mock_esm("../src/message_user_ids");
 const settings_data = mock_esm("../src/settings_data", {
     user_can_access_all_other_users: () => true,
+});
+mock_esm("../src/server_events_state", {
+    has_received_first_events_response: () => true,
 });
 const channel = mock_esm("../src/channel");
 
@@ -30,11 +32,11 @@ set_global("setTimeout", (func) => {
 
 const muted_users = zrequire("muted_users");
 const people = zrequire("people");
+const retry_backoff = zrequire("retry_backoff");
 const settings_config = zrequire("../src/settings_config.ts");
 const {set_current_user, set_realm} = zrequire("state_data");
 const user_groups = zrequire("user_groups");
 const {initialize_user_settings} = zrequire("user_settings");
-const util = zrequire("util");
 
 const current_user = {};
 set_current_user(current_user);
@@ -223,6 +225,14 @@ const linus = make_user({
     full_name: "Linus Torvalds",
 });
 
+// A user whose full name starts with digits, used to verify that
+// id matching is exact and does not collide with digit-leading names.
+const digit_named = make_user({
+    email: "digit-named@example.com",
+    user_id: 9001,
+    full_name: "304 Robot",
+});
+
 const emp401 = make_user({
     email: "emp401@example.com",
     user_id: 401,
@@ -288,6 +298,13 @@ const stewie = make_user({
     },
 });
 
+const imported_user = {
+    email: "imported-user@example.com",
+    user_id: 1205,
+    full_name: "Imported user",
+    is_imported_stub: true,
+};
+
 function get_all_persons() {
     return people.filter_all_persons(() => true);
 }
@@ -334,7 +351,6 @@ run_test("basics", ({override}) => {
     const active_user_ids = people.get_active_user_ids().toSorted();
     assert.deepEqual(active_user_ids, [me.user_id, isaac.user_id]);
     assert.equal(people.is_active_user_or_system_bot(isaac.user_id), true);
-    assert.ok(people.is_valid_email_for_compose(isaac.email));
     assert.ok(people.is_valid_user_id_for_compose(isaac.user_id));
 
     let bot_user_ids = people.get_bot_ids();
@@ -346,7 +362,6 @@ run_test("basics", ({override}) => {
     assert.equal(people.get_non_active_user_ids_count([isaac.user_id]), 1);
     assert.equal(people.get_active_human_count(), 1);
     assert.equal(people.is_active_user_or_system_bot(isaac.user_id), false);
-    assert.equal(people.is_valid_email_for_compose(isaac.email), true);
     assert.equal(people.is_valid_user_id_for_compose(isaac.user_id), true);
 
     people.add_active_user(bot_botson);
@@ -412,9 +427,6 @@ run_test("basics", ({override}) => {
     person = people.get_by_email("me@example.com");
     assert.equal(person.full_name, "Me Myself");
 
-    // Test undefined people
-    assert.equal(people.is_cross_realm_email("invalid@example.com"), false);
-
     // Test is_my_user_id function
     assert.equal(people.is_my_user_id(me.user_id), true);
     assert.equal(people.is_my_user_id(isaac.user_id), false);
@@ -427,6 +439,20 @@ run_test("basics", ({override}) => {
 
     // get_users_from_ids
     assert.deepEqual(people.get_users_from_ids([me.user_id, isaac.user_id]), [me, isaac]);
+
+    // Test with imported user.
+    people.add_active_user(imported_user);
+    assert.equal(people.get_realm_active_human_user_ids().length, 3);
+    assert.equal(people.get_realm_active_human_user_ids_for_users_panel().length, 2);
+    assert.equal(people.get_realm_active_imported_stub_user_ids().length, 1);
+
+    // Check get_realm_active_imported_stub_user_ids does not include deactivated users.
+    assert.equal(people.get_non_active_human_ids().length, 0);
+    people.deactivate(imported_user);
+    assert.equal(people.get_realm_active_human_user_ids().length, 2);
+    assert.equal(people.get_realm_active_human_user_ids_for_users_panel().length, 2);
+    assert.equal(people.get_realm_active_imported_stub_user_ids().length, 0);
+    assert.equal(people.get_non_active_human_ids().length, 1);
 });
 
 run_test("sort_but_pin_current_user_on_top with me", () => {
@@ -652,7 +678,7 @@ run_test("bot_custom_profile_data", () => {
 
 run_test("user_timezone", ({override}) => {
     initialize();
-    MockDate.set(parseISO("20130208T080910").getTime());
+    clock.setSystemTime(parseISO("20130208T080910").getTime());
 
     override(user_settings, "twenty_four_hour_time", true);
     assert.equal(people.get_user_time(me.user_id), "00:09");
@@ -663,7 +689,7 @@ run_test("user_timezone", ({override}) => {
 
 run_test("utcToZonedTime", ({override}) => {
     initialize();
-    MockDate.set(parseISO("20130208T080910").getTime());
+    clock.setSystemTime(parseISO("20130208T080910").getTime());
     override(user_settings, "twenty_four_hour_time", true);
 
     assert.deepEqual(people.get_user_time(unknown_user.user_id), undefined);
@@ -743,7 +769,7 @@ run_test("set_custom_profile_field_data", () => {
     assert.equal(person.profile_data[field.id].rendered_value, "<p>Field value</p>");
 
     people.set_custom_profile_field_data(person.user_id, {id: 3, value: null});
-    assert.ok(!(field.id in person.profile_data));
+    assert.ok(!Object.hasOwn(person.profile_data, field.id));
 });
 
 run_test("is_current_user_only_owner", ({override}) => {
@@ -791,17 +817,6 @@ run_test("user_can_change_their_own_role", ({override}) => {
     assert.ok(people.user_can_change_their_own_role());
 });
 
-run_test("recipient_counts", () => {
-    initialize();
-    const user_id = 99;
-    assert.equal(people.get_recipient_count({user_id}), 0);
-    people.incr_recipient_count(user_id);
-    people.incr_recipient_count(user_id);
-    assert.equal(people.get_recipient_count({user_id}), 2);
-
-    assert.equal(people.get_recipient_count({pm_recipient_count: 5}), 5);
-});
-
 run_test("filtered_users", () => {
     initialize();
     people.add_active_user(charles);
@@ -842,6 +857,18 @@ run_test("filtered_users", () => {
     filtered_people = people.filter_people_by_search_terms(users, "ëm");
     assert.equal(filtered_people.size, 1);
     assert.ok(filtered_people.has(noah.user_id));
+
+    // Multi-word query should ignore diacritics when the query
+    // itself has no diacritics.
+    filtered_people = people.filter_people_by_search_terms(users, "nooa em");
+    assert.equal(filtered_people.size, 2);
+    assert.ok(filtered_people.has(noah.user_id));
+    assert.ok(filtered_people.has(plain_noah.user_id));
+
+    // Multi-word query with diacritics should match only Nöôáàh
+    filtered_people = people.filter_people_by_search_terms(users, "nöôáàh Ëme");
+    assert.equal(filtered_people.size, 1);
+    assert.ok(filtered_people.has(noah.user_id));
 });
 
 run_test("dm_matches_search_string", () => {
@@ -852,6 +879,7 @@ run_test("dm_matches_search_string", () => {
     people.add_active_user(linus);
     people.add_active_user(noah);
     people.add_active_user(plain_noah);
+    people.add_active_user(digit_named);
 
     let result = people.dm_matches_search_string([ashton], "a");
     assert.ok(result);
@@ -874,6 +902,13 @@ run_test("dm_matches_search_string", () => {
 
     // Match with user id.
     result = people.dm_matches_search_string([linus], "304");
+    assert.ok(result);
+    result = people.dm_matches_search_string([linus], "30");
+    assert.ok(!result);
+
+    // A full name starting with digits is still matched by name, and
+    // is not affected by the (unrelated) id of any other user.
+    result = people.dm_matches_search_string([digit_named], "304");
     assert.ok(result);
 
     // Test filtering of names with diacritics. This should match
@@ -942,23 +977,11 @@ run_test("multi_user_methods", () => {
     assert.equal(emp401.user_id, 401);
     assert.equal(emp402.user_id, 402);
 
-    let emails_string = people.user_ids_string_to_emails_string("402,401");
-    assert.equal(emails_string, "emp401@example.com,emp402@example.com");
-
     let user_ids = people.slug_to_user_ids("402,401");
     assert.deepEqual(user_ids, [402, 401]);
 
     user_ids = people.slug_to_user_ids("402,401-group");
     assert.deepEqual(user_ids, [402, 401]);
-
-    emails_string = "emp402@example.com,EMP401@EXAMPLE.COM";
-    let user_ids_string = people.emails_strings_to_user_ids_string(emails_string);
-    assert.equal(user_ids_string, "401,402");
-
-    user_ids_string = people.reply_to_to_user_ids_string(emails_string);
-    assert.equal(user_ids_string, "401,402");
-
-    assert.equal(people.reply_to_to_user_ids_string("invalid@example.com"), undefined);
 
     assert.equal(people.user_ids_string_to_slug("401,402"), "401,402-group");
     assert.equal(people.user_ids_string_to_slug("402"), "402-whatever-402");
@@ -1023,6 +1046,9 @@ run_test("message_methods", () => {
         maria.avatar_url,
         "https://secure.gravatar.com/avatar/6dbdd7946b58d8b11351fcb27e5cdd55?d=identicon",
     );
+    // small_avatar_url_for_user_id delegates to small_avatar_url_for_person.
+    assert.equal(people.small_avatar_url_for_user_id(maria.user_id), maria.avatar_url);
+
     // This will use the cached gravatar url
     assert.equal(
         people.medium_avatar_url_for_person(maria),
@@ -1056,7 +1082,6 @@ run_test("message_methods", () => {
     };
     assert.equal(people.pm_with_url(message), "#narrow/dm/301,302-group");
     assert.equal(people.pm_perma_link(message), "#narrow/dm/30,301,302-group");
-    assert.equal(people.pm_reply_to(message), "charles@example.com,Athens@example.com");
     assert.equal(people.small_avatar_url(message), "http://charles.com/foo.png");
 
     message = {
@@ -1066,7 +1091,6 @@ run_test("message_methods", () => {
     };
     assert.equal(people.pm_with_url(message), "#narrow/dm/302-Maria-Athens");
     assert.equal(people.pm_perma_link(message), "#narrow/dm/30,302-dm");
-    assert.equal(people.pm_reply_to(message), "Athens@example.com");
     assert.equal(people.small_avatar_url(message), "legacy.png");
 
     message = {
@@ -1116,7 +1140,6 @@ run_test("message_methods", () => {
     assert.equal(people.all_user_ids_in_pm(message), undefined);
 
     // Test undefined user_ids
-    assert.equal(people.pm_reply_to(message), undefined);
     assert.equal(people.pm_reply_user_string(message), undefined);
     assert.equal(people.pm_with_url(message), undefined);
 
@@ -1177,39 +1200,6 @@ run_test("extract_people_from_message", () => {
     blueslip.reset();
 });
 
-run_test("maybe_incr_recipient_count", () => {
-    initialize();
-    const maria_recip = {
-        id: maria.user_id,
-    };
-    people.add_active_user(maria);
-
-    let message = {
-        type: "private",
-        display_recipient: [maria_recip],
-        sent_by_me: true,
-    };
-    assert.equal(people.get_recipient_count(maria), 0);
-    people.maybe_incr_recipient_count(message);
-    assert.equal(people.get_recipient_count(maria), 1);
-
-    // Test all the no-op conditions to get test
-    // coverage.
-    message = {
-        type: "private",
-        sent_by_me: false,
-        display_recipient: [maria_recip],
-    };
-    people.maybe_incr_recipient_count(message);
-    assert.equal(people.get_recipient_count(maria), 1);
-
-    message = {
-        type: "stream",
-    };
-    people.maybe_incr_recipient_count(message);
-    assert.equal(people.get_recipient_count(maria), 1);
-});
-
 run_test("get_people_for_search_bar", ({override}) => {
     initialize();
     let user_ids;
@@ -1254,7 +1244,6 @@ run_test("updates", () => {
 
     // Do sanity checks on our data.
     assert.equal(people.get_by_email(old_email).user_id, user_id);
-    assert.ok(!people.is_cross_realm_email(old_email));
 
     assert.equal(people.get_by_email(new_email), undefined);
 
@@ -1263,7 +1252,6 @@ run_test("updates", () => {
 
     // Now look up using the new email.
     assert.equal(people.get_by_email(new_email).user_id, user_id);
-    assert.ok(!people.is_cross_realm_email(new_email));
 
     const all_people = get_all_persons();
     assert.equal(all_people.length, 3);
@@ -1279,22 +1267,6 @@ run_test("updates", () => {
     );
     person = people.get_by_email(old_email);
     assert.equal(person.user_id, user_id);
-});
-
-run_test("update_email_in_reply_to", () => {
-    initialize();
-    people.add_active_user(charles);
-    people.add_active_user(maria);
-
-    let reply_to = "    charles@example.com,   athens@example.com";
-    assert.equal(people.update_email_in_reply_to(reply_to, 9999, "whatever"), reply_to);
-    assert.equal(
-        people.update_email_in_reply_to(reply_to, maria.user_id, "maria@example.com"),
-        "charles@example.com,maria@example.com",
-    );
-
-    reply_to = "    charles@example.com,   athens@example.com, invalid@example.com";
-    assert.equal(people.update_email_in_reply_to(reply_to, 9999, "whatever"), reply_to);
 });
 
 run_test("track_duplicate_full_names", () => {
@@ -1347,6 +1319,12 @@ run_test("get_mention_syntax", () => {
     assert.equal(people.get_mention_syntax("Stephen King", 601), "@**Stephen King|601**");
     assert.equal(people.get_mention_syntax("Stephen King", 602, true), "@_**Stephen King|602**");
     assert.equal(people.get_mention_syntax("Maria Athens", 603), "@**Maria Athens**");
+
+    // With always_include_id, the id is pinned even when the name is unique.
+    assert.equal(
+        people.get_mention_syntax("Maria Athens", 603, false, true),
+        "@**Maria Athens|603**",
+    );
 
     // Following tests handle a special case when `full_name` matches with a wildcard.
     //
@@ -1402,18 +1380,11 @@ run_test("initialize", () => {
     people.initialize(current_user.user_id, params, user_group_params);
 
     assert.equal(people.is_active_user_or_system_bot(17), true);
-    assert.ok(people.is_cross_realm_email("bot@example.com"));
-    assert.ok(people.is_valid_email_for_compose("bot@example.com"));
     assert.ok(people.is_valid_user_id_for_compose(test_bot.user_id));
-    assert.ok(people.is_valid_email_for_compose("alice@example.com"));
     assert.ok(people.is_valid_user_id_for_compose(alice.user_id));
-    assert.ok(people.is_valid_email_for_compose("retiree@example.com"));
     assert.ok(people.is_valid_user_id_for_compose(retiree.user_id));
-    assert.ok(!people.is_valid_email_for_compose("totally-bogus-username@example.com"));
     blueslip.expect("error", "Unknown user_id in maybe_get_user_by_id");
     assert.ok(!people.is_valid_user_id_for_compose(9999));
-    assert.ok(people.is_valid_bulk_emails_for_compose(["bot@example.com", "alice@example.com"]));
-    assert.ok(!people.is_valid_bulk_emails_for_compose(["not@valid.com", "alice@example.com"]));
     assert.ok(people.is_valid_bulk_user_ids_for_compose([17, 16, 15]));
     blueslip.reset();
     blueslip.expect("error", "Unknown user_id in maybe_get_user_by_id");
@@ -1523,19 +1494,6 @@ run_test("is_valid_full_name_and_user_id", () => {
     assert.ok(!people.is_valid_full_name_and_user_id("bogus", 99));
     assert.ok(!people.is_valid_full_name_and_user_id(me.full_name, 99));
     assert.ok(people.is_valid_full_name_and_user_id(me.full_name, me.user_id));
-});
-
-run_test("emails_strings_to_user_ids_array", () => {
-    initialize();
-    people.add_active_user(steven);
-    people.add_active_user(maria);
-
-    let user_ids = people.emails_strings_to_user_ids_array(`${steven.email},${maria.email}`);
-    assert.deepEqual(user_ids, [steven.user_id, maria.user_id]);
-
-    blueslip.expect("warn", "Unknown emails");
-    user_ids = people.emails_strings_to_user_ids_array("dummyuser@example.com");
-    assert.equal(user_ids, undefined);
 });
 
 run_test("get_visible_email", () => {
@@ -1675,12 +1633,6 @@ run_test("sort_by_username", () => {
         people.sort_user_ids_by_username([maria.user_id, cedar.user_id, leo.user_id]),
         [cedar.user_id, leo.user_id, maria.user_id],
     );
-
-    assert.deepEqual(people.sort_emails_by_username([maria.email, cedar.email, leo.email]), [
-        cedar.email,
-        leo.email,
-        maria.email,
-    ]);
 });
 
 run_test("get_users_that_match_role_ids", () => {
@@ -1719,7 +1671,7 @@ run_test("get_users_that_match_role_ids", () => {
 
 // reset to native Date()
 run_test("reset MockDate", () => {
-    MockDate.reset();
+    clock.reset();
 });
 
 run_test("fetch_users retry", async ({override, override_rewire}) => {
@@ -1753,6 +1705,7 @@ run_test("fetch_users retry", async ({override, override_rewire}) => {
                     avatar_url: "",
                     avatar_version: 1,
                     is_bot: false,
+                    is_imported_stub: false,
                 },
             ],
             result: "success",
@@ -1761,7 +1714,7 @@ run_test("fetch_users retry", async ({override, override_rewire}) => {
     });
 
     // Math.round will be `0`.
-    override_rewire(util, "get_retry_backoff_seconds", () => retry_count / 1000);
+    override_rewire(retry_backoff, "get_retry_backoff_seconds", () => retry_count / 1000);
     // Check that we retry the request after a failed attempt.
     blueslip.expect(
         "warn",
@@ -1791,6 +1744,7 @@ run_test("fetch_users", async ({override}) => {
             avatar_url: "",
             avatar_version: 1,
             is_bot: false,
+            is_imported_stub: false,
         },
         {
             email: "alice@example.com",
@@ -1806,6 +1760,7 @@ run_test("fetch_users", async ({override}) => {
             avatar_url: "",
             avatar_version: 1,
             is_bot: false,
+            is_imported_stub: false,
         },
     ];
 
@@ -1934,6 +1889,7 @@ run_test("fetch_users corner case", async ({override, override_rewire}) => {
             avatar_url: "",
             avatar_version: 1,
             is_bot: false,
+            is_imported_stub: false,
         },
         {
             email: "alice@example.com",
@@ -1949,6 +1905,7 @@ run_test("fetch_users corner case", async ({override, override_rewire}) => {
             avatar_url: "",
             avatar_version: 1,
             is_bot: false,
+            is_imported_stub: false,
         },
     ];
     const second_request_response = [
@@ -1966,6 +1923,7 @@ run_test("fetch_users corner case", async ({override, override_rewire}) => {
             avatar_url: "",
             avatar_version: 1,
             is_bot: false,
+            is_imported_stub: false,
         },
     ];
 
@@ -1985,7 +1943,8 @@ run_test("fetch_users corner case", async ({override, override_rewire}) => {
                 msg: "",
             });
             return;
-        } else if (data.user_ids === "[1,2]") {
+        }
+        if (data.user_ids === "[1,2]") {
             if (!sent_success_response_for_third_user) {
                 error({responseJSON: {msg: "Network error"}});
                 return;
@@ -1999,7 +1958,7 @@ run_test("fetch_users corner case", async ({override, override_rewire}) => {
         }
     });
 
-    override_rewire(util, "get_retry_backoff_seconds", () => 0);
+    override_rewire(retry_backoff, "get_retry_backoff_seconds", () => 0);
     // Check that we retry the request after a failed attempt.
     blueslip.expect(
         "warn",
@@ -2073,6 +2032,78 @@ run_test("get_by_user_id", () => {
             message: "Unknown user_id in get_by_user_id: 8888",
         },
     );
+});
+
+run_test("is_valid_bot_user", () => {
+    initialize();
+    people.add_active_user(bot_botson);
+    people.add_active_user(isaac);
+
+    assert.equal(people.is_valid_bot_user(bot_botson.user_id), true);
+    assert.equal(people.is_valid_bot_user(isaac.user_id), false);
+    assert.equal(people.is_valid_bot_user(me.user_id), false);
+    // Unknown user_id returns false without error (uses ignore_missing).
+    assert.equal(people.is_valid_bot_user(9999), false);
+});
+
+run_test("maybe_get_user_by_id", () => {
+    initialize();
+    people.add_active_user(isaac);
+
+    const user = people.maybe_get_user_by_id(isaac.user_id);
+    assert.equal(user.full_name, "Isaac Newton");
+
+    // With ignore_missing=true, returns undefined without error.
+    assert.equal(people.maybe_get_user_by_id(9999, true), undefined);
+
+    // Without ignore_missing, logs an error and returns undefined.
+    blueslip.expect("error", "Unknown user_id in maybe_get_user_by_id");
+    assert.equal(people.maybe_get_user_by_id(9999), undefined);
+});
+
+run_test("small_avatar_url_for_person", () => {
+    initialize();
+    people.add_active_user(charles);
+    people.add_active_user(maria);
+
+    // User with an explicit avatar_url returns it directly.
+    assert.equal(people.small_avatar_url_for_person(charles), "http://charles.com/foo.png");
+
+    // Current user (me) has no avatar_url set, so falls back to /avatar/{user_id}.
+    assert.equal(people.small_avatar_url_for_person(me), `/avatar/${me.user_id}`);
+
+    // User with avatar_url=null computes a gravatar URL from email.
+    assert.equal(
+        people.small_avatar_url_for_person(maria),
+        "https://secure.gravatar.com/avatar/6dbdd7946b58d8b11351fcb27e5cdd55?d=identicon",
+    );
+    // Verify the gravatar URL was cached on the person object.
+    assert.equal(
+        maria.avatar_url,
+        "https://secure.gravatar.com/avatar/6dbdd7946b58d8b11351fcb27e5cdd55?d=identicon",
+    );
+});
+
+run_test("sender_is_bot", () => {
+    initialize();
+    people.add_active_user(bot_botson);
+    people.add_active_user(isaac);
+
+    assert.equal(people.sender_is_bot({sender_id: bot_botson.user_id}), true);
+    assert.equal(people.sender_is_bot({sender_id: isaac.user_id}), false);
+    assert.equal(people.sender_is_bot({sender_id: me.user_id}), false);
+    assert.equal(people.sender_is_bot({sender_id: undefined}), false);
+});
+
+run_test("sender_is_guest", () => {
+    initialize();
+    people.add_active_user(guest);
+    people.add_active_user(isaac);
+
+    assert.equal(people.sender_is_guest({sender_id: guest.user_id}), true);
+    assert.equal(people.sender_is_guest({sender_id: isaac.user_id}), false);
+    assert.equal(people.sender_is_guest({sender_id: me.user_id}), false);
+    assert.equal(people.sender_is_guest({sender_id: undefined}), false);
 });
 
 run_test("get_user_mentions_for_display", () => {

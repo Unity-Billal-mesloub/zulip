@@ -294,15 +294,23 @@ def user_allows_notifications_in_StreamTopic(
     visibility_policy: int,
     stream_specific_setting: bool | None,
     global_setting: bool,
+    channel_specific_setting_overrides_mute: bool,
 ) -> bool:
     """
     Captures the hierarchy of notification settings, where visibility policy is considered first,
     followed by stream-specific settings, and the global-setting in the UserProfile is the fallback.
+
+    When `channel_specific_setting_overrides_mute` is True (currently used for
+    `wildcard_mentions_notify` setting), `stream_specific_setting` overrides
+    channel mute, but not topic mute.
     """
-    if stream_is_muted and visibility_policy != UserTopic.VisibilityPolicy.UNMUTED:
+    # Muted topics always suppress notifications, regardless of other settings.
+    if visibility_policy == UserTopic.VisibilityPolicy.MUTED:
         return False
 
-    if visibility_policy == UserTopic.VisibilityPolicy.MUTED:
+    if stream_is_muted and visibility_policy != UserTopic.VisibilityPolicy.UNMUTED:
+        if channel_specific_setting_overrides_mute and stream_specific_setting is not None:
+            return stream_specific_setting
         return False
 
     if stream_specific_setting is not None:
@@ -378,11 +386,18 @@ def get_mentioned_user_group(
 
     # We now want to calculate the name of the smallest user group mentioned among
     # all these messages.
-    smallest_user_group_size = math.inf
-    for user_group_id in mentioned_user_group_ids:
-        current_user_group = NamedUserGroup.objects.get(
-            id=user_group_id, realm_for_sharding=user_profile.realm
+    # Deduplicate IDs while preserving message order.
+    unique_user_group_ids = list(dict.fromkeys(mentioned_user_group_ids))
+    user_groups_by_id = {
+        user_group.id: user_group
+        for user_group in NamedUserGroup.objects.filter(
+            id__in=unique_user_group_ids, realm_for_sharding=user_profile.realm
         )
+    }
+
+    smallest_user_group_size = math.inf
+    for user_group_id in unique_user_group_ids:
+        current_user_group = user_groups_by_id[user_group_id]
         current_mentioned_user_group = MentionedUserGroup(
             id=current_user_group.id,
             name=current_user_group.name,

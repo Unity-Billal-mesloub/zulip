@@ -19,6 +19,9 @@ for syntax highlighting. This field is used in the
 
 ## Global times
 
+**Changes**: In Zulip 13.0 (feature level 503), the global time
+syntax only recognizes ISO 8601 formatted timestamps.
+
 **Changes**: In Zulip 12.0 (feature level 451), invalid timestamp formats
 are now rendered as escaped literal text instead of a `<span>` element with
 `timestamp-error` class and an error message.
@@ -418,7 +421,12 @@ available.
 ## Video embeddings and previews
 
 When a Zulip message is sent linking to an uploaded video, Zulip may
-generate a video preview element with the following format.
+generate a video preview element with the following format. Supported
+MIME types are `video/mp4`, `video/quicktime` (i.e., `.mov` files), and
+`video/webm`. Because `video/quicktime` is not supported in every
+browser, the preview element is hidden at render time when the browser
+reports that it cannot play the video; the download link in the
+surrounding `a` tag remains available.
 
 
 ``` html
@@ -435,9 +443,10 @@ generate a video preview element with the following format.
 When the Markdown media syntax is used with an uploaded file with an
 audio `Content-Type`, Zulip will generate an HTML5 `<audio>` player
 element. Supported MIME types are currently `audio/aac`, `audio/flac`,
-`audio/mpeg`, and `audio/wav`.
+`audio/mpeg`, and `audio/wav` (and its `audio/x-wav` and
+`audio/vnd.wave` variants).
 
-For example, `[file.mp3](/user_uploads/path/to/file.mp3)` renders as:
+For example, `![file.mp3](/user_uploads/path/to/file.mp3)` renders as:
 
 ``` html
 <audio controls preload="metadata"

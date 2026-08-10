@@ -5,17 +5,20 @@ const assert = require("node:assert/strict");
 const _ = require("lodash");
 
 const {make_realm} = require("./lib/example_realm.cjs");
+const {make_stream} = require("./lib/example_stream.cjs");
 const {mock_esm, zrequire} = require("./lib/namespace.cjs");
 const {run_test} = require("./lib/test.cjs");
 
-mock_esm("../src/message_store", {
-    get() {
-        return {
+const message_store = zrequire("message_store");
+message_store.set_messages_for_tests([
+    {
+        message: {
             stream_id: 556,
             topic: "general",
-        };
+        },
     },
-});
+]);
+
 const user_topics = mock_esm("../src/user_topics", {
     is_topic_muted() {
         return false;
@@ -42,10 +45,10 @@ const REALM_EMPTY_TOPIC_DISPLAY_NAME = "test general chat";
 
 set_realm(make_realm({realm_empty_topic_display_name: REALM_EMPTY_TOPIC_DISPLAY_NAME}));
 
-const general = {
+const general = make_stream({
     stream_id: 556,
     name: "general",
-};
+});
 
 stream_data.add_sub_for_tests(general);
 
@@ -334,6 +337,40 @@ test("get_list_info unreads", ({override}) => {
         );
     }
 
+    // If there are no unread messages in the channel,
+    // we show the most recent 6 topics (MAX_TOPICS).
+    list_info = get_list_info();
+    assert.equal(list_info.items.length, 6);
+    assert.equal(list_info.more_topics_unreads, 0);
+    assert.equal(list_info.more_topics_have_unread_mention_messages, false);
+    assert.equal(list_info.num_possible_topics, 16);
+    assert.deepEqual(
+        list_info.items.map((li) => li.topic_name),
+        ["topic 0", "topic 1", "topic 2", "topic 3", "topic 4", "topic 5"],
+    );
+
+    // We show the most recent, unmuted MAX_TOPICS
+    // topics in the channel, whether they have
+    // unread messages or not.
+    override(user_topics, "is_topic_muted", (stream_id, topic_name) => {
+        assert.equal(stream_id, general.stream_id);
+        return ["topic 0", "topic 1", "topic 2", "topic 3", "topic 4", "topic 5"].includes(
+            topic_name,
+        );
+    });
+
+    list_info = get_list_info();
+    assert.equal(list_info.items.length, 6);
+    assert.equal(list_info.more_topics_unreads, 0);
+    assert.equal(list_info.more_topics_have_unread_mention_messages, false);
+    assert.equal(list_info.num_possible_topics, 16);
+    assert.deepEqual(
+        list_info.items.map((li) => li.topic_name),
+        ["topic 6", "topic 7", "topic 8", "topic 9", "topic 10", "topic 11"],
+    );
+
+    override(user_topics, "is_topic_muted", () => false);
+
     /*
         We have 16 topics, but we only show up
         to 10 topics, depending on how many have
@@ -390,6 +427,35 @@ test("get_list_info unreads", ({override}) => {
             "topic 13",
         ],
     );
+
+    // If there is an active topic, then it's shown, even
+    // if it's an older topic with no unread messages.
+    override(narrow_state, "stream_id", () => 556);
+    override(narrow_state, "topic", () => "topic 15");
+    list_info = get_list_info();
+    assert.equal(list_info.items.length, 11);
+    assert.equal(list_info.more_topics_unreads, 2);
+    assert.equal(list_info.more_topics_have_unread_mention_messages, true);
+    assert.equal(list_info.num_possible_topics, 16);
+
+    assert.deepEqual(
+        list_info.items.map((li) => li.topic_name),
+        [
+            "topic 0",
+            "topic 1",
+            "topic 2",
+            "topic 3",
+            "topic 4",
+            "topic 5",
+            "topic 10",
+            "topic 11",
+            "topic 12",
+            "topic 13",
+            "topic 15",
+        ],
+    );
+
+    override(narrow_state, "topic", () => {});
 
     add_unreads("topic 9", 1);
 

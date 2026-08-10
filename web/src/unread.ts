@@ -35,7 +35,7 @@ import * as util from "./util.ts";
 export let old_unreads_missing = false;
 // Note this doesn't handle the case of `old_unreads_missing` because
 // it is simpler and we as a client are not expected to.
-export let first_unread_unmuted_message_id = Number.POSITIVE_INFINITY;
+export let first_unread_unmuted_message_id = Infinity;
 
 export function clear_old_unreads_missing(): void {
     old_unreads_missing = false;
@@ -281,6 +281,26 @@ class UnreadTopicCounter {
         const {stream_id, topic} = stream_topic;
         this.bucketer.get(stream_id)?.get(topic)?.delete(message_id);
         this.reverse_lookup.delete(message_id);
+    }
+
+    update_topic_name_case(stream_id: number, old_topic: string, new_topic: string): void {
+        const per_stream_bucketer = this.bucketer.get(stream_id);
+        if (per_stream_bucketer === undefined) {
+            return;
+        }
+
+        const topic_bucket = per_stream_bucketer.get(old_topic);
+        if (topic_bucket === undefined) {
+            return;
+        }
+
+        // Resetting with new_topic updates the display casing for
+        // topic_bucket.
+        per_stream_bucketer.set(new_topic, topic_bucket);
+
+        for (const message_id of topic_bucket) {
+            this.reverse_lookup.set(message_id, {stream_id, topic: new_topic});
+        }
     }
 
     get_counts_per_topic(): UnreadTopicCounts {
@@ -729,6 +749,14 @@ export function update_unread_topics(
     });
 }
 
+export function update_unread_topic_name_case(
+    stream_id: number,
+    old_topic: string,
+    new_topic: string,
+): void {
+    unread_topic_counter.update_topic_name_case(stream_id, old_topic, new_topic);
+}
+
 export function process_loaded_messages(
     messages: Message[],
     expect_no_new_unreads = false,
@@ -814,9 +842,7 @@ export function process_unread_message(message: UnreadMessageData): void {
             message_id: message.id,
             user_ids_string: message.user_ids_string,
         });
-    }
-
-    if (message.type === "stream") {
+    } else if (message.type === "stream") {
         unread_topic_counter.add({
             message_id: message.id,
             stream_id: message.stream_id,
@@ -938,7 +964,7 @@ export function get_counts(): FullUnreadCountsData {
     const update_first_unmuted_message_id = true;
     // Reset the first_unread_unmuted_message_id, to ensure it is always capture the
     // minimum of current unread messages between topics and DMs.
-    first_unread_unmuted_message_id = Number.POSITIVE_INFINITY;
+    first_unread_unmuted_message_id = Infinity;
     const topic_res = unread_topic_counter.get_counts(update_first_unmuted_message_id);
     const pm_res = unread_direct_message_counter.get_counts(update_first_unmuted_message_id);
 
@@ -966,7 +992,7 @@ export function get_counts(): FullUnreadCountsData {
 
 // Saves us from calling to get_counts() when we can avoid it.
 export function calculate_notifiable_count(res: FullUnreadCountsData): number {
-    let new_message_count = 0;
+    let new_message_count;
 
     const only_show_dm_mention =
         user_settings.desktop_icon_count_display ===
@@ -1120,9 +1146,10 @@ export function initialize(params: StateData["unread"]): void {
     unread_direct_message_counter.set_direct_message_groups(unread_msgs.huddles);
     unread_direct_message_counter.set_pms(unread_msgs.pms);
     unread_topic_counter.set_streams(unread_msgs.streams);
+    const direct_message_ids = new Set(unread_direct_message_counter.get_msg_ids());
     for (const message_id of unread_msgs.mentions) {
         unread_mentions_counter.add(message_id);
-        if (unread_direct_message_counter.get_msg_ids().includes(message_id)) {
+        if (direct_message_ids.has(message_id)) {
             direct_message_with_mention_count.add(message_id);
         }
     }

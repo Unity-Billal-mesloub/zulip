@@ -1,4 +1,4 @@
-/* global $, CSS */
+/* global CSS, zulip_test */
 
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -66,17 +66,20 @@ async function run(): Promise<void> {
         await page.goto(`${realmUrl}/#narrow/id/${messageId}`, {
             waitUntil: "networkidle2",
         });
-        // eslint-disable-next-line no-undef
         const message_list_id = await page.evaluate(() => zulip_test.current_msg_list?.id);
         assert.ok(message_list_id !== undefined);
         const messageSelector = `#message-row-${message_list_id}-${CSS.escape(messageId)}`;
         await page.waitForSelector(messageSelector);
         // remove unread marker and don't select message
         const marker = `#message-row-${message_list_id}-${CSS.escape(messageId)} .unread_marker`;
-        await page.evaluate((sel) => $(sel).remove(), marker);
+        await page.$eval(marker, (element) => {
+            element.remove();
+        });
         const messageBox = await page.$(messageSelector);
         assert.ok(messageBox !== null);
-        await page.evaluate((msg) => $(msg).removeClass("selected_message"), messageSelector);
+        await page.$eval(messageSelector, (element) => {
+            element.classList.remove("selected_message");
+        });
         const messageGroup = await messageBox.$("xpath/..");
         assert.ok(messageGroup !== null);
         // Compute screenshot area, with some padding around the message group

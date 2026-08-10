@@ -6,6 +6,7 @@ from django.db import transaction
 from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
 from django.shortcuts import render
 from django.urls import reverse
+from django.utils.crypto import constant_time_compare
 from django.utils.translation import gettext as _
 from pydantic import Json
 
@@ -21,7 +22,6 @@ from zerver.lib.exceptions import (
     ErrorCode,
     JsonableError,
     MissingRemoteRealmError,
-    OrganizationOwnerRequiredError,
     PushServiceNotConfiguredError,
     RemoteRealmServerMismatchError,
     ResourceNotFoundError,
@@ -37,7 +37,7 @@ from zerver.lib.push_notifications import (
     validate_token,
 )
 from zerver.lib.push_registration import RegisterPushDeviceToBouncerQueueItem, check_push_key
-from zerver.lib.queue import queue_event_on_commit
+from zerver.lib.queue import mobile_notifications_queue_name, queue_event_on_commit
 from zerver.lib.remote_server import (
     SELF_HOSTING_REGISTRATION_TAKEOVER_CHALLENGE_TOKEN_REDIS_KEY,
     UserDataForRemoteBilling,
@@ -147,6 +147,11 @@ def send_e2ee_test_push_notification_api(
     return json_success(request)
 
 
+class CannotManageRemoteBillingError(JsonableError):
+    def __init__(self) -> None:
+        super().__init__(_("You do not have permission to manage plans and billing."))
+
+
 def self_hosting_auth_view_common(
     request: HttpRequest, user_profile: UserProfile, next_page: str | None = None
 ) -> str:
@@ -155,7 +160,7 @@ def self_hosting_auth_view_common(
         # but this endpoint shouldn't be accessible via the UI to an unauthorized
         # user_profile - and they need to directly enter the URL in their browser. So a json
         # error may be sufficient.
-        raise OrganizationOwnerRequiredError
+        raise CannotManageRemoteBillingError
 
     if not uses_notification_bouncer():
         if settings.CORPORATE_ENABLED:
@@ -257,7 +262,7 @@ def self_hosting_auth_not_configured(request: HttpRequest) -> HttpResponse:
     assert user.is_authenticated
     assert isinstance(user, UserProfile)
     if not user.has_billing_access:
-        raise OrganizationOwnerRequiredError
+        raise CannotManageRemoteBillingError
 
     if settings.CORPORATE_ENABLED or uses_notification_bouncer():
         # This error page should only be available if the config error
@@ -290,7 +295,7 @@ def self_hosting_registration_transfer_challenge_verify(
         raise VerificationSecretNotPreparedError
 
     data = orjson.loads(json_data)
-    if data["access_token"] != access_token:
+    if not constant_time_compare(data["access_token"], access_token):
         # Without knowing the access_token, the client gets the same error
         # as if we're not serving the verification secret at all.
         raise VerificationSecretNotPreparedError
@@ -415,7 +420,7 @@ def register_push_device(
             "token_id_base64": token_id_base64,
         }
         queue_event_on_commit(
-            "missedmessage_mobile_notifications",
+            mobile_notifications_queue_name(user_profile.id),
             {
                 "type": "register_push_device_to_bouncer",
                 "payload": queue_item,

@@ -1,4 +1,6 @@
 ---
+/* eslint-disable unicorn/better-dom-traversing */
+
 import assert from "node:assert/strict";
 
 import type {Element} from "hast";
@@ -10,11 +12,9 @@ import lightbulb_svg from "../../../web/icons/lightbulb.svg?raw";
 const lightbulb_icon_fragment = fromHtml(lightbulb_svg, {fragment: true});
 const lightbulb_icon_first_child = lightbulb_icon_fragment.children[0]!;
 assert.ok(
-    lightbulb_icon_first_child.type === "element" &&
-        lightbulb_icon_first_child.tagName === "svg",
+    lightbulb_icon_first_child.type === "element" && lightbulb_icon_first_child.tagName === "svg",
 );
-lightbulb_icon_first_child.properties.class =
-    "zulip-unplugin-icon aside-icon-lightbulb";
+lightbulb_icon_first_child.properties.class = "zulip-unplugin-icon aside-icon-lightbulb";
 
 // We want to add the `Tip: ` prefix without a line break or wrapping
 // it in a paragraph. If we write `Tip: <slot />`, slot will be wrapped
@@ -58,7 +58,7 @@ first_element.children = [...prefix_element_list, ...first_element.children];
 tree.children[0] = first_element;
 ---
 
-<aside aria-label="Tip" class=`starlight-aside starlight-aside--tip`>
+<aside aria-label="Tip" class="starlight-aside starlight-aside--tip">
     <div class="starlight-aside__content">
         <Fragment set:html={toHtml(tree)} />
     </div>

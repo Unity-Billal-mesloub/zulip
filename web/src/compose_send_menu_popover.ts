@@ -1,4 +1,5 @@
-import $ from "jquery";
+import autosize from "autosize";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as tippy from "tippy.js";
 
@@ -54,6 +55,10 @@ export function open_schedule_message_menu(
                 },
             ],
         },
+        onHide() {
+            // onHide returning false prevents Tippy from closing the popover when flatpickr is open.
+            return flatpickr.is_open() ? false : undefined;
+        },
         onShow(instance) {
             // Only show send later options that are possible today.
             const date = new Date();
@@ -83,6 +88,18 @@ export function open_schedule_message_menu(
                 );
             }
             const $popper = $(instance.popper);
+            const $reminder_note_textarea = $popper.find<HTMLTextAreaElement>(
+                "textarea.schedule-reminder-note",
+            );
+
+            if ($reminder_note_textarea.length > 0) {
+                $reminder_note_textarea.off("autosize:resized").on("autosize:resized", () => {
+                    // Keep popper visible in viewport when textarea height increases.
+                    void instance.popperInstance?.update();
+                });
+                autosize($reminder_note_textarea);
+            }
+
             const message_schedule_callback = (time: string | number): void => {
                 if (remind_message_id !== undefined) {
                     do_schedule_reminder(
@@ -276,7 +293,6 @@ export function initialize(): void {
                 // time.
                 compose_state.prevent_draft_restoring();
                 compose.clear_compose_box();
-                compose.clear_preview_area();
                 popover_menus.hide_current_popover_if_visible(instance);
             });
         },

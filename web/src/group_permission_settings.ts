@@ -4,6 +4,7 @@ import * as z from "zod/mini";
 import * as blueslip from "./blueslip.ts";
 import type * as dropdown_widget from "./dropdown_widget.ts";
 import {$t} from "./i18n.ts";
+import {page_params} from "./page_params.ts";
 import * as settings_config from "./settings_config.ts";
 import {realm} from "./state_data.ts";
 import type {GroupPermissionSetting, GroupSettingValue} from "./state_data.ts";
@@ -64,6 +65,7 @@ const realm_group_setting_names_supporting_anonymous_groups = [
     "create_multiuse_invite_group",
     "direct_message_initiator_group",
     "direct_message_permission_group",
+    "workplace_users_group",
 ] as const;
 
 export const realm_group_setting_name_schema = z.enum([
@@ -225,6 +227,17 @@ export function get_assigned_permission_object(
                         "This permission cannot be removed, as it would mean that nobody is allowed to take this action.",
                 });
             }
+
+            if (
+                setting_name === "workplace_users_group" &&
+                page_params.is_cloud_realm_with_discounted_plan
+            ) {
+                assigned_permission_object.can_edit = false;
+                assigned_permission_object.tooltip_message = $t(
+                    {defaultMessage: "Contact {sales_email} to change this setting."},
+                    {sales_email: "sales@zulip.com"},
+                );
+            }
             return assigned_permission_object;
         }
 
@@ -265,6 +278,17 @@ export function get_assigned_permission_object(
                 });
             }
         }
+
+        if (
+            setting_name === "workplace_users_group" &&
+            page_params.is_cloud_realm_with_discounted_plan
+        ) {
+            assigned_permission_object.can_edit = false;
+            assigned_permission_object.tooltip_message = $t(
+                {defaultMessage: "Contact {sales_email} to change this setting."},
+                {sales_email: "sales@zulip.com"},
+            );
+        }
         return assigned_permission_object;
     }
 
@@ -296,8 +320,8 @@ export function check_group_permission_settings_data(): void {
     }
 
     if (
-        !all_realm_group_settings.every((setting_name) =>
-            realm_group_settings_with_subsection_data.has(setting_name),
+        all_realm_group_settings.some(
+            (setting_name) => !realm_group_settings_with_subsection_data.has(setting_name),
         )
     ) {
         blueslip.error("Settings missing in 'settings_config.realm_group_permission_settings'");
@@ -308,8 +332,8 @@ export function check_group_permission_settings_data(): void {
         Object.keys(settings_config.all_group_setting_labels.realm),
     );
     if (
-        !all_realm_group_settings.every((setting_name) =>
-            realm_group_setting_label_object_keys.has(setting_name),
+        all_realm_group_settings.some(
+            (setting_name) => !realm_group_setting_label_object_keys.has(setting_name),
         )
     ) {
         blueslip.error("Settings missing in 'settings_config.all_group_setting_labels.realm'");
@@ -323,8 +347,8 @@ export function check_group_permission_settings_data(): void {
         settings_config.stream_group_permission_settings,
     );
     if (
-        !all_stream_group_settings.every((setting_name) =>
-            stream_group_permission_settings.has(setting_name),
+        all_stream_group_settings.some(
+            (setting_name) => !stream_group_permission_settings.has(setting_name),
         )
     ) {
         blueslip.error("Settings missing in 'settings_config.stream_group_permission_settings'");
@@ -335,8 +359,8 @@ export function check_group_permission_settings_data(): void {
         Object.keys(settings_config.all_group_setting_labels.stream),
     );
     if (
-        !all_stream_group_settings.every((setting_name) =>
-            stream_group_setting_label_object_keys.has(setting_name),
+        all_stream_group_settings.some(
+            (setting_name) => !stream_group_setting_label_object_keys.has(setting_name),
         )
     ) {
         blueslip.error("Settings missing in 'settings_config.all_group_setting_labels.stream'");
@@ -346,8 +370,8 @@ export function check_group_permission_settings_data(): void {
     const all_group_group_settings = get_group_permission_settings();
     const group_group_permission_settings = new Set(settings_config.group_permission_settings);
     if (
-        !all_group_group_settings.every((setting_name) =>
-            group_group_permission_settings.has(setting_name),
+        all_group_group_settings.some(
+            (setting_name) => !group_group_permission_settings.has(setting_name),
         )
     ) {
         blueslip.error("Settings missing in 'settings_config.group_permission_settings'");
@@ -358,8 +382,8 @@ export function check_group_permission_settings_data(): void {
         Object.keys(settings_config.all_group_setting_labels.group),
     );
     if (
-        !all_group_group_settings.every((setting_name) =>
-            group_group_setting_label_object_keys.has(setting_name),
+        all_group_group_settings.some(
+            (setting_name) => !group_group_setting_label_object_keys.has(setting_name),
         )
     ) {
         blueslip.error("Settings missing in 'settings_config.all_group_setting_labels.group'");

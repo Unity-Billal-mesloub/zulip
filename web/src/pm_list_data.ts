@@ -68,7 +68,11 @@ export function get_conversations(search_string = ""): DisplayObject[] {
             .map((conversation) => conversation.user_ids_string)
             .includes(active_user_ids_string)
     ) {
-        conversations.unshift({user_ids_string: active_user_ids_string, max_message_id: -1});
+        conversations.unshift({
+            user_ids_string: active_user_ids_string,
+            max_message_id: -1,
+            local_message_count: 0,
+        });
     }
 
     for (const conversation of conversations) {
@@ -167,9 +171,11 @@ export function get_list_info(
         // We don't need to filter muted users here, because
         // pm_conversations.ts takes care of this for us.
 
-        // Conversations that include any deactivated users should
-        // only be visible in the unzoomed view.
-        if (conversation.includes_deactivated_user) {
+        // Conversations that include any deactivated users are
+        // hidden from the unzoomed view to declutter the sidebar,
+        // unless they have unread messages since that's still worth
+        // showing.
+        if (conversation.includes_deactivated_user && conversation.unread === 0) {
             return false;
         }
 

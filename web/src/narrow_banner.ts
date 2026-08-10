@@ -1,10 +1,12 @@
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
 import assert from "minimalistic-assert";
 
 import * as compose_validate from "./compose_validate.ts";
 import type {Filter} from "./filter.ts";
+import * as hash_util from "./hash_util.ts";
 import {$t, $t_html} from "./i18n.ts";
+import * as message_feed_top_notices from "./message_feed_top_notices.ts";
 import * as message_lists from "./message_lists.ts";
 import type {NarrowBannerData, SearchData} from "./narrow_error.ts";
 import {narrow_error} from "./narrow_error.ts";
@@ -80,8 +82,44 @@ const MUTED_TOPICS_IN_CHANNEL_EMPTY_BANNER = {
 };
 
 const NO_SEARCH_RESULTS_TITLE = $t({defaultMessage: "No search results."});
+const NO_SEARCH_RESULTS_TITLE_HTML = $t_html(
+    {
+        defaultMessage: "No search results from <z-link>your message history</z-link>.",
+    },
+    {
+        "z-link": (content_html) =>
+            `<a href="/help/search-for-messages#search-shared-history" target="_blank" rel="noopener noreferrer">${content_html.join(
+                "",
+            )}</a>`,
+    },
+);
 
-function empty_search_query_banner(current_filter: Filter): NarrowBannerData {
+function should_show_search_shared_history_action(
+    current_filter: Filter,
+    invalid_narrow: boolean,
+): boolean {
+    return current_filter.may_have_incomplete_message_history() && !invalid_narrow;
+}
+
+// When we're offering the search shared history in banner, the title
+// links to the relevant help center page; otherwise it's plain text.
+function get_no_search_results_title(
+    show_search_shared_history: boolean,
+): {title: string} | {title_html: string} {
+    if (show_search_shared_history) {
+        return {
+            title_html: NO_SEARCH_RESULTS_TITLE_HTML,
+        };
+    }
+
+    return {title: NO_SEARCH_RESULTS_TITLE};
+}
+
+function empty_search_query_banner(
+    current_filter: Filter,
+    show_search_shared_history: boolean,
+): NarrowBannerData {
+    const no_search_results = get_no_search_results_title(show_search_shared_history);
     const search_query = current_filter.terms_with_operator("search")[0]!.operand;
     const query_words = search_query.split(" ");
 
@@ -92,7 +130,7 @@ function empty_search_query_banner(current_filter: Filter): NarrowBannerData {
 
     // Gather information about each query word
     for (const query_word of query_words) {
-        if (realm.stop_words.includes(query_word)) {
+        if (realm.stop_words.includes(query_word.toLowerCase())) {
             search_string_result.has_stop_word = true;
             search_string_result.query_words.push({
                 query_word,
@@ -110,14 +148,50 @@ function empty_search_query_banner(current_filter: Filter): NarrowBannerData {
     // when there are excluded stop words.
     if (search_string_result.has_stop_word) {
         return {
-            title: NO_SEARCH_RESULTS_TITLE,
+            ...no_search_results,
+            show_action: show_search_shared_history,
             search_data: search_string_result,
         };
     }
-    return {title: NO_SEARCH_RESULTS_TITLE};
+    return {...no_search_results, show_action: show_search_shared_history};
 }
 
-export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerData {
+// Returns a banner describing why direct messages to these users are
+// not allowed, or undefined if they are permitted.
+function dm_permission_error_banner(user_ids_string: string): NarrowBannerData | undefined {
+    const direct_message_error_string =
+        compose_validate.check_dm_permissions_and_get_error_string(user_ids_string);
+    if (direct_message_error_string === "") {
+        return undefined;
+    }
+    return {
+        title: direct_message_error_string,
+        html: $t_html(
+            {
+                defaultMessage: "<z-link>Learn more.</z-link>",
+            },
+            {
+                "z-link": (content_html) =>
+                    `<a target="_blank" rel="noopener noreferrer" href="/help/restrict-direct-messages">${content_html.join("")}</a>`,
+            },
+        ),
+    };
+}
+
+export function pick_empty_narrow_banner(
+    current_filter: Filter,
+    invalid_narrow = false,
+): NarrowBannerData {
+    // Show the "search shared history" help link and action button only for
+    // banners where the user's message history may be incomplete in a valid
+    // narrow. Some compatible banners do not show them because the user lacks
+    // permission to search shared history or the corresponding view is not
+    // available.
+    const show_search_shared_history = should_show_search_shared_history_action(
+        current_filter,
+        invalid_narrow,
+    );
+    const no_search_results = get_no_search_results_title(show_search_shared_history);
     const default_banner = {
         title: $t({defaultMessage: "There are no messages here."}),
         // Spectators cannot start a conversation.
@@ -197,7 +271,7 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
 
         // For empty search queries, we display excluded stop words
         if (current_filter.terms_with_operator("search").length > 0) {
-            return empty_search_query_banner(current_filter);
+            return empty_search_query_banner(current_filter, show_search_shared_history);
         }
 
         if (
@@ -251,7 +325,8 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
 
         // For other multi-operator narrows, we just use the default banner
         return {
-            title: NO_SEARCH_RESULTS_TITLE,
+            ...no_search_results,
+            show_action: show_search_shared_history,
         };
     }
 
@@ -287,7 +362,19 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
                     };
                 case "resolved":
                     return {
-                        title: $t({defaultMessage: "No topics are marked as resolved."}),
+                        title_html: $t_html(
+                            {
+                                defaultMessage:
+                                    "No topics in <z-link>your history</z-link> are marked as resolved.",
+                            },
+                            {
+                                "z-link": (content_html) =>
+                                    `<a href="/help/search-for-messages#search-shared-history" target="_blank" rel="noopener noreferrer">${content_html.join(
+                                        "",
+                                    )}</a>`,
+                            },
+                        ),
+                        show_action: show_search_shared_history,
                     };
                 case "followed":
                     return {
@@ -299,6 +386,11 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
                         title: $t({
                             defaultMessage: "You have no messages in muted topics and channels.",
                         }),
+                    };
+                case "alerted":
+                    return {
+                        title_html: NO_SEARCH_RESULTS_TITLE_HTML,
+                        show_action: show_search_shared_history,
                     };
             }
             // fallthrough to default case if no match is found
@@ -344,9 +436,15 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
             // else fallthrough to default case
             break;
         }
+        case "channels": {
+            return {
+                title: $t({defaultMessage: "There are no messages here."}),
+                html: "",
+            };
+        }
         case "search": {
             // You are narrowed to empty search results.
-            return empty_search_query_banner(current_filter);
+            return empty_search_query_banner(current_filter, show_search_shared_history);
         }
         case "dm": {
             if (!people.is_valid_bulk_user_ids_for_compose(first_term.operand, true)) {
@@ -362,26 +460,14 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
             const user_ids = first_term.operand;
             assert(user_ids?.[0] !== undefined);
             const user_ids_string = util.sorted_ids(user_ids).join(",");
-            const direct_message_error_string =
-                compose_validate.check_dm_permissions_and_get_error_string(user_ids_string);
-            if (direct_message_error_string) {
-                return {
-                    title: direct_message_error_string,
-                    html: $t_html(
-                        {
-                            defaultMessage: "<z-link>Learn more.</z-link>",
-                        },
-                        {
-                            "z-link": (content_html) =>
-                                `<a target="_blank" rel="noopener noreferrer" href="/help/restrict-direct-messages">${content_html.join("")}</a>`,
-                        },
-                    ),
-                };
+            const dm_permission_error = dm_permission_error_banner(user_ids_string);
+            if (dm_permission_error) {
+                return dm_permission_error;
             }
             if (user_ids.length === 1) {
-                const recipient_user = people.get_by_user_id(user_ids[0]);
+                const user_id = user_ids[0];
                 // You have no direct messages with this person
-                if (people.is_my_user_id(recipient_user.user_id)) {
+                if (people.is_my_user_id(user_id)) {
                     return {
                         title: $t({
                             defaultMessage: "You haven't sent yourself any notes yet!",
@@ -393,13 +479,13 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
                     };
                 }
                 // If the recipient is deactivated, we cannot start the conversation.
-                if (!people.is_person_active(recipient_user.user_id)) {
+                if (!people.is_person_active(user_id)) {
                     return {
                         title: $t(
                             {
                                 defaultMessage: "You have no direct messages with {person}.",
                             },
-                            {person: recipient_user.full_name},
+                            {person: people.get_full_name(user_id)},
                         ),
                     };
                 }
@@ -408,7 +494,7 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
                         {
                             defaultMessage: "You have no direct messages with {person} yet.",
                         },
-                        {person: recipient_user.full_name},
+                        {person: people.get_full_name(user_id)},
                     ),
                     html: $t_html(
                         {
@@ -454,6 +540,7 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
                         },
                         {person: sender.full_name},
                     ),
+                    show_action: show_search_shared_history,
                 };
             }
             return {
@@ -473,36 +560,23 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
                 };
             }
             const valid_people_in_dms: people.User[] = [];
-            for (const user of people_in_dms.values()) {
+            for (const user of people_in_dms) {
                 if (user === undefined) {
                     return {
-                        // We intentionally give the same non-specific
-                        // error message as the single user case,
+                        // We don't pinpoint which user is invalid,
                         // since we don't display API email addresses
                         // or user IDs typically in UI errors, and we
                         // don't have any other handle as to which
                         // user this was supposed to be.
-                        title: $t({defaultMessage: "This user does not exist!"}),
+                        title: $t({defaultMessage: "One or more of these users do not exist!"}),
                     };
                 }
                 valid_people_in_dms.push(user);
             }
             const person_id_string = valid_people_in_dms.map((user) => user.user_id).join(",");
-            const direct_message_error_string =
-                compose_validate.check_dm_permissions_and_get_error_string(person_id_string);
-            if (direct_message_error_string) {
-                return {
-                    title: direct_message_error_string,
-                    html: $t_html(
-                        {
-                            defaultMessage: "<z-link>Learn more.</z-link>",
-                        },
-                        {
-                            "z-link": (content_html) =>
-                                `<a target="_blank" rel="noopener noreferrer" href="/help/restrict-direct-messages">${content_html.join("")}</a>`,
-                        },
-                    ),
-                };
+            const dm_permission_error = dm_permission_error_banner(person_id_string);
+            if (dm_permission_error) {
+                return dm_permission_error;
             }
             if (
                 valid_people_in_dms.length === 1 &&
@@ -523,14 +597,64 @@ export function pick_empty_narrow_banner(current_filter: Filter): NarrowBannerDa
                 ),
             };
         }
+
+        case "mentions": {
+            const mentioned_user = people.maybe_get_user_by_id(first_term.operand, true);
+
+            if (!mentioned_user) {
+                return {
+                    title: $t({defaultMessage: "This user does not exist!"}),
+                };
+            }
+
+            // mentions:me is redirected to is:mentioned in Filter.parse(),
+            // so mentioned_user will never be the current user here.
+            return {
+                title_html: $t_html(
+                    {
+                        defaultMessage:
+                            "No messages in <z-link>your message history</z-link> mention {person} yet.",
+                    },
+                    {
+                        "z-link": (content_html) =>
+                            `<a href="/help/search-for-messages#search-shared-history" target="_blank" rel="noopener noreferrer">${content_html.join("")}</a>`,
+                        person: mentioned_user.full_name,
+                    },
+                ),
+                show_action: show_search_shared_history,
+            };
+        }
+
+        case "has": {
+            return {
+                title_html: NO_SEARCH_RESULTS_TITLE_HTML,
+                show_action: show_search_shared_history,
+            };
+        }
     }
     return default_banner;
 }
 
-export function show_empty_narrow_message(current_filter: Filter): void {
+export function show_empty_narrow_message(current_filter: Filter, invalid_narrow = false): void {
     $(".empty_feed_notice_main").empty();
-    const rendered_narrow_banner = narrow_error(pick_empty_narrow_banner(current_filter));
+    const rendered_narrow_banner = narrow_error(
+        pick_empty_narrow_banner(current_filter, invalid_narrow),
+    );
     $(".empty_feed_notice_main").html(rendered_narrow_banner);
+
+    // Removing messages from the current narrow can leave a stale
+    // top-of-feed notice visible, so hide all of them before showing
+    // the empty-narrow banner.
+    message_feed_top_notices.hide_top_of_narrow_notices();
+
+    if (current_filter.may_have_incomplete_message_history()) {
+        $(".empty_feed_notice .empty-feed-notice-action").show();
+
+        const terms = current_filter.terms();
+        const update_hash = hash_util.search_public_streams_notice_url(terms);
+
+        $(".empty_feed_notice .search-shared-history").attr("data-url", update_hash);
+    }
 }
 
 export function hide_empty_narrow_message(): void {

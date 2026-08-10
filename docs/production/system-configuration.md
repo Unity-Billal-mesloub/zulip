@@ -16,6 +16,15 @@ The `zulip-puppet-apply` command will display the configuration
 changes it will make and prompt for you to confirm you'd like to make
 those changes, before executing them (if you approve).
 
+:::{important}
+
+If you are using [Docker](docker.md), see
+{doc}`docker:how-to/compose-settings` and
+{doc}`docker:reference/environment-vars` for configuring
+`zulip.conf` via `CONFIG_*` environment variables.
+
+:::
+
 ### Truthy values
 
 When a setting refers to "set to true" or "set to false", the values
@@ -104,6 +113,28 @@ SSL/TLS termination.
 Set to the port number if you [prefer to listen on a port other than
 443](deployment.md#using-an-alternate-port).
 
+#### `nginx_server_name`
+
+Sets the [`server_name`][nginx_server_name] directive on Zulip's
+nginx `server` blocks; by default it is unset, so they match any
+hostname. Set it if you run other software alongside Zulip whose
+nginx configuration would otherwise claim requests meant for Zulip.
+List every hostname Zulip is served on, separated by spaces,
+including those on its TLS certificate; otherwise automatic
+certificate renewal will fail.
+
+If Zulip is served on more than one hostname, or on a hostname plus
+several subdomains, list them all; nginx's `server_name` supports a
+trailing wildcard for matching subdomains. For example, to serve
+Zulip on both `example.com` and any subdomain of it:
+
+```ini
+[application_server]
+nginx_server_name = example.com *.example.com
+```
+
+[nginx_server_name]: https://nginx.org/en/docs/http/server_names.html
+
 #### `nginx_worker_processes`
 
 Adjusts the [`worker_processes`][nginx_worker_processes] setting in
@@ -138,6 +169,17 @@ unless a [memory limit is set][docker-memory-limit], as well as when
 using remote servers for PostgreSQL, memcached, Redis, and RabbitMQ.
 
 [docker-memory-limit]: https://docs.docker.com/reference/compose-file/deploy/#memory
+
+#### `dedicated_soft_reactivation_queue`
+
+When a long-term-idle user returns, Zulip backfills the message-history
+rows that were skipped while they were idle; this "soft reactivation"
+can take many seconds. By default it runs in the shared `deferred_work`
+queue, alongside jobs such as data exports that can take minutes. Set
+this to true to process soft reactivations in a dedicated queue (and, in
+multiprocess mode, a dedicated worker process), so they aren't delayed
+behind such jobs. This costs an additional worker process, so it is most
+useful on large servers; smaller servers should leave it disabled.
 
 #### `rolling_restart`
 

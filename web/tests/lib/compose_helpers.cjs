@@ -2,8 +2,7 @@
 
 const assert = require("node:assert/strict");
 
-const {noop} = require("./test.cjs");
-const $ = require("./zjquery.cjs");
+const {$} = require("./zjquery.cjs");
 
 class FakeComposeBox {
     constructor() {
@@ -14,17 +13,26 @@ class FakeComposeBox {
         // Simulate DOM relationships
         this.$send_message_form.set_find_results(".message-textarea", this.$content_textarea);
 
+        // These are needed by compose_ui.enter_preview_mode() and
+        // compose_ui.exit_preview_mode(), which use $container.find().
+        const $compose = $("#compose");
+        $compose.set_find_results("textarea.message-textarea", this.$content_textarea);
+        $compose.set_find_results(
+            ".preview_mode_disabled .compose_control_button",
+            $("#compose .preview_mode_disabled .compose_control_button"),
+        );
+        $compose.set_find_results(".markdown_preview", $("#compose .markdown_preview"));
+        $compose.set_find_results(".undo_markdown_preview", $("#compose .undo_markdown_preview"));
+        $compose.set_find_results(".preview_message_area", this.$preview_message_area);
+        $compose.set_find_results(".preview_content", $("#compose .preview_content"));
+
         this.$send_message_form.set_find_results(
             ".message-limit-indicator",
             $(".message-limit-indicator"),
         );
 
-        const $message_row_stub = $.create("message_row_stub");
-        this.$content_textarea.closest = (selector) => {
-            assert.equal(selector, ".message_row");
-            $message_row_stub.length = 0;
-            return $message_row_stub;
-        };
+        const $message_row_stub = $.set_results("message_row_stub", []);
+        this.$content_textarea.set_closest_results(".message_row", $message_row_stub);
 
         this.reset();
     }
@@ -33,14 +41,13 @@ class FakeComposeBox {
         $(".message-limit-indicator").html("");
         $(".message-limit-indicator").text("");
 
-        $("#compose_banners .user_not_subscribed").length = 0;
+        $.reset_selector("#compose_banners .user_not_subscribed");
+        $.set_results("#compose_banners .user_not_subscribed", []);
 
-        this.$content_textarea.toggleClass = noop;
         this.$content_textarea.set_height(50);
         this.$content_textarea.val("default message");
         this.$content_textarea.trigger("blur");
 
-        this.$preview_message_area.css = noop;
         $(".compose-submit-button .loader").show();
     }
 
@@ -88,10 +95,6 @@ class FakeComposeBox {
 
     show_submit_button_spinner() {
         $(".compose-submit-button .loader").show();
-    }
-
-    set_textarea_toggle_class_function(f) {
-        this.$content_textarea.toggleClass = f;
     }
 
     is_recipient_not_subscribed_banner_visible() {
@@ -185,9 +188,8 @@ function forward_channel_message_template(opts) {
     const channel_name = name;
     const {sender_full_name, sender_id, id, topic} = selected_message;
     const near_url = `http://zulip.zulipdev.com/#narrow/channel/${stream_id}-${channel_name}/topic/${topic}/near/${id}`;
-    const with_url = `#narrow/channel/${stream_id}-${channel_name}/topic/${topic}/with/${id}`;
-    const topic_link_syntax = `[#**${channel_name}>${topic}**](${with_url})`;
-    return `translated: @_**${sender_full_name}|${sender_id}** [said](${near_url}) in ${topic_link_syntax}:
+    const topic_link = `#**${channel_name}>${topic}**`;
+    return `translated: @_**${sender_full_name}|${sender_id}** [said](${near_url}) in ${topic_link}:
 ${fence}quote
 ${content}
 ${fence}`;

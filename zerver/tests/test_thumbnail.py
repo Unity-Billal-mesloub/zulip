@@ -31,8 +31,9 @@ from zerver.lib.upload import (
     all_message_attachments,
     attachment_source,
     create_attachment,
+    generate_message_upload_path,
     save_attachment_contents,
-    upload_backend,
+    store_message_attachment,
 )
 from zerver.models import Attachment, ImageAttachment
 from zerver.views.upload import closest_thumbnail_format
@@ -734,16 +735,41 @@ class TestStoreThumbnail(ZulipTestCase):
             )
             image_attachment.content_type = "image/png"
             self.assertEqual(get_transcoded_format(image_attachment), None)
+            # A null or empty content-type is judged inline.
             image_attachment.content_type = None
             self.assertEqual(get_transcoded_format(image_attachment), None)
+            image_attachment.content_type = ""
+            self.assertEqual(get_transcoded_format(image_attachment), None)
+
+    def test_missing_thumbnails_missing_content_type(self) -> None:
+        # A null or empty content-type (some old uploads) must not
+        # crash; it is judged inline, like get_transcoded_format.
+        image_attachment = ImageAttachment(
+            path_id="example",
+            original_width_px=150,
+            original_height_px=100,
+            frames=1,
+            thumbnail_metadata=[],
+            content_type="image/tiff",
+        )
+        still_webp = ThumbnailFormat("webp", 100, 75, animated=False, opts="Q=90")
+        transcoded = ThumbnailFormat("webp", 4032, 3024, animated=False)
+        with self.thumbnail_formats(still_webp):
+            # A known non-inline type gets the extra transcoded format.
+            self.assertEqual(missing_thumbnails(image_attachment), [still_webp, transcoded])
+
+            # A missing content-type does not, and does not crash.
+            for missing_content_type in (None, ""):
+                image_attachment.content_type = missing_content_type
+                self.assertEqual(missing_thumbnails(image_attachment), [still_webp])
 
     def test_maybe_thumbnail_from_stream(self) -> None:
         # If we put the file in place directly (e.g. simulating a
         # chunked upload), and then use the streaming source to
         # create the attachment, we still thumbnail correctly.
         hamlet = self.example_user("hamlet")
-        path_id = upload_backend.generate_message_upload_path(str(hamlet.realm.id), "img.png")
-        upload_backend.upload_message_attachment(
+        path_id = generate_message_upload_path(str(hamlet.realm.id), "img.png")
+        store_message_attachment(
             path_id, "img.png", "image/png", read_test_image_file("img.png"), hamlet, hamlet.realm
         )
         source = attachment_source(path_id)
@@ -1004,3 +1030,72 @@ class TestThumbnailRetrieval(ZulipTestCase):
             ),
             "100x75.webp",
         )
+
+
+class ThumbnailStatusEndpointTest(ZulipTestCase):
+    def test_thumbnail_status_with_ready_thumbnails(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+
+        with self.thumbnail_formats(ThumbnailFormat("webp", 100, 75, animated=True)):
+            with self.captureOnCommitCallbacks(execute=True):
+                with get_test_image_file("animated_unequal_img.gif") as image_file:
+                    json_response = self.assert_json_success(
+                        self.client_post("/json/user_uploads", {"file": image_file})
+                    )
+                path_id = re.sub(r"/user_uploads/", "", json_response["url"])
+
+            result = self.client_get(f"/json/thumbnail/status/{path_id}")
+            self.assert_json_success(result)
+            self.assertEqual(result.json()["has_thumbnail"], True)
+
+    def test_thumbnail_status_without_ready_thumbnails(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+
+        with self.thumbnail_formats(ThumbnailFormat("webp", 100, 75, animated=True)):
+            # Don't execute callbacks, so thumbnails aren't generated
+            with get_test_image_file("animated_unequal_img.gif") as image_file:
+                json_response = self.assert_json_success(
+                    self.client_post("/json/user_uploads", {"file": image_file})
+                )
+            path_id = re.sub(r"/user_uploads/", "", json_response["url"])
+
+        result = self.client_get(f"/json/thumbnail/status/{path_id}")
+        self.assert_json_success(result)
+        self.assertEqual(result.json()["has_thumbnail"], False)
+
+    def test_thumbnail_status_for_non_image_file(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+
+        fp = StringIO("zulip text file!")
+        fp.name = "zulip.txt"
+
+        json_response = self.assert_json_success(
+            self.client_post("/json/user_uploads", {"file": fp})
+        )
+        path_id = re.sub(r"/user_uploads/", "", json_response["url"])
+
+        result = self.client_get(f"/json/thumbnail/status/{path_id}")
+        self.assert_json_error(result, "Invalid attachment")
+
+    def test_thumbnail_status_nonexistent_file(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+
+        result = self.client_get("/json/thumbnail/status/2/nonexistent/fake.gif")
+        self.assert_json_error(result, "Invalid attachment")
+
+    def test_thumbnail_status_without_access(self) -> None:
+        hamlet = self.example_user("hamlet")
+        iago = self.example_user("iago")
+
+        path_id = f"{hamlet.realm_id}/31/4CBjtTLYZhk66pZrF8hnYGwc/img.gif"
+        create_attachment("img.gif", path_id, "image/gif", b"gif_content", hamlet, hamlet.realm)
+
+        # Iago is not a recipient of the uploaded file so they
+        # should not be able to query its thumbnail status.
+        self.login_user(iago)
+        result = self.client_get(f"/json/thumbnail/status/{path_id}")
+        self.assert_json_error(result, "Invalid attachment")

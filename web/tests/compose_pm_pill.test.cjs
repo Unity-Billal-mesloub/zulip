@@ -6,7 +6,7 @@ const {make_realm} = require("./lib/example_realm.cjs");
 const {make_user} = require("./lib/example_user.cjs");
 const {mock_esm, zrequire} = require("./lib/namespace.cjs");
 const {run_test} = require("./lib/test.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 
 const input_pill = mock_esm("../src/input_pill");
 const people = zrequire("people");
@@ -52,8 +52,8 @@ run_test("pills", ({override}) => {
     people.add_active_user(hamlet);
 
     const $recipient_stub = $("#private_message_recipient");
-    const pill_container_stub = "pill-container";
-    $recipient_stub.set_parent(pill_container_stub);
+    const $pill_container_stub = $.create("pill-container-stub");
+    $recipient_stub.set_parent($pill_container_stub);
     let create_item_handler;
 
     const all_pills = new Map();
@@ -63,27 +63,15 @@ run_test("pills", ({override}) => {
         assert.ok(!all_pills.has(id));
         all_pills.set(id, item);
     };
-    pills.items = () => [...all_pills.values()];
+    pills.items = () => all_pills.values().toArray();
 
-    let text_cleared;
-    pills.clear_text = () => {
-        text_cleared = true;
-    };
+    pills.clear_text = () => {};
 
-    let pills_cleared;
     pills.clear = () => {
-        pills_cleared = true;
         pills = {
             pill: {},
         };
         all_pills.clear();
-    };
-
-    let appendValue_called;
-    pills.appendValue = function (value) {
-        appendValue_called = true;
-        assert.equal(value, othello.user_id.toString());
-        this.appendValidatedData(othello);
     };
 
     function test_create_item(handler) {
@@ -111,7 +99,7 @@ run_test("pills", ({override}) => {
     }
 
     function input_pill_stub(opts) {
-        assert.equal(opts.$container, pill_container_stub);
+        assert.equal(opts.$container[0], $pill_container_stub[0]);
         create_item_handler = opts.create_item_from_text;
         assert.ok(create_item_handler);
         return pills;
@@ -156,13 +144,7 @@ run_test("pills", ({override}) => {
 
     test_create_item(create_item_handler);
 
-    compose_pm_pill.set_from_emails("othello@example.com");
-    assert.ok(compose_pm_pill.widget);
-
-    assert.ok(pills_cleared);
-    assert.ok(appendValue_called);
-    assert.ok(text_cleared);
-
+    compose_pm_pill.clear();
     compose_pm_pill.set_from_typeahead(me);
     compose_pm_pill.set_from_typeahead(othello);
 
@@ -293,4 +275,26 @@ run_test("update_user_pill_active_status", ({override_rewire}) => {
     compose_pm_pill.update_user_pill_active_status(hamlet, true);
 
     assert.ok(!pill_updated);
+});
+
+run_test("update_user_pill_full_name", ({override_rewire}) => {
+    // The pill-update logic lives in user_pill.update_pill_full_name and
+    // is tested there; here we just verify the wrapper delegates when
+    // the widget is set, and is a no-op otherwise.
+    let user_pill_function_called = false;
+    const widget = {
+        getPillByPredicate() {
+            user_pill_function_called = true;
+            return undefined;
+        },
+        updatePill() {},
+    };
+
+    override_rewire(compose_pm_pill, "widget", undefined);
+    compose_pm_pill.update_user_pill_full_name(1, "Othello the Moor");
+    assert.ok(!user_pill_function_called);
+
+    override_rewire(compose_pm_pill, "widget", widget);
+    compose_pm_pill.update_user_pill_full_name(1, "Othello the Moor");
+    assert.ok(user_pill_function_called);
 });

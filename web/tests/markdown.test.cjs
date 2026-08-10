@@ -2,8 +2,6 @@
 
 const assert = require("node:assert/strict");
 
-const katex = require("katex");
-
 const markdown_test_cases = require("../../zerver/tests/fixtures/markdown_test_cases.json");
 
 const {make_user_group} = require("./lib/example_group.cjs");
@@ -262,6 +260,10 @@ test("markdown_detection", () => {
         "User Mention @**leo with some name**",
         "Group Mention @*hamletcharacters*",
         "Stream #**Verona**",
+        "Twitter URL https://twitter.com/jacobian/status/407886996565016579",
+        "https://twitter.com/jacobian/status/407886996565016579",
+        "then https://twitter.com/jacobian/status/407886996565016579",
+        "Twitter URL http://twitter.com/jacobian/status/407886996565016579",
     ];
 
     const markup = [
@@ -272,10 +274,6 @@ test("markdown_detection", () => {
         "https://zulip.com/image.jpg too",
         "Contains a zulip.com/foo.jpeg file",
         "Contains a https://zulip.com/image.png file",
-        "Twitter URL https://twitter.com/jacobian/status/407886996565016579",
-        "https://twitter.com/jacobian/status/407886996565016579",
-        "then https://twitter.com/jacobian/status/407886996565016579",
-        "Twitter URL http://twitter.com/jacobian/status/407886996565016579",
         "YouTube URL https://www.youtube.com/watch?v=HHZ8iqswiCw&feature=youtu.be&a",
     ];
 
@@ -466,7 +464,7 @@ test("marked", ({override}) => {
                 '<p>This is an <span aria-label="poop" class="emoji emoji-1f4a9" role="img" title="poop">:poop:</span> message</p>',
         },
         {
-            input: "\uD83D\uDCA9",
+            input: "\u{1F4A9}",
             expected:
                 '<p><span aria-label="poop" class="emoji emoji-1f4a9" role="img" title="poop">:poop:</span></p>',
         },
@@ -525,9 +523,6 @@ test("marked", ({override}) => {
             expected:
                 '<blockquote>\n<p>User group mention in quote: <span class="user-group-mention silent" data-user-group-id="2">Backend</span></p>\n</blockquote>\n<blockquote>\n<p>Another user group mention in quote: <span class="user-group-mention silent" data-user-group-id="1">hamletcharacters</span></p>\n</blockquote>',
         },
-        // Test only those linkifiers which don't return True for
-        // `contains_backend_only_syntax()`. Those which return True
-        // are tested separately.
         {
             input: "This is a linkifier #1234 with text after it",
             expected:
@@ -547,6 +542,14 @@ test("marked", ({override}) => {
             input: "This is a linkifier with ZGROUP_123:45 groups",
             expected:
                 '<p>This is a linkifier with <a href="https://zone_45.zulip.net/ticket/123" title="https://zone_45.zulip.net/ticket/123">ZGROUP_123:45</a> groups</p>',
+        },
+        {
+            input: "Here is the PR-#123.",
+            expected: `<p>Here is the PR-<a href="https://trac.example.com/ticket/123" title="https://trac.example.com/ticket/123">#123</a>.</p>`,
+        },
+        {
+            input: "Function abc() was introduced in (PR)#123.",
+            expected: `<p>Function abc() was introduced in (PR)<a href="https://trac.example.com/ticket/123" title="https://trac.example.com/ticket/123">#123</a>.</p>`,
         },
         {input: "Test *italic*", expected: "<p>Test <em>italic</em></p>"},
         {
@@ -664,12 +667,12 @@ test("marked", ({override}) => {
         {
             input: "#**& &amp; &amp;amp;**",
             expected:
-                '<p><a class="stream" data-stream-id="5" href="/#narrow/channel/5-.26-.26-.26amp.3B">#&amp; &amp; &amp;amp;</a></p>',
+                '<p><a class="stream" data-stream-id="5" href="/#narrow/channel/5">#&amp; &amp; &amp;amp;</a></p>',
         },
         {
             input: "#**& &amp; &amp;amp;>& &amp; &amp;amp;**",
             expected:
-                '<p><a class="stream-topic" data-stream-id="5" href="#narrow/channel/5-.26-.26-.26amp.3B/topic/.26.20.26.20.26amp.3B">#&amp; &amp; &amp;amp; &gt; &amp; &amp; &amp;amp;</a></p>',
+                '<p><a class="stream-topic" data-stream-id="5" href="#narrow/channel/5/topic/.26.20.26.20.26amp.3B">#&amp; &amp; &amp;amp; &gt; &amp; &amp; &amp;amp;</a></p>',
         },
     ];
 
@@ -992,16 +995,6 @@ test("message_flags", () => {
     assert.equal(message.flags.includes("mentioned"), false);
 });
 
-test("backend_only_linkifiers", () => {
-    const backend_only_linkifiers = [
-        "Here is the PR-#123.",
-        "Function abc() was introduced in (PR)#123.",
-    ];
-    for (const content of backend_only_linkifiers) {
-        assert.equal(markdown.contains_backend_only_syntax(content), true);
-    }
-});
-
 test("translate_emoticons_to_names", () => {
     const get_emoticon_translations = emoji.get_emoticon_translations;
 
@@ -1082,15 +1075,4 @@ test("missing unicode emojis", ({override}) => {
         ...markdown.render(message.raw_content),
     };
     assert.equal(message.content, "<p>\u{1F6B2}</p>");
-});
-
-test("katex_throws_unexpected_exceptions", ({override}) => {
-    const message = {raw_content: "$$a$$"};
-    override(katex, "renderToString", () => {
-        throw new Error("some-exception");
-    });
-    assert.throws(() => markdown.render(message.raw_content), {
-        name: "Error",
-        message: "some-exception\nPlease report this to https://zulip.com/development-community/",
-    });
 });

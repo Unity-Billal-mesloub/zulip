@@ -251,8 +251,8 @@ def cache_set(
         val = (val,)
     try:
         cache_backend.set(final_key, val, timeout=timeout)
-    except MemcachedException as e:
-        logger.exception(e)
+    except MemcachedException:
+        logger.exception("Error while storing to cache")
     remote_cache_stats_finish()
 
 
@@ -306,8 +306,8 @@ def cache_set_many(
     remote_cache_stats_start()
     try:
         get_cache_backend(cache_name).set_many(items, timeout=timeout)
-    except MemcachedException as e:
-        logger.exception(e)
+    except MemcachedException:
+        logger.exception("Error while storing to cache")
     remote_cache_stats_finish()
 
 
@@ -536,6 +536,7 @@ realm_user_dict_fields: list[str] = [
     "long_term_idle",
     "email_address_visibility",
     "is_imported_stub",
+    "is_deleted",
 ]
 
 

@@ -27,7 +27,7 @@ from zerver.lib.validator import (
     check_long_string,
     check_short_string,
     check_url,
-    validate_select_field,
+    validate_dropdown_field,
 )
 from zerver.models.realms import Realm
 from zerver.models.users import UserProfile
@@ -90,8 +90,8 @@ class CustomProfileField(models.Model):
     editable_by_user = models.BooleanField(default=True, db_default=True)
 
     SHORT_TEXT = 1
-    LONG_TEXT = 2
-    SELECT = 3
+    PARAGRAPH = 2
+    DROPDOWN = 3
     DATE = 4
     URL = 5
     USER = 6
@@ -99,17 +99,17 @@ class CustomProfileField(models.Model):
     PRONOUNS = 8
 
     # These are the fields whose validators require more than var_name
-    # and value argument. i.e. SELECT require field_data, USER require
+    # and value argument. i.e. DROPDOWN require field_data, USER require
     # realm as argument.
-    SELECT_FIELD_TYPE_DATA: list[ExtendedFieldElement] = [
-        (SELECT, gettext_lazy("Dropdown"), validate_select_field, str, "SELECT"),
+    DROPDOWN_FIELD_TYPE_DATA: list[ExtendedFieldElement] = [
+        (DROPDOWN, gettext_lazy("Dropdown"), validate_dropdown_field, str, "DROPDOWN"),
     ]
     USER_FIELD_TYPE_DATA: list[UserFieldElement] = [
         (USER, gettext_lazy("Users"), check_valid_user_ids, orjson.loads, "USER"),
     ]
 
-    SELECT_FIELD_VALIDATORS: dict[int, ExtendedValidator] = {
-        item[0]: item[2] for item in SELECT_FIELD_TYPE_DATA
+    DROPDOWN_FIELD_VALIDATORS: dict[int, ExtendedValidator] = {
+        item[0]: item[2] for item in DROPDOWN_FIELD_TYPE_DATA
     }
     USER_FIELD_VALIDATORS: dict[int, RealmUserValidator] = {
         item[0]: item[2] for item in USER_FIELD_TYPE_DATA
@@ -118,7 +118,7 @@ class CustomProfileField(models.Model):
     FIELD_TYPE_DATA: list[FieldElement] = [
         # Type, display name, validator, converter, keyword
         (SHORT_TEXT, gettext_lazy("Short text"), check_short_string, str, "SHORT_TEXT"),
-        (LONG_TEXT, gettext_lazy("Paragraph"), check_long_string, str, "LONG_TEXT"),
+        (PARAGRAPH, gettext_lazy("Paragraph"), check_long_string, str, "PARAGRAPH"),
         (DATE, gettext_lazy("Date"), check_date, str, "DATE"),
         (URL, gettext_lazy("Link"), check_url, str, "URL"),
         (
@@ -132,7 +132,7 @@ class CustomProfileField(models.Model):
     ]
 
     ALL_FIELD_TYPES = sorted(
-        [*FIELD_TYPE_DATA, *SELECT_FIELD_TYPE_DATA, *USER_FIELD_TYPE_DATA], key=lambda x: x[1]
+        [*FIELD_TYPE_DATA, *DROPDOWN_FIELD_TYPE_DATA, *USER_FIELD_TYPE_DATA], key=lambda x: x[1]
     )
 
     FIELD_VALIDATORS: dict[int, Validator[ProfileDataElementValue]] = {
@@ -153,8 +153,8 @@ class CustomProfileField(models.Model):
     # A JSON blob of any additional data needed to define the field beyond
     # type/name/hint.
     #
-    # The format depends on the type.  Field types SHORT_TEXT, LONG_TEXT,
-    # DATE, URL, and USER leave this empty.  Fields of type SELECT store the
+    # The format depends on the type.  Field types SHORT_TEXT, PARAGRAPH,
+    # DATE, URL, and USER leave this empty.  Fields of type DROPDOWN store the
     # choices' descriptions.
     #
     # Note: There is no performance overhead of using TextField in PostgreSQL.
@@ -187,7 +187,7 @@ class CustomProfileField(models.Model):
         return data_as_dict
 
     def is_renderable(self) -> bool:
-        if self.field_type in [CustomProfileField.SHORT_TEXT, CustomProfileField.LONG_TEXT]:
+        if self.field_type in [CustomProfileField.SHORT_TEXT, CustomProfileField.PARAGRAPH]:
             return True
         return False
 

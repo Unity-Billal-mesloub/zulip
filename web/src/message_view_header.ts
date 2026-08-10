@@ -1,7 +1,6 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 
-import render_inline_decorated_channel_name from "../templates/inline_decorated_channel_name.hbs";
 import render_message_view_header from "../templates/message_view_header.hbs";
 
 import type {Filter} from "./filter.ts";
@@ -94,7 +93,7 @@ function get_message_view_header_context(filter: Filter | undefined): MessageVie
     const description = filter.get_description()?.description;
     const link = filter.get_description()?.link;
     assert(title !== undefined);
-    let context = filter.add_icon_data({
+    const context = filter.add_icon_data({
         title,
         description,
         link,
@@ -113,21 +112,6 @@ function get_message_view_header_context(filter: Filter | undefined): MessageVie
                 rendered_narrow_description: $t({
                     defaultMessage: "This channel does not exist or is private.",
                 }),
-            };
-        }
-
-        if (inbox_util.is_visible() && inbox_util.is_channel_view()) {
-            const stream_name_with_privacy_symbol_html = render_inline_decorated_channel_name({
-                stream: current_stream,
-                show_colored_icon: true,
-            });
-            context = {
-                ...context,
-                title: undefined,
-                title_html: stream_name_with_privacy_symbol_html,
-                // We don't want to show an initial icon here.
-                icon: undefined,
-                zulip_icon: undefined,
             };
         }
 
@@ -153,8 +137,7 @@ export function colorize_message_view_header(): void {
     if (!current_sub) {
         return;
     }
-    // selecting i instead of .fa because web public streams have custom icon.
-    $("#message_view_header a.stream i").css("color", current_sub.color);
+    $("#message_view_header .navbar-icon").css("color", current_sub.color);
 }
 
 function append_and_display_title_area(context: MessageViewHeaderContext): void {
@@ -179,7 +162,7 @@ function build_message_view_header(filter: Filter | undefined): void {
     } else {
         const context = get_message_view_header_context(filter);
         append_and_display_title_area(context);
-        search.close_search_bar_and_open_narrow_description();
+        search.close_search();
     }
 }
 
@@ -249,5 +232,34 @@ export function maybe_rerender_title_area_for_stream(modified_stream_id: number)
 
     if (current_stream_id === modified_stream_id) {
         render_title_area();
+    }
+}
+
+// The navbar title shows a user's name when narrowed to a DM that
+// includes them or to messages sent by them, so we refresh it for a
+// rename of such a user.
+export function maybe_update_navbar_title_for_user(modified_user_id: number): void {
+    const filter = narrow_state.filter();
+    if (filter === undefined) {
+        return;
+    }
+    // Only common narrows show a name in the title; others show a search
+    // bar and have no title to update.
+    if (!filter.is_common_narrow()) {
+        return;
+    }
+    const narrowed_to_dm_with_user = narrow_state.pm_ids_set(filter).has(modified_user_id);
+    const sender_id = filter.terms_with_operator("sender")[0]?.operand;
+    const narrowed_to_messages_sent_by_user = sender_id === modified_user_id;
+
+    if (narrowed_to_dm_with_user || narrowed_to_messages_sent_by_user) {
+        // Update just the title text rather than rebuilding the whole
+        // header with render_title_area(), which would close or reset a
+        // search bar the user has open to refine the narrow. For these
+        // narrows the title is plain text and the icon doesn't depend on
+        // the renamed user.
+        const title = filter.get_title();
+        assert(title !== undefined);
+        $("#message_view_header .message-header-navbar-title").text(title);
     }
 }

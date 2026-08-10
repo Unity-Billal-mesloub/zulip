@@ -2,13 +2,19 @@ import datetime
 import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
+from unittest import mock
 
 import time_machine
-from django.test.utils import override_settings
 
-from zerver.actions.scheduled_messages import try_deliver_one_scheduled_message
+from zerver.actions.realm_settings import do_deactivate_realm
+from zerver.actions.scheduled_messages import (
+    SCHEDULED_MESSAGE_LATE_CUTOFF_MINUTES,
+    try_deliver_one_scheduled_message,
+)
+from zerver.actions.users import change_user_is_active
 from zerver.lib.message import get_user_mentions_for_display
 from zerver.lib.test_classes import ZulipTestCase
+from zerver.lib.test_helpers import most_recent_message
 from zerver.lib.timestamp import timestamp_to_datetime
 from zerver.models import Message, ScheduledMessage
 from zerver.models.recipients import Recipient, get_or_create_direct_message_group
@@ -73,13 +79,19 @@ class RemindersTest(ZulipTestCase):
     def get_channel_message_reminder_content(self, msg_content: str, msg_id: int) -> str:
         return (
             f"You requested a reminder for the following message.\n\n"
-            f"@_**King Hamlet|10** [said](http://zulip.testserver/#narrow/channel/3-Verona/topic/test/near/{msg_id}) in #**Verona>test**:\n```quote\n{msg_content}\n```"
+            f"@_**King Hamlet|10** [said](http://zulip.testserver/#narrow/channel/3-Verona/topic/test/near/{msg_id}) in [#Verona > test](#narrow/channel/3-Verona/topic/test/with/{msg_id}):\n```quote\n{msg_content}\n```"
         )
 
     def test_schedule_reminder(self) -> None:
+        hamlet = self.example_user("hamlet")
+        othello = self.example_user("othello")
+
         self.login("hamlet")
         content = "Test message"
         scheduled_delivery_timestamp = int(time.time() + 86400)
+
+        # Create a direct message group for hamlet's self messages.
+        hamlet_self_direct_message_group = get_or_create_direct_message_group(id_list=[hamlet.id])
 
         # Scheduling a reminder to a channel you are subscribed is successful.
         message_id = self.send_channel_message_for_hamlet(content)
@@ -90,9 +102,9 @@ class RemindersTest(ZulipTestCase):
             scheduled_message.content,
             self.get_channel_message_reminder_content(content, message_id),
         )
-        # Recipient and sender are the same for reminders.
-        self.assertEqual(scheduled_message.recipient.type_id, self.example_user("hamlet").id)
-        self.assertEqual(scheduled_message.sender, self.example_user("hamlet"))
+        self.assertEqual(scheduled_message.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
+        self.assertEqual(scheduled_message.recipient.type_id, hamlet_self_direct_message_group.id)
+        self.assertEqual(scheduled_message.sender, hamlet)
         self.assertEqual(
             scheduled_message.scheduled_timestamp,
             timestamp_to_datetime(scheduled_delivery_timestamp),
@@ -102,43 +114,9 @@ class RemindersTest(ZulipTestCase):
             message_id,
         )
         self.assertEqual(scheduled_message.topic_name(), Message.DM_TOPIC)
-
-        # Scheduling a direct message with user IDs is successful.
-        othello = self.example_user("othello")
-        message_id = self.send_dm_from_hamlet_to_othello(content)
-        result = self.do_schedule_reminder(message_id, scheduled_delivery_timestamp)
-        self.assert_json_success(result)
-        scheduled_message = self.last_scheduled_reminder()
-        self.assertEqual(
-            scheduled_message.content,
-            self.get_dm_reminder_content(content, message_id, [othello]),
-        )
-        self.assertEqual(scheduled_message.recipient.type_id, self.example_user("hamlet").id)
-        self.assertEqual(scheduled_message.sender, self.example_user("hamlet"))
-        self.assertEqual(
-            scheduled_message.scheduled_timestamp,
-            timestamp_to_datetime(scheduled_delivery_timestamp),
-        )
-        self.assertEqual(
-            scheduled_message.reminder_target_message_id,
-            message_id,
-        )
-        self.assertEqual(scheduled_message.topic_name(), Message.DM_TOPIC)
-
-    @override_settings(PREFER_DIRECT_MESSAGE_GROUP=True)
-    def test_schedule_reminder_using_direct_message_group(self) -> None:
-        hamlet = self.example_user("hamlet")
-        othello = self.example_user("othello")
-
-        self.login("hamlet")
-        content = "Test message"
-        scheduled_delivery_timestamp = int(time.time() + 86400)
 
         # Create a direct message group between hamlet and othello.
         get_or_create_direct_message_group(id_list=[hamlet.id, othello.id])
-
-        # Create a direct message group for hamlet's self messages.
-        hamlet_self_direct_message_group = get_or_create_direct_message_group(id_list=[hamlet.id])
 
         # Scheduling a direct message with user IDs is successful.
         message_id = self.send_dm_from_hamlet_to_othello(content)
@@ -159,6 +137,7 @@ class RemindersTest(ZulipTestCase):
             scheduled_message.reminder_target_message_id,
             message_id,
         )
+        self.assertEqual(scheduled_message.topic_name(), Message.DM_TOPIC)
 
     def test_schedule_reminder_with_bad_timestamp(self) -> None:
         self.login("hamlet")
@@ -345,6 +324,131 @@ class RemindersTest(ZulipTestCase):
             )
             self.assertEqual(delivered_message.date_sent, more_than_scheduled_delivery_datetime)
 
+    def test_reminder_still_fires_past_late_cutoff(self) -> None:
+        # Reminders deliberately bypass the late-cutoff guard: a
+        # reminder delivered late is strictly more useful to the
+        # sender than one silently dropped.
+        content = "Test content"
+        reminder = self.create_reminder(content)
+
+        too_late_datetime = reminder.scheduled_timestamp + datetime.timedelta(
+            minutes=SCHEDULED_MESSAGE_LATE_CUTOFF_MINUTES + 1
+        )
+        with (
+            time_machine.travel(too_late_datetime, tick=False),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            self.assertTrue(try_deliver_one_scheduled_message())
+
+        reminder.refresh_from_db()
+        self.assertTrue(reminder.delivered)
+        self.assertFalse(reminder.failed)
+        assert isinstance(reminder.delivered_message_id, int)
+        self.assertEqual(
+            logs.output,
+            [
+                f"INFO:root:Sending scheduled message {reminder.id} with date {reminder.scheduled_timestamp} (sender: {reminder.sender_id})"
+            ],
+        )
+        delivered_message = Message.objects.get(id=reminder.delivered_message_id)
+        assert isinstance(reminder.reminder_target_message_id, int)
+        self.assertEqual(
+            delivered_message.content,
+            self.get_dm_reminder_content(
+                content, reminder.reminder_target_message_id, [self.example_user("othello")]
+            ),
+        )
+        self.assertEqual(delivered_message.date_sent, too_late_datetime)
+
+    def assert_reminder_dropped_silently(
+        self,
+        reminder: ScheduledMessage,
+        expected_failure_message: str,
+        message_before: Message,
+        logs_output: list[str],
+    ) -> None:
+        # Reminders have their own notification system, so a failed
+        # reminder is expected to be recorded on the row but NOT to
+        # send a failure DM back to the sender.
+        reminder.refresh_from_db()
+        self.assertTrue(reminder.failed)
+        self.assertFalse(reminder.delivered)
+        self.assertIsNone(reminder.delivered_message_id)
+        self.assertEqual(reminder.failure_message, expected_failure_message)
+        self.assertEqual(
+            logs_output,
+            [
+                f"INFO:root:Sending scheduled message {reminder.id} with date {reminder.scheduled_timestamp} (sender: {reminder.sender_id})",
+                f"INFO:root:Failed with message: {expected_failure_message}",
+            ],
+        )
+        self.assertEqual(most_recent_message(reminder.sender).id, message_before.id)
+
+    def test_reminder_refused_for_deactivated_sender(self) -> None:
+        expected_failure_message = "Account is deactivated"
+        reminder = self.create_reminder("Test content")
+        message_before = most_recent_message(reminder.sender)
+
+        with (
+            time_machine.travel(
+                reminder.scheduled_timestamp + datetime.timedelta(minutes=1), tick=False
+            ),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            change_user_is_active(reminder.sender, False)
+            self.assertTrue(try_deliver_one_scheduled_message())
+
+        self.assert_reminder_dropped_silently(
+            reminder, expected_failure_message, message_before, logs.output
+        )
+
+    def test_reminder_refused_when_send_returns_none(self) -> None:
+        # internal_send_private_message swallows JsonableError from
+        # check_message and returns None; the worker must still mark
+        # the row failed rather than delivered with a NULL message id.
+        expected_failure_message = "Reminder could not be sent."
+        reminder = self.create_reminder("Test content")
+        message_before = most_recent_message(reminder.sender)
+
+        with (
+            time_machine.travel(
+                reminder.scheduled_timestamp + datetime.timedelta(minutes=1), tick=False
+            ),
+            mock.patch(
+                "zerver.actions.scheduled_messages.internal_send_private_message",
+                return_value=None,
+            ),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            self.assertTrue(try_deliver_one_scheduled_message())
+
+        self.assert_reminder_dropped_silently(
+            reminder, expected_failure_message, message_before, logs.output
+        )
+
+    def test_reminder_refused_for_deactivated_realm(self) -> None:
+        expected_failure_message = "This organization has been deactivated"
+        reminder = self.create_reminder("Test content")
+        message_before = most_recent_message(reminder.sender)
+
+        with (
+            time_machine.travel(
+                reminder.scheduled_timestamp + datetime.timedelta(minutes=1), tick=False
+            ),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            do_deactivate_realm(
+                reminder.realm,
+                acting_user=None,
+                deactivation_reason="owner_request",
+                email_owners=False,
+            )
+            self.assertTrue(try_deliver_one_scheduled_message())
+
+        self.assert_reminder_dropped_silently(
+            reminder, expected_failure_message, message_before, logs.output
+        )
+
     def test_delete_reminder(self) -> None:
         hamlet = self.example_user("hamlet")
         cordelia = self.example_user("cordelia")
@@ -485,7 +589,7 @@ class RemindersTest(ZulipTestCase):
         self.assertEqual(
             scheduled_message.content,
             f"You requested a reminder for the following message. Note:\n > {note}\n\n"
-            f"@_**King Hamlet|10** [said](http://zulip.testserver/#narrow/channel/3-Verona/topic/test/near/{message_id}) in #**Verona>test**:\n```quote\n{content}\n```",
+            f"@_**King Hamlet|10** [said](http://zulip.testserver/#narrow/channel/3-Verona/topic/test/near/{message_id}) in [#Verona > test](#narrow/channel/3-Verona/topic/test/with/{message_id}):\n```quote\n{content}\n```",
         )
 
         message_id = self.send_dm_from_hamlet_to_othello(content)
@@ -531,7 +635,9 @@ class RemindersTest(ZulipTestCase):
             scheduled_message.content,
             "You requested a reminder for the following message. Note:\n > {123}\n\n"
             f"@_**King Hamlet|10** [said](http://zulip.testserver/#narrow/channel/3-Verona/topic/.7B789.7D/near/{message_id})"
-            " in #**Verona>{789}**:\n" + f"```quote\n{content}\n```",
+            " in [#Verona > {789}](#narrow/channel/3-Verona/topic/.7B789.7D/with/"
+            f"{message_id}):\n"
+            f"```quote\n{content}\n```",
         )
 
     def test_schedule_reminder_ones_own_message(self) -> None:

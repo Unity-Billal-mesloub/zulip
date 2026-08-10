@@ -16,6 +16,7 @@ from zerver.lib.exceptions import (
     ChannelExistsError,
     IncompatibleParametersError,
     JsonableError,
+    MissingAuthenticationError,
     OrganizationOwnerRequiredError,
 )
 from zerver.lib.stream_subscription import (
@@ -39,6 +40,7 @@ from zerver.lib.user_groups import (
     parse_group_setting_value,
     user_has_permission_for_group_setting,
 )
+from zerver.lib.utils import assert_is_not_none
 from zerver.models import (
     ChannelFolder,
     DefaultStreamGroup,
@@ -83,6 +85,7 @@ class StreamDict(TypedDict, total=False):
     """
 
     name: str
+    default_push_notifications: bool
     description: str
     invite_only: bool
     is_web_public: bool
@@ -367,6 +370,7 @@ def create_stream_if_needed(
     realm: Realm,
     stream_name: str,
     *,
+    default_push_notifications: bool = False,
     invite_only: bool = False,
     is_web_public: bool = False,
     history_public_to_subscribers: bool | None = None,
@@ -426,6 +430,7 @@ def create_stream_if_needed(
             is_web_public=is_web_public,
             history_public_to_subscribers=history_public_to_subscribers,
             message_retention_days=message_retention_days,
+            default_push_notifications=default_push_notifications,
             folder=folder,
             topics_policy=topics_policy,
             **group_setting_values,
@@ -502,6 +507,7 @@ def create_streams_if_needed(
             history_public_to_subscribers=stream_dict.get("history_public_to_subscribers"),
             stream_description=stream_dict.get("description", ""),
             message_retention_days=stream_dict.get("message_retention_days", None),
+            default_push_notifications=stream_dict.get("default_push_notifications", False),
             topics_policy=stream_dict.get("topics_policy", None),
             can_add_subscribers_group=stream_dict.get("can_add_subscribers_group", None),
             can_administer_channel_group=stream_dict.get("can_administer_channel_group", None),
@@ -1026,6 +1032,10 @@ def get_public_streams_queryset(realm: Realm) -> QuerySet[Stream]:
     return Stream.objects.filter(realm=realm, invite_only=False, history_public_to_subscribers=True)
 
 
+def get_archived_streams_queryset(realm: Realm) -> QuerySet[Stream]:
+    return Stream.objects.filter(realm=realm, deactivated=True)
+
+
 def get_web_public_streams_queryset(realm: Realm) -> QuerySet[Stream]:
     # This should match the include_web_public code path in do_get_streams.
     return Stream.objects.filter(
@@ -1072,6 +1082,9 @@ def access_stream_by_name(
 
 
 def access_web_public_stream(stream_id: int, realm: Realm) -> Stream:
+    if not realm.web_public_streams_enabled():
+        raise MissingAuthenticationError
+
     error = _("Invalid channel ID")
     try:
         stream = get_stream_by_id_in_realm(stream_id, realm)
@@ -1351,7 +1364,7 @@ def bulk_can_remove_subscribers_from_streams(
     if not bool(permission_failure_streams):
         return True
 
-    existing_recipient_ids = [stream.recipient_id for stream in streams]
+    existing_recipient_ids = [assert_is_not_none(stream.recipient_id) for stream in streams]
     sub_recipient_ids = Subscription.objects.filter(
         user_profile=user_profile, recipient_id__in=existing_recipient_ids, active=True
     ).values_list("recipient_id", flat=True)
@@ -1446,7 +1459,7 @@ def get_metadata_access_streams(
     if len(streams) == 0:
         return []
 
-    recipient_ids = [stream.recipient_id for stream in streams]
+    recipient_ids = [assert_is_not_none(stream.recipient_id) for stream in streams]
     subscribed_recipient_ids = set(
         Subscription.objects.filter(
             user_profile=user_profile, recipient_id__in=recipient_ids, active=True
@@ -1483,7 +1496,7 @@ def get_content_access_streams(
     if len(streams) == 0:
         return []
 
-    recipient_ids = [stream.recipient_id for stream in streams]
+    recipient_ids = [assert_is_not_none(stream.recipient_id) for stream in streams]
     subscribed_recipient_ids = set(
         Subscription.objects.filter(
             user_profile=user_profile, recipient_id__in=recipient_ids, active=True
@@ -1848,7 +1861,6 @@ def stream_to_dict(
     )
 
     return APIStreamDict(
-        is_archived=stream.deactivated,
         can_add_subscribers_group=can_add_subscribers_group,
         can_administer_channel_group=can_administer_channel_group,
         can_create_topic_group=can_create_topic_group,
@@ -1862,19 +1874,21 @@ def stream_to_dict(
         can_subscribe_group=can_subscribe_group,
         creator_id=stream.creator_id,
         date_created=datetime_to_timestamp(stream.date_created),
+        default_push_notifications=stream.default_push_notifications,
         description=stream.description,
         first_message_id=stream.first_message_id,
         folder_id=stream.folder_id,
-        is_recently_active=stream.is_recently_active,
         history_public_to_subscribers=stream.history_public_to_subscribers,
         invite_only=stream.invite_only,
+        is_announcement_only=stream_post_policy == Stream.STREAM_POST_POLICY_ADMINS,
+        is_archived=stream.deactivated,
+        is_recently_active=stream.is_recently_active,
         is_web_public=stream.is_web_public,
         message_retention_days=stream.message_retention_days,
         name=stream.name,
         rendered_description=stream.rendered_description,
         stream_id=stream.id,
         stream_post_policy=stream_post_policy,
-        is_announcement_only=stream_post_policy == Stream.STREAM_POST_POLICY_ADMINS,
         stream_weekly_traffic=stream_weekly_traffic,
         subscriber_count=stream.subscriber_count,
         topics_policy=StreamTopicsPolicyEnum(stream.topics_policy).name,

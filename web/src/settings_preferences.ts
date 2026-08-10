@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import Cookies from "js-cookie";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
@@ -347,6 +347,14 @@ export function report_user_list_style_change(settings_panel: SettingsPanel): vo
         $spinner.expectOne();
         settings_ui.display_checkmark($spinner);
     }
+}
+
+export function update_user_list_style_preview_name(full_name: string): void {
+    $(".user_list_style_values .preview .user-name").text(full_name);
+}
+
+export function update_user_list_style_preview_avatar(avatar_url: string): void {
+    $(".user_list_style_values .preview .user-profile-picture img").attr("src", avatar_url);
 }
 
 export function update_page(property: UserSettingsProperty): void {

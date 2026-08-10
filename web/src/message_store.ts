@@ -65,6 +65,12 @@ export const single_message_content_schema = z.object({
     }),
 });
 
+export const message_render_response_schema = z.object({
+    msg: z.string(),
+    result: z.string(),
+    rendered: z.string(),
+});
+
 export const submessage_schema = z.object({
     id: z.number(),
     sender_id: z.number(),
@@ -79,7 +85,7 @@ export const raw_message_schema = z.intersection(
             avatar_url: z.nullable(z.string()),
             client: z.string(),
             content: z.string(),
-            content_type: z.literal("text/html"),
+            content_type: z.enum(["text/html", "text/x-markdown"]),
             display_recipient: display_recipient_schema,
             edit_history: z.optional(z.array(message_edit_history_entry_schema)),
             id: z.number(),
@@ -99,7 +105,7 @@ export const raw_message_schema = z.intersection(
         z.discriminatedUnion("type", [
             z.object({
                 type: z.literal("private"),
-                topic_links: z.optional(z.array(z.undefined())),
+                topic_links: z.optional(z.array(z.never())),
             }),
             z.object({
                 type: z.literal("stream"),
@@ -133,8 +139,7 @@ type Booleans = {
 };
 
 type RawMessageWithBooleans = (
-    | Omit<RawMessage & {type: "private"}, "flags">
-    | Omit<RawMessage & {type: "stream"}, "flags">
+    Omit<RawMessage & {type: "private"}, "flags"> | Omit<RawMessage & {type: "stream"}, "flags">
 ) &
     Booleans;
 
@@ -210,6 +215,9 @@ export type Message = (
     // Added during message rendering in message_list_view.ts. Should
     // never be accessed outside rendering, as the value may be stale.
     reminders?: TimeFormattedReminder[] | undefined;
+
+    // Cache for whether the message has widget edits (e.g. poll question changes).
+    has_widget_edits?: boolean;
 } & (
         | {
               type: "private";
@@ -251,6 +259,13 @@ export function clear_for_testing(): void {
 // here before returning the Message.
 export function get(message_id: number): Message | undefined {
     return stored_messages.get(message_id)?.message;
+}
+
+export function set_messages_for_tests(messages: ProcessedMessage[]): void {
+    stored_messages.clear();
+    for (const message of messages) {
+        stored_messages.set(message.message.id, message);
+    }
 }
 
 export function get_pm_emails(
@@ -444,16 +459,24 @@ export function remove(message_ids: number[]): void {
 }
 
 export function get_message_ids_in_stream(stream_id: number): number[] {
-    return [...stored_messages.values()]
+    return stored_messages
+        .values()
         .filter(
             (message_data) =>
                 message_data.message.type === "stream" &&
                 message_data.message.stream_id === stream_id,
         )
-        .map((message_data) => message_data.message.id);
+        .map((message_data) => message_data.message.id)
+        .toArray();
 }
 
-export function maybe_update_raw_content(message: Message, raw_content: string | undefined): void {
+export function maybe_update_raw_content(id: number, raw_content: string | undefined): void {
+    const message = get(id);
+    // In case the message was deleted from the cache after receiving a delete
+    // event.
+    if (message === undefined) {
+        return;
+    }
     // We shouldn't cache raw_content for messages we won't be receiving update events
     // for, which in this case are messages from channels the current user isn't
     // subscribed to.

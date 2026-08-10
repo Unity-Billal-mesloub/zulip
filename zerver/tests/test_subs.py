@@ -30,6 +30,7 @@ from zerver.actions.streams import (
     deactivated_streams_by_old_name,
     do_change_stream_group_based_setting,
     do_change_stream_permission,
+    do_change_subscription_property,
     do_deactivate_stream,
     do_set_stream_property,
     do_unarchive_stream,
@@ -1087,6 +1088,46 @@ class StreamAdminTest(ZulipTestCase):
         self.assertEqual(stream.history_public_to_subscribers, False)
         self.assertEqual(stream.can_create_topic_group.id, everyone_system_group.id)
 
+    def test_attachment_in_web_public_stream(self) -> None:
+        self.login("desdemona")
+        fp = StringIO("zulip!")
+        fp.name = "zulip.txt"
+
+        result = self.client_post("/json/user_uploads", {"file": fp})
+        url = self.assert_json_success(result)["url"]
+
+        owner = self.example_user("desdemona")
+        realm = owner.realm
+        self.make_stream("test_stream", realm=realm, is_web_public=True)
+        self.subscribe(owner, "test_stream")
+        body = f"First message ...[zulip.txt](http://{realm.host}" + url + ")"
+        msg_id = self.send_stream_message(owner, "test_stream", body, "test")
+        attachment = Attachment.objects.get(messages__id=msg_id)
+        self.assertTrue(attachment.is_web_public)
+
+        self.assertTrue(validate_attachment_request_for_spectator_access(realm, attachment))
+
+        do_set_realm_property(realm, "enable_spectator_access", False, acting_user=None)
+        attachment = Attachment.objects.get(messages__id=msg_id)
+        self.assertIsNone(attachment.is_web_public)
+
+        self.assertFalse(validate_attachment_request_for_spectator_access(realm, attachment))
+        attachment = Attachment.objects.get(messages__id=msg_id)
+        self.assertIsNone(attachment.is_web_public)
+
+        # Check that is_web_public is set as False when uploading a file in
+        # web-public stream with spectator access disabled for realm.
+        fp = StringIO("zulip!")
+        fp.name = "zulip1.txt"
+
+        result = self.client_post("/json/user_uploads", {"file": fp})
+        url = self.assert_json_success(result)["url"]
+
+        body = f"Second message ...[zulip1.txt](http://{realm.host}" + url + ")"
+        msg_id = self.send_stream_message(owner, "test_stream", body, "test")
+        attachment = Attachment.objects.get(messages__id=msg_id)
+        self.assertEqual(attachment.is_web_public, False)
+
     def test_stream_permission_changes_updates_updates_attachments(self) -> None:
         self.login("desdemona")
         fp = StringIO("zulip!")
@@ -1518,6 +1559,10 @@ class StreamAdminTest(ZulipTestCase):
                 {"is_private": orjson.dumps(False).decode()},
                 f"@_**Desdemona|{desdemona.id}** changed the [access permissions]",
             ),
+            (
+                {"topics_policy": StreamTopicsPolicyEnum.allow_empty_topic.name},
+                f'@_**Desdemona|{desdemona.id}** changed the "Allow posting to the *general chat* topic?" setting',
+            ),
         ]
 
         for param, notice in param_to_notice_list:
@@ -1782,7 +1827,9 @@ class StreamAdminTest(ZulipTestCase):
         def get_notified_user_ids() -> set[int]:
             # Two events should be sent: stream_name update and notification message.
             with self.capture_send_event_calls(expected_num_events=2) as events:
-                stream_id = get_stream("stream_name1", user_profile.realm).id
+                stream = get_stream("stream_name1", user_profile.realm)
+                stream_id = stream.id
+                old_name = stream.name
                 result = self.client_patch(
                     f"/json/streams/{stream_id}", {"new_name": "stream_name2"}
                 )
@@ -1796,7 +1843,7 @@ class StreamAdminTest(ZulipTestCase):
                     property="name",
                     value="stream_name2",
                     stream_id=stream_id,
-                    name="sTREAm_name1",
+                    name=old_name,
                 ),
             )
             self.assertRaises(Stream.DoesNotExist, get_stream, "stream_name1", realm)
@@ -2420,6 +2467,94 @@ class StreamAdminTest(ZulipTestCase):
             f"/json/streams/{stream.id}", {"message_retention_days": orjson.dumps(0).decode()}
         )
         self.assert_json_error(result, "Bad value for 'message_retention_days': 0")
+
+    def test_stream_default_push_notifications_default_value(self) -> None:
+        """New streams default to default_push_notifications=False."""
+        user_profile = self.example_user("iago")
+        self.login_user(user_profile)
+        stream = self.subscribe(user_profile, "test_push_default")
+        self.assertFalse(stream.default_push_notifications)
+
+    def test_new_subscription_gets_push_notifications_from_stream(self) -> None:
+        """When a stream has default_push_notifications=True, brand-new
+        subscriptions get push_notifications=True, overriding the user default."""
+        admin = self.example_user("iago")
+        hamlet = self.example_user("hamlet")
+        self.login_user(admin)
+
+        stream = self.subscribe(admin, "push_default_stream")
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"default_push_notifications": orjson.dumps(True).decode()},
+        )
+        self.assert_json_success(result)
+        stream.refresh_from_db()
+        self.assertTrue(stream.default_push_notifications)
+
+        # hamlet's account default is off, so push_notifications=True below
+        # must come from the stream override.
+        self.assertFalse(hamlet.enable_stream_push_notifications)
+
+        self.login_user(hamlet)
+        result = self.client_post(
+            "/json/users/me/subscriptions",
+            {"subscriptions": orjson.dumps([{"name": "push_default_stream"}]).decode()},
+        )
+        self.assert_json_success(result)
+        sub = Subscription.objects.get(
+            user_profile=hamlet,
+            recipient=stream.recipient,
+        )
+        self.assertTrue(sub.push_notifications)
+
+    def test_resubscription_preserves_push_notifications_preference(self) -> None:
+        """Re-subscribing a previously unsubscribed user does not overwrite
+        the stored push_notifications preference they had before."""
+        admin = self.example_user("iago")
+        hamlet = self.example_user("hamlet")
+        self.login_user(admin)
+
+        stream = self.subscribe(admin, "resubscribe_stream")
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"default_push_notifications": orjson.dumps(True).decode()},
+        )
+        self.assert_json_success(result)
+        stream.refresh_from_db()
+
+        self.login_user(hamlet)
+        result = self.client_post(
+            "/json/users/me/subscriptions",
+            {"subscriptions": orjson.dumps([{"name": "resubscribe_stream"}]).decode()},
+        )
+        self.assert_json_success(result)
+        sub = Subscription.objects.get(user_profile=hamlet, recipient=stream.recipient)
+        self.assertTrue(sub.push_notifications)
+
+        # Turn off push notifications for this subscription.
+        do_change_subscription_property(
+            hamlet, sub, stream, "push_notifications", False, acting_user=hamlet
+        )
+        sub.refresh_from_db()
+        self.assertFalse(sub.push_notifications)
+
+        # Unsubscribe and re-subscribe; stored preference must survive the round-trip.
+        self.client_delete(
+            "/json/users/me/subscriptions",
+            {"subscriptions": orjson.dumps(["resubscribe_stream"]).decode()},
+        )
+        sub.refresh_from_db()
+        self.assertFalse(sub.active)
+
+        result = self.client_post(
+            "/json/users/me/subscriptions",
+            {"subscriptions": orjson.dumps([{"name": "resubscribe_stream"}]).decode()},
+        )
+        self.assert_json_success(result)
+        sub.refresh_from_db()
+        self.assertTrue(sub.active)
+        # push_notifications should remain False, not be reset to True.
+        self.assertFalse(sub.push_notifications)
 
     def do_test_change_stream_permission_setting(self, setting_name: str) -> None:
         user_profile = self.example_user("iago")
@@ -3147,7 +3282,7 @@ class StreamAdminTest(ZulipTestCase):
         ]
         result = self.attempt_unsubscribe_of_principal(
             query_count=22,
-            cache_count=13,
+            cache_count=12,
             target_users=target_users,
             is_realm_admin=True,
             is_subbed=True,
@@ -4256,7 +4391,7 @@ class SubscriptionAPITest(ZulipTestCase):
         )
 
         self.assertNotIn(self.example_user("polonius").id, add_peer_event["users"])
-        self.assert_length(add_peer_event["users"], 11)
+        self.assert_length(add_peer_event["users"], 12)
         self.assertEqual(add_peer_event["event"]["type"], "subscription")
         self.assertEqual(add_peer_event["event"]["op"], "peer_add")
         self.assertEqual(add_peer_event["event"]["user_ids"], [self.user_profile.id])
@@ -4287,7 +4422,7 @@ class SubscriptionAPITest(ZulipTestCase):
         # We don't send a peer_add event to othello
         self.assertNotIn(user_profile.id, add_peer_event["users"])
         self.assertNotIn(self.example_user("polonius").id, add_peer_event["users"])
-        self.assert_length(add_peer_event["users"], 11)
+        self.assert_length(add_peer_event["users"], 12)
         self.assertEqual(add_peer_event["event"]["type"], "subscription")
         self.assertEqual(add_peer_event["event"]["op"], "peer_add")
         self.assertEqual(add_peer_event["event"]["user_ids"], [user_profile.id])
@@ -4744,7 +4879,7 @@ class SubscriptionAPITest(ZulipTestCase):
 
         with (
             self.assert_database_query_count(20),
-            self.assert_memcached_count(11),
+            self.assert_memcached_count(10),
             mock.patch("zerver.views.streams.send_user_subscribed_and_new_channel_notifications"),
         ):
             self.subscribe_via_post(
@@ -5346,16 +5481,10 @@ class SubscriptionAPITest(ZulipTestCase):
         notification_bot_dms = Message.objects.filter(
             realm_id=realm.id,
             sender=bot.id,
-            recipient__type=Recipient.PERSONAL,
+            recipient__type=Recipient.DIRECT_MESSAGE_GROUP,
             date_sent__gt=now,
         )
         self.assert_length(notification_bot_dms, 5)
-        notif_bot_dm_recipients = [
-            dm["recipient__type_id"] for dm in notification_bot_dms.values("recipient__type_id")
-        ]
-        self.assertSetEqual(
-            {id for id in user_ids if id != desdemona.id}, set(notif_bot_dm_recipients)
-        )
 
         announcement_channel_message = Message.objects.filter(
             realm_id=realm.id,
@@ -5381,7 +5510,7 @@ class SubscriptionAPITest(ZulipTestCase):
         notification_bot_dms = Message.objects.filter(
             realm_id=realm.id,
             sender=bot.id,
-            recipient__type=Recipient.PERSONAL,
+            recipient__type=Recipient.DIRECT_MESSAGE_GROUP,
             date_sent__gt=now,
         )
         self.assertEqual(notification_bot_dms.count(), 0)
@@ -5434,7 +5563,7 @@ class SubscriptionAPITest(ZulipTestCase):
         notification_bot_dms = Message.objects.filter(
             realm_id=realm.id,
             sender=bot.id,
-            recipient__type=Recipient.PERSONAL,
+            recipient__type=Recipient.DIRECT_MESSAGE_GROUP,
             date_sent__gt=now,
         )
         self.assertEqual(notification_bot_dms.count(), 0)
@@ -5465,7 +5594,7 @@ class SubscriptionAPITest(ZulipTestCase):
         notification_bot_dms = Message.objects.filter(
             realm_id=realm.id,
             sender=bot.id,
-            recipient__type=Recipient.PERSONAL,
+            recipient__type=Recipient.DIRECT_MESSAGE_GROUP,
             date_sent__gt=now,
         )
         self.assertEqual(notification_bot_dms.count(), 0)

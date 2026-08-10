@@ -1,7 +1,7 @@
 import ClipboardJS from "clipboard";
 import {add} from "date-fns";
 import Handlebars from "handlebars/runtime.js";
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -476,7 +476,7 @@ function update_stream_list(): void {
         for (const stream_id of guest_invite_stream_ids) {
             const sub = stream_data.get_sub_by_id(stream_id);
             if (sub) {
-                stream_pill.append_stream(sub, stream_pill_widget, false);
+                stream_pill.append_stream(sub, stream_pill_widget);
             }
         }
     } else {

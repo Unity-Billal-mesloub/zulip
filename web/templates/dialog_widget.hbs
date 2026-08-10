@@ -3,7 +3,7 @@
         <div {{#if id}}id="{{id}}" {{/if}}class="modal__container" role="dialog" aria-modal="true" aria-labelledby="dialog_title">
             <header class="modal__header">
                 <div class="modal__header-content">
-                    <h1 class="modal__title dialog_heading">
+                    <h1 id="dialog_title" class="modal__title dialog_heading">
                         {{#if modal_title_html}}
                             {{{ modal_title_html }}}
                         {{else}}
@@ -13,6 +13,9 @@
                         {{> help_link_widget . }}
                         {{/if}}
                     </h1>
+                    {{#if is_compact}}
+                        <div class="alert" id="dialog_error"></div>
+                    {{/if}}
                     {{#if modal_subtitle_html}}
                     <div class="modal__subtitle">
                         {{{ modal_subtitle_html }}}

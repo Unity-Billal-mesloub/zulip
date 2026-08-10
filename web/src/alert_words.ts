@@ -21,11 +21,7 @@ export function set_words(words: string[]): void {
 export function get_word_list(): {word: string}[] {
     // Returns a array of objects
     // (with each alert_word as value and 'word' as key to the object.)
-    const words = [];
-    for (const word of my_alert_words) {
-        words.push({word});
-    }
-    return words;
+    return Array.from(my_alert_words, (word) => ({word}));
 }
 
 export function has_alert_word(word: string): boolean {
@@ -41,23 +37,18 @@ const alert_regex_replacements = new Map<string, string>([
     ["'", "(?:'|&#39;)"],
 ]);
 
-export function process_message(message: Message): void {
-    // Parsing for alert words is expensive, so we rely on the host
-    // to tell us there any alert words to even look for.
-    if (!message.alerted) {
-        return;
-    }
+export function highlight_alert_words(content: string): string {
+    let updated_content = content;
 
     for (const word of my_alert_words) {
-        const clean = _.escapeRegExp(word).replaceAll(
-            /["&'<>]/g,
-            (c) => alert_regex_replacements.get(c)!,
+        const clean = _.escapeRegExp(word).replaceAll(/["&'<>]/g, (c) =>
+            alert_regex_replacements.get(c)!,
         );
         const before_punctuation = "\\s|^|>|[\\(\\\".,';\\[]";
         const after_punctuation = "(?=\\s)|$|<|[\\)\\\"\\?!:.,';\\]!]";
 
         const regex = new RegExp(`(${before_punctuation})(${clean})(${after_punctuation})`, "ig");
-        const updated_content = message.content.replace(
+        updated_content = updated_content.replace(
             regex,
             (
                 match: string,
@@ -82,8 +73,20 @@ export function process_message(message: Message): void {
                 return before + "<span class='alert-word'>" + word + "</span>" + after;
             },
         );
-        message_store.update_message_content(message, updated_content);
     }
+
+    return updated_content;
+}
+
+export function process_message(message: Message): void {
+    // Parsing for alert words is expensive, so we rely on the host
+    // to tell us if there are any alert words to even look for.
+    if (!message.alerted) {
+        return;
+    }
+
+    const updated_content = highlight_alert_words(message.content);
+    message_store.update_message_content(message, updated_content);
 }
 
 export function notifies(message: Message): boolean {

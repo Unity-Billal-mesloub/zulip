@@ -1,11 +1,10 @@
 import * as Sentry from "@sentry/browser";
 import {SPAN_STATUS_OK} from "@sentry/core";
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
 import * as activity_ui from "./activity_ui.ts";
-import {all_messages_data} from "./all_messages_data.ts";
 import * as blueslip from "./blueslip.ts";
 import * as browser_history from "./browser_history.ts";
 import * as channel from "./channel.ts";
@@ -17,6 +16,7 @@ import * as compose_notifications from "./compose_notifications.ts";
 import * as compose_recipient from "./compose_recipient.ts";
 import * as compose_state from "./compose_state.ts";
 import * as condense from "./condense.ts";
+import * as date_util from "./date_util.ts";
 import * as feedback_widget from "./feedback_widget.ts";
 import {Filter} from "./filter.ts";
 import * as hash_parser from "./hash_parser.ts";
@@ -272,6 +272,17 @@ function create_and_update_message_list(
         opts.show_more_topics = browser_history.get_current_state_show_more_topics() ?? false;
     }
 
+    // To keep the behaviour of `n` key consistent and the memory of
+    // `topics_kept_unread_by_user` as recent as possible, we clear it.
+    if (
+        !opts.trigger ||
+        !["next_topic_unread_hotkey", "old_unreads_missing", "retarget message location"].includes(
+            opts.trigger,
+        )
+    ) {
+        topic_generator.reset_topics_kept_unread_by_user();
+    }
+
     // Show the new set of messages. It is important to set message_lists.current to
     // the view right as it's being shown, because we rely on message_lists.current
     // being shown for deciding when to condense messages.
@@ -288,6 +299,7 @@ function handle_post_message_list_change(
     select_immediately: boolean,
     select_opts: SelectIdOpts,
     then_select_offset: number | undefined,
+    anchored_for_date?: boolean,
 ): void {
     // Important: We need to consider opening the compose box
     // before calling render_message_list_with_selected_message, so that the logic in
@@ -297,12 +309,20 @@ function handle_post_message_list_change(
     compose_actions.on_narrow(opts);
 
     if (select_immediately) {
-        render_message_list_with_selected_message({
+        const render_opts: Parameters<typeof render_message_list_with_selected_message>[0] = {
             id_info,
             select_offset: then_select_offset,
             msg_list: message_lists.current,
             select_opts,
-        });
+        };
+
+        if (anchored_for_date) {
+            // We go through this codepath only when the message closest
+            // to the date is present locally in the current message list.
+            render_opts.anchor_for_date = true;
+            id_info.final_select_id = id_info.local_select_id!;
+        }
+        render_message_list_with_selected_message(render_opts);
     }
 
     handle_post_view_change(msg_list, opts);
@@ -312,6 +332,24 @@ function handle_post_message_list_change(
     // It is important to call this after other important updates
     // like narrow filter and compose recipients happen.
     compose_recipient.handle_middle_pane_transition();
+}
+
+function get_selected_message_top_offset(is_first_message_in_narrow = false): number {
+    const navbar_height = $("#navbar-fixed-container").height()!;
+    let final_offset =
+        navbar_height +
+        // Falls back to 30px height + 10px top margin if no sticky header is present.
+        ($(".message_header").outerHeight(true) ?? 40);
+
+    // These extra offsets are only needed for the first message in the feed when using
+    // the date search operator. Using this otherwise causes too much of a gap between
+    // the top of the message and the sticky header.
+    if (is_first_message_in_narrow) {
+        final_offset +=
+            ($("#message_feed_errors_container").outerHeight(true) ?? 0) +
+            ($(".top-messages-logo").outerHeight(true) ?? 0);
+    }
+    return final_offset;
 }
 
 export function try_rendering_locally_for_same_narrow(
@@ -691,12 +729,8 @@ export let show = (raw_terms: NarrowTerm[], show_opts: ShowMessageViewOpts): voi
                 const $row = message_lists.current.get_row(opts.then_select_id);
                 if ($row.length > 0) {
                     const row_props = $row.get_offset_to_window();
-                    const navbar_height = $("#navbar-fixed-container").height()!;
-                    // 30px height + 10px top margin.
                     const compose_box_top = $("#compose").get_offset_to_window().top;
-                    const sticky_header_outer_height = 40;
-                    const min_height_for_message_top_visible =
-                        navbar_height + sticky_header_outer_height;
+                    const min_height_for_message_top_visible = get_selected_message_top_offset();
 
                     if (
                         // We want to keep the selected message in the same scroll position after the narrow changes if possible.
@@ -747,7 +781,7 @@ export let show = (raw_terms: NarrowTerm[], show_opts: ShowMessageViewOpts): voi
             // Reset the collapsed status of messages rows.
             condense.condense_and_collapse(message_lists.current.view.$list.find(".message_row"));
             message_edit.restore_edit_state_after_message_view_change();
-            submessage.process_widget_rows_in_list(message_lists.current);
+            submessage.render_widget_rows_in_list(message_lists.current);
             message_feed_top_notices.update_top_of_narrow_notices(msg_list);
 
             // We may need to scroll to the selected message after swapping
@@ -766,15 +800,25 @@ export let show = (raw_terms: NarrowTerm[], show_opts: ShowMessageViewOpts): voi
 
             {
                 let anchor;
+                let anchor_date;
 
                 // Either we're trying to center the narrow around a
                 // particular message ID (which could be max_int), or we're
                 // asking the server to figure out for us what the first
                 // unread message is, and center the narrow around that.
                 switch (id_info.final_select_id) {
-                    case undefined:
+                    case undefined: {
                         anchor = "first_unread";
+                        const date_term = filter
+                            .terms()
+                            .find((raw_term) => raw_term.operator === "date");
+                        const date_anchor =
+                            date_term && date_util.maybe_get_date_anchor(date_term.operand);
+                        if (date_anchor) {
+                            ({anchor, anchor_date} = date_anchor);
+                        }
                         break;
+                    }
                     case -1:
                         // This case should never happen in this code path; it's
                         // here in case we choose to extract this as an
@@ -789,9 +833,10 @@ export let show = (raw_terms: NarrowTerm[], show_opts: ShowMessageViewOpts): voi
                 }
                 message_fetch.load_messages_for_narrow({
                     anchor,
+                    anchor_date,
                     validate_filter_topic_post_fetch:
                         filter.requires_adjustment_for_moved_with_target,
-                    cont() {
+                    cont(data) {
                         if (message_lists.current !== msg_list) {
                             return;
                         }
@@ -819,12 +864,18 @@ export let show = (raw_terms: NarrowTerm[], show_opts: ShowMessageViewOpts): voi
                             );
                             filter.narrow_requires_hash_change = false;
                         }
+                        // If the server request was made with a "date" anchor,
+                        // we select the message id that the server returned.
+                        if (anchor === "date") {
+                            id_info.final_select_id = data.anchor;
+                        }
                         if (!select_immediately) {
                             render_message_list_with_selected_message({
                                 id_info,
                                 select_offset: then_select_offset,
                                 msg_list,
                                 select_opts,
+                                anchor_for_date: anchor === "date",
                             });
                         }
                     },
@@ -835,6 +886,7 @@ export let show = (raw_terms: NarrowTerm[], show_opts: ShowMessageViewOpts): voi
         assert(select_opts !== undefined);
         assert(select_immediately !== undefined);
 
+        const anchored_for_date = filter.has_operator("date");
         handle_post_message_list_change(
             id_info,
             msg_list,
@@ -842,10 +894,12 @@ export let show = (raw_terms: NarrowTerm[], show_opts: ShowMessageViewOpts): voi
             select_immediately,
             select_opts,
             then_select_offset,
+            anchored_for_date,
         );
         if (
             id_info.first_unread_msg_id_pending_server_verification &&
-            filter.is_conversation_view()
+            filter.is_conversation_view() &&
+            !filter.is_conversation_view_with_near()
         ) {
             const params = message_fetch.get_parameters_for_message_fetch_api({
                 anchor: "first_unread",
@@ -868,7 +922,7 @@ export let show = (raw_terms: NarrowTerm[], show_opts: ShowMessageViewOpts): voi
                     ) {
                         return;
                     }
-                    const data = message_fetch.response_schema.parse(raw_data);
+                    const data = message_fetch.message_fetch_response_schema.parse(raw_data);
                     const first_unread_message_id = data.anchor;
                     const current_selected_id = msg_list.selected_id();
                     if (
@@ -896,9 +950,8 @@ export let show = (raw_terms: NarrowTerm[], show_opts: ShowMessageViewOpts): voi
                             },
                         ];
                         assert(msg_list.data.filter.is_conversation_view());
-                        // Using both /with/ and /near/ operators in a single view doesn't
-                        // make sense, and checks like is_conversation_view_with_near do not
-                        // handle that combination correctly.
+                        // We remove /with/ because using both /with/ and /near/
+                        // operators in a single view doesn't make sense.
                         terms = terms.filter((term) => term.operator !== "with");
                         // We are not navigating user to a different place but want to
                         // keep user at the same place but avoid marking messages as read.
@@ -975,18 +1028,24 @@ function navigate_to_anchor_message(opts: {
     // to avoid them being used for any other purpose.
     function duplicate_current_msg_list_with_new_data(data: MessageListData): MessageList {
         assert(message_lists.current !== undefined);
-        const msg_list = new message_list.MessageList({data});
-        msg_list.reading_prevented = message_lists.current.reading_prevented;
-        return msg_list;
+        return new message_list.MessageList({
+            data,
+            reading_prevented: message_lists.current.reading_prevented,
+            near_view_reading_gate_pending: message_lists.current.near_view_reading_gate_pending,
+        });
     }
 
     function select_msg_id(msg_id: number, select_opts?: SelectIdOpts): void {
         assert(message_lists.current !== undefined);
-        message_lists.current.select_id(msg_id, {
+        const updated_select_opts = {
             then_scroll: true,
             from_scroll: false,
             ...select_opts,
-        });
+        };
+        if (anchor === "date") {
+            updated_select_opts.target_scroll_offset = get_selected_message_top_offset();
+        }
+        message_lists.current.select_id(msg_id, updated_select_opts);
     }
 
     function select_anchor_using_data(data: MessageListData): void {
@@ -1000,34 +1059,6 @@ function navigate_to_anchor_message(opts: {
     if (is_anchor_fetched(message_lists.current.data)) {
         select_msg_id(message_list_data_to_target_message_id(message_lists.current.data));
         return;
-    } else if (is_anchor_fetched(all_messages_data) && anchor !== "date") {
-        // We can load messages into `msg_list_data` but we don't know
-        // the fetch status until we contact server. If we are contacting the
-        // server, it is better to just fetch the required messages instead
-        // of just fetching status.
-        //
-        // So, a cheaper check is to see if we have found the anchor in
-        // `all_messages_data`, and if we have, we can say `msg_list_data`
-        // will also have the anchor (for oldest / newest anchors at least).
-        //
-        // We skip this for date anchor since message_list_data_to_target_message_id
-        // for date anchor heavily relies on has_found_oldest/newest being up-to-date.
-        // When using load_local_messages, we do not copy fetch_status over to
-        // msg_list_data, which causes error in message_list_data_to_target_message_id.
-        // See https://github.com/zulip/zulip/pull/37198#issuecomment-3858015457 for
-        // more details.
-        const msg_list_data = new MessageListData({
-            filter: message_lists.current.data.filter,
-            excludes_muted_topics: message_lists.current.data.excludes_muted_topics,
-            excludes_muted_users: message_lists.current.data.excludes_muted_users,
-        });
-        load_local_messages(msg_list_data, all_messages_data);
-        // It is still possible that `all_messages_data` doesn't have any messages
-        // for the current narrow, so we check for that.
-        if (!msg_list_data.visibly_empty()) {
-            select_anchor_using_data(msg_list_data);
-            return;
-        }
     }
 
     const msg_list_data = new MessageListData({
@@ -1156,6 +1187,79 @@ export function maybe_add_local_messages(opts: {
     const superset_data = opts.superset_data;
     const filter = msg_data.filter;
     const unread_info = narrow_state.get_first_unread_info(filter);
+
+    // The `date` operator behaves as a slicing mechanism rather than a
+    // true filter: we just need to pick the message to select, namely
+    // the one closest to (on or after) the searched date. The local
+    // superset cache is not an authoritative, contiguous view of the
+    // narrow (see message_list_data_cache.get_superset_datasets), so we
+    // can resolve the anchor locally only when the answer doesn't depend
+    // on the cache being complete: when every local message is older than
+    // the date and we've found the newest, nothing matches on/after the
+    // date and the closest match is the newest message we have. In every
+    // other case the cache may be missing a matching message, so we leave
+    // `final_select_id` undefined and defer to the server's anchor.
+    if (filter.has_operator("date")) {
+        if (
+            unread_info.flavor === "cannot_compute" ||
+            !load_local_messages(msg_data, superset_data)
+        ) {
+            // We surely don't have the earliest matching message
+            // and should fetch messages from the server
+            // for the most accurate anchor.
+            // This is particularly applicable during a hashchange or
+            // when the filter has a search operator.
+            id_info.final_select_id = undefined;
+            return;
+        }
+
+        const date_str = filter.terms_with_operator("date")[0]!.operand;
+        const unix_seconds_for_date_local_midnight =
+            date_util.get_unix_seconds_for_local_midnight(date_str);
+        if (unix_seconds_for_date_local_midnight === null) {
+            return;
+        }
+
+        const first_message_in_filtered_data = msg_data.first();
+        assert(first_message_in_filtered_data !== undefined);
+        const last_message_in_filtered_data = msg_data.last();
+        assert(last_message_in_filtered_data !== undefined);
+
+        id_info.final_select_id = undefined;
+        if (first_message_in_filtered_data.timestamp >= unix_seconds_for_date_local_midnight) {
+            // The earliest message we have locally is already on or after the
+            // searched date, so the anchor would be our first message. But we
+            // cannot confirm locally that it's the first message in the narrow:
+            // superset_data's fetch status reflects only messages with
+            // UserMessage rows, so for a channel narrow that includes history
+            // it cannot tell us whether older matching messages exist on the
+            // server (see #32150). We therefore defer to the server, which
+            // returns both the accurate anchor and the correct oldest-message
+            // fetch status that render_message_list_with_selected_message
+            // relies on to add the top-of-feed offsets when the anchor is the
+            // first message in the narrow.
+            return;
+        }
+
+        if (last_message_in_filtered_data.timestamp < unix_seconds_for_date_local_midnight) {
+            if (superset_data.fetch_status.has_found_newest()) {
+                // No messages on/after the date exist at all so select last message
+                // locally.
+                id_info.final_select_id = last_message_in_filtered_data.id;
+                id_info.local_select_id = id_info.final_select_id;
+                return;
+            }
+            // There may be matching messages on/after the date that we
+            // haven't fetched yet, so defer to the server.
+            return;
+        }
+        // The date falls within the local range, but the cache need not
+        // be contiguous, so the first local message on/after the date may
+        // not be the narrow's true first such message (an unfetched
+        // matching message could lie between the date and it). Defer to
+        // the server for the accurate anchor.
+        return;
+    }
 
     // If we don't have a specific message we're hoping to select
     // (i.e. no `target_id`) and the narrow's filter doesn't
@@ -1314,6 +1418,7 @@ export function render_message_list_with_selected_message(opts: {
     id_info: TargetMessageIdInfo;
     select_offset: number | undefined;
     select_opts: SelectIdOpts;
+    anchor_for_date?: boolean;
 }): void {
     if (message_lists.current !== undefined && message_lists.current !== opts.msg_list) {
         // If we navigated away from a view while we were fetching
@@ -1332,6 +1437,7 @@ export function render_message_list_with_selected_message(opts: {
     const select_offset = opts.select_offset;
 
     const msg_id = id_info.final_select_id ?? message_lists.current.first_unread_message_id();
+
     // There should be something since it's not visibly empty.
     assert(msg_id !== undefined);
 
@@ -1358,6 +1464,21 @@ export function render_message_list_with_selected_message(opts: {
         message_lists.current.view.set_message_offset(select_offset);
     }
     message_lists.current.view.update_sticky_recipient_headers();
+    if (opts.anchor_for_date) {
+        // The aim is to keep the selected message at the top, when using
+        // the date anchor.
+        const is_first_message_in_narrow =
+            message_lists.current.first()?.id === msg_id &&
+            message_lists.current.data.fetch_status.has_found_oldest();
+        message_lists.current.view.set_message_offset(
+            get_selected_message_top_offset(is_first_message_in_narrow),
+        );
+    }
+
+    // For /near/ views, check whether reading can be resumed before
+    // processing visibility, so that messages are correctly marked
+    // as read on the initial render if appropriate.
+    message_lists.current.maybe_resume_reading_for_near_view();
     unread_ops.process_visible();
     narrow_history.save_narrow_state_and_flush();
 }
@@ -1554,7 +1675,7 @@ export function narrow_by_recipient(
             show(
                 [
                     {
-                        operator: "stream",
+                        operator: "channel",
                         operand: message.stream_id.toString(),
                     },
                 ],
@@ -1628,7 +1749,6 @@ function handle_post_view_change(
     } else {
         compose_closed_ui.update_buttons();
     }
-    compose_closed_ui.update_recipient_text_for_reply_button();
 
     message_view_header.render_title_area();
 

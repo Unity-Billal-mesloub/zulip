@@ -61,6 +61,7 @@ AUTHENTICATION_BACKENDS: tuple[str, ...] = (
     "zproject.backends.GitLabAuthBackend",
     "zproject.backends.AppleAuthBackend",
     "zproject.backends.GenericOpenIdConnectBackend",
+    "zproject.backends.DiscordAuthBackend",
 )
 
 EXTERNAL_URI_SCHEME = "http://"
@@ -181,6 +182,8 @@ if FAKE_LDAP_MODE:
     AUTHENTICATION_BACKENDS += ("zproject.backends.ZulipLDAPAuthBackend",)
 
 BILLING_ENABLED = True
+# Set a string value here to test the navbar message in dev.
+# <a> elements and other HTML permitted.
 LANDING_PAGE_NAVBAR_MESSAGE: str | None = None
 
 # Our run-dev proxy uses X-Forwarded-Port to communicate to Django
@@ -229,7 +232,8 @@ DEMO_ORG_DEADLINE_DAYS = 30
 if external_host_env is None and not IS_DEV_DROPLET:
     USING_CAPTCHA = True
 
-TOPIC_SUMMARIZATION_MODEL = "groq/llama-3.3-70b-versatile"
+TOPIC_SUMMARIZATION_MODEL = "llama-3.3-70b-versatile"
+TOPIC_SUMMARIZATION_API_BASE = "https://api.groq.com/openai/v1"
 # Defaults based on groq's pricing for Llama 3.3 70B Versatile 128k.
 # https://groq.com/pricing/
 OUTPUT_COST_PER_GIGATOKEN = 590

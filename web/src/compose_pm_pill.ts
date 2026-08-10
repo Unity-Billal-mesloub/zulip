@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 
 import type {InputPillConfig} from "./input_pill.ts";
 import * as input_pill from "./input_pill.ts";
@@ -63,18 +63,6 @@ export function set_from_typeahead(person: User): void {
     });
 }
 
-export function set_from_emails(value: string): void {
-    // value is something like "alice@example.com,bob@example.com"
-    clear();
-    if (value === "") {
-        return;
-    }
-    const user_ids_string = people.emails_strings_to_user_ids_string(value);
-    if (user_ids_string) {
-        widget.appendValue(user_ids_string);
-    }
-}
-
 export function set_from_user_ids(value: number[], skip_pill_callbacks: boolean): void {
     clear();
     for (const user_id of value) {
@@ -137,6 +125,13 @@ export function update_user_pill_active_status(user: User, is_active: boolean): 
     };
 
     widget.updatePill(pill.$element[0]!, updated_pill);
+}
+
+export function update_user_pill_full_name(user_id: number, full_name: string): void {
+    if (!widget) {
+        return;
+    }
+    user_pill.update_pill_full_name(widget, user_id, full_name);
 }
 
 export function rewire_widget(value: UserPillWidget): void {

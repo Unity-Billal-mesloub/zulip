@@ -1,6 +1,7 @@
-import hashlib
+import fcntl
 import os
 import re
+import tempfile
 from datetime import timedelta
 from typing import Any
 from unittest import mock, skipUnless
@@ -10,7 +11,7 @@ from urllib.parse import quote, quote_plus
 from django.apps import apps
 from django.conf import settings
 from django.core.management import call_command, find_commands
-from django.core.management.base import CommandError
+from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Q
 from django.db.models.functions import Lower
 from django.test import override_settings
@@ -19,7 +20,7 @@ from typing_extensions import override
 from confirmation.models import Confirmation, generate_realm_creation_url
 from zerver.actions.create_user import do_create_user
 from zerver.actions.user_settings import do_change_user_setting
-from zerver.lib.management import ZulipBaseCommand
+from zerver.lib.management import ZulipBaseCommand, skip_unless_locked
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import most_recent_message, stdout_suppressed
 from zerver.models import Realm, RealmAuditLog, Recipient, UserProfile
@@ -382,6 +383,31 @@ class TestCalculateFirstVisibleMessageID(ZulipTestCase):
         m.assert_has_calls(calls, any_order=True)
 
 
+class TestSkipUnlessLocked(ZulipTestCase):
+    def test_skip_when_lock_is_held(self) -> None:
+        ran = []
+
+        @skip_unless_locked
+        def handle(self: BaseCommand, *args: Any, **kwargs: Any) -> None:
+            ran.append(True)
+
+        command = BaseCommand()
+        with tempfile.TemporaryDirectory() as lock_dir, self.settings(LOCKFILE_DIRECTORY=lock_dir):
+            # With the lock free, the wrapped command runs.
+            handle(command)
+            self.assertEqual(ran, [True])
+
+            # While the lock is held -- as it would be by a previous
+            # invocation still running -- the command is skipped, with
+            # no error and no output.
+            ran.clear()
+            lock_path = os.path.join(lock_dir, "test_management_commands.lock")
+            with open(lock_path, "w") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle(command)
+            self.assertEqual(ran, [])
+
+
 class TestPasswordRestEmail(ZulipTestCase):
     COMMAND_NAME = "send_password_reset_email"
 
@@ -481,6 +507,7 @@ class TestConvertMattermostData(ZulipTestCase):
             masking_content=False,
             mattermost_data_dir=os.path.realpath(mm_fixtures),
             output_dir=os.path.realpath(output_dir),
+            combine_into_one_realm=False,
         )
         self.assertEqual(mock_print.mock_calls, [call("Converting data ...")])
 
@@ -555,6 +582,7 @@ class TestSendCustomEmail(ZulipTestCase):
                 self.COMMAND_NAME,
                 "-r=zulip",
                 f"--path={path}",
+                "--campaign-name=test_dry_run",
                 f"-u={user.delivery_email}",
                 "--subject=Test email",
                 "--from-name=zulip@zulip.example.com",
@@ -573,6 +601,7 @@ class TestSendCustomEmail(ZulipTestCase):
                 self.COMMAND_NAME,
                 "-r=zulip",
                 f"--path={path}",
+                "--campaign-name=test_dry_run",
                 f"-u={user.delivery_email},{other_user.delivery_email}",
                 "--subject=Test email",
                 "--from-name=zulip@zulip.example.com",
@@ -594,10 +623,7 @@ class TestSendCustomEmail(ZulipTestCase):
     def test_custom_email_duplicate_prevention_by_user(self) -> None:
         path = "zerver/tests/fixtures/email/custom_emails/email_base_headers_custom_test.md"
 
-        # Generate email hash
-        with open(path) as f:
-            text = f.read()
-            email_template_hash = hashlib.sha256(text.encode()).hexdigest()[0:32]
+        campaign_name = "test_campaign_01"
 
         iago = self.example_user("iago")
         prospero = self.example_user("prospero")
@@ -606,13 +632,14 @@ class TestSendCustomEmail(ZulipTestCase):
         call_command(
             self.COMMAND_NAME,
             f"--path={path}",
+            f"--campaign-name={campaign_name}",
             f"-u={iago.delivery_email},{prospero.delivery_email}",
         )
 
         # Verify RealmAuditLog entries were created
         audit_logs = RealmAuditLog.objects.filter(event_type=AuditLogEventType.CUSTOM_EMAIL_SENT)
         self.assert_length(audit_logs, 2)
-        self.assertEqual(email_template_hash, audit_logs[0].extra_data["email_id"])
+        self.assertEqual(campaign_name, audit_logs[0].extra_data["campaign_name"])
         self.assertEqual("Test subject", audit_logs[0].extra_data["email_subject"])
 
         # Second send attempt - should send one email and exclude the two users that already received the email
@@ -621,6 +648,7 @@ class TestSendCustomEmail(ZulipTestCase):
             call_command(
                 self.COMMAND_NAME,
                 f"--path={path}",
+                f"--campaign-name={campaign_name}",
                 f"-u={iago.delivery_email},{prospero.delivery_email},{othello.delivery_email}",
             )
 
@@ -634,7 +662,7 @@ class TestSendCustomEmail(ZulipTestCase):
             event_type=AuditLogEventType.CUSTOM_EMAIL_SENT
         )
         self.assert_length(new_audit_logs, 3)
-        self.assertEqual(email_template_hash, new_audit_logs[0].extra_data["email_id"])
+        self.assertEqual(campaign_name, new_audit_logs[0].extra_data["campaign_name"])
         self.assertEqual("Test subject", audit_logs[0].extra_data["email_subject"])
 
         othello_audit_log = RealmAuditLog.objects.filter(
@@ -675,19 +703,25 @@ class TestSendCustomEmail(ZulipTestCase):
         owner_user.save()
 
         # Get the total number of marketing emails to be sent
-        users = UserProfile.objects.filter(
-            is_active=True,
-            is_bot=False,
-            is_mirror_dummy=False,
-            realm__deactivated=False,
-            enable_marketing_emails=True,
-        ).filter(
-            Q(long_term_idle=False)
-            | Q(
-                role__in=[
-                    UserProfile.ROLE_REALM_OWNER,
-                    UserProfile.ROLE_REALM_ADMINISTRATOR,
-                ]
+        users = (
+            UserProfile.objects.filter(
+                is_active=True,
+                is_bot=False,
+                is_mirror_dummy=False,
+                realm__deactivated=False,
+                enable_marketing_emails=True,
+            )
+            .filter(
+                Q(long_term_idle=False)
+                | Q(
+                    role__in=[
+                        UserProfile.ROLE_REALM_OWNER,
+                        UserProfile.ROLE_REALM_ADMINISTRATOR,
+                    ]
+                )
+            )
+            .exclude(
+                Q(tos_version=None) | Q(tos_version=UserProfile.TOS_VERSION_BEFORE_FIRST_LOGIN)
             )
         )
 
@@ -696,14 +730,12 @@ class TestSendCustomEmail(ZulipTestCase):
         users_count = users.count()
         users_emails = users.values_list("lower_email", flat=True)
 
-        # Get the email hash
-        with open(path) as f:
-            text = f.read()
-            email_template_hash = hashlib.sha256(text.encode()).hexdigest()[0:32]
+        campaign_name = "marketing_campaign_01"
 
         call_command(
             self.COMMAND_NAME,
             f"--path={path}",
+            f"--campaign-name={campaign_name}",
             "--marketing",
         )
 
@@ -711,8 +743,8 @@ class TestSendCustomEmail(ZulipTestCase):
         audit_logs = RealmAuditLog.objects.filter(event_type=AuditLogEventType.CUSTOM_EMAIL_SENT)
         self.assert_length(audit_logs, users_count)
 
-        # Verify the email_id
-        self.assertEqual(email_template_hash, audit_logs[0].extra_data["email_id"])
+        # Verify the campaign_name
+        self.assertEqual(campaign_name, audit_logs[0].extra_data["campaign_name"])
 
         # Verify modified_user email
         modified_users_email = audit_logs.annotate(
@@ -739,6 +771,7 @@ class TestSendCustomEmail(ZulipTestCase):
             call_command(
                 self.COMMAND_NAME,
                 f"--path={path}",
+                f"--campaign-name={campaign_name}",
                 "--marketing",
             )
 
@@ -759,6 +792,7 @@ class TestSendCustomEmail(ZulipTestCase):
     def test_email_sending_failure_does_not_create_audit_log(self) -> None:
         """Test that audit log entries are not created when email sending fails"""
         path = "zerver/tests/fixtures/email/custom_emails/email_base_headers_custom_test.md"
+        campaign_name = "failed_campaign_01"
         hamlet = self.example_user("hamlet")
         cordelia = self.example_user("cordelia")
 
@@ -779,6 +813,7 @@ class TestSendCustomEmail(ZulipTestCase):
                 self.COMMAND_NAME,
                 f"--path={path}",
                 "-r=zulip",
+                f"--campaign-name={campaign_name}",
                 f"-u={hamlet.delivery_email},{cordelia.delivery_email}",
             )
 

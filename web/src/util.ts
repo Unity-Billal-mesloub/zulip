@@ -1,5 +1,4 @@
 import _ from "lodash";
-import * as z from "zod/mini";
 
 import * as blueslip from "./blueslip.ts";
 import {$t} from "./i18n.ts";
@@ -32,11 +31,9 @@ export function lower_bound<T1, T2>(
     const last = array.length;
 
     let len = last - first;
-    let middle;
-    let step;
     while (len > 0) {
-        step = Math.floor(len / 2);
-        middle = first + step;
+        const step = Math.floor(len / 2);
+        const middle = first + step;
         if (less(array[middle]!, value, middle)) {
             first = middle;
             first += 1;
@@ -76,8 +73,7 @@ export function extract_pm_recipients(recipients: string): string[] {
 // When the type is "private", properties from to_user_ids might be undefined.
 // See https://github.com/zulip/zulip/pull/23032#discussion_r1038480596.
 export type Recipient =
-    | {type: "private"; to_user_ids?: string | undefined; reply_to: string}
-    | ({type: "stream"} & StreamTopic);
+    {type: "private"; to_user_ids?: string | undefined} | ({type: "stream"} & StreamTopic);
 
 export const same_recipient = function util_same_recipient(a?: Recipient, b?: Recipient): boolean {
     if (a === undefined || b === undefined) {
@@ -89,7 +85,8 @@ export const same_recipient = function util_same_recipient(a?: Recipient, b?: Re
             return false;
         }
         return a.to_user_ids === b.to_user_ids;
-    } else if (a.type === "stream" && b.type === "stream") {
+    }
+    if (a.type === "stream" && b.type === "stream") {
         return same_stream_and_topic(a, b);
     }
 
@@ -145,6 +142,20 @@ export function make_strcmp(): (x: string, y: string) => number {
 }
 
 export const strcmp = make_strcmp();
+
+type StreamInfo = {
+    name: string;
+    is_archived: boolean;
+};
+
+export function compare_stream_by_archived_then_name(a: StreamInfo, b: StreamInfo): number {
+    // We show non-archived streams first
+    if (a.is_archived !== b.is_archived) {
+        return Number(a.is_archived) - Number(b.is_archived);
+    }
+
+    return strcmp(a.name, b.name);
+}
 
 export const array_compare = function util_array_compare<T>(a: T[], b: T[]): boolean {
     if (a.length !== b.length) {
@@ -269,6 +280,10 @@ export function is_channel_synonym(text: string): boolean {
 
 export function is_channels_synonym(text: string): boolean {
     return text === "streams";
+}
+
+export function is_numeric_string(text: string): boolean {
+    return /^\d+$/.test(text);
 }
 
 export function prefix_match({value, search_term}: {value: string; search_term: string}): boolean {
@@ -467,7 +482,7 @@ export function check_time_input(input_value: string, keep_number_as_float = fal
     // Number.parseInt and Number.parseFloat will convert strings like
     // "24a" to 24.
     if (Number.isNaN(Number(input_value))) {
-        return Number.NaN;
+        return NaN;
     }
 
     if (keep_number_as_float) {
@@ -506,7 +521,8 @@ export function the<T>(items: T[] | JQuery<T>): T {
 export function compare_a_b<T>(a: T, b: T): number {
     if (a > b) {
         return 1;
-    } else if (a === b) {
+    }
+    if (a === b) {
         return 0;
     }
     return -1;
@@ -531,46 +547,6 @@ export function is_topic_name_considered_empty(topic: string): boolean {
         return true;
     }
     return false;
-}
-
-export let get_retry_backoff_seconds = (
-    xhr: JQuery.jqXHR<unknown> | undefined,
-    attempts: number,
-    tighter_backoff = false,
-): number => {
-    // We need to respect the server's rate-limiting headers, but beyond
-    // that, we also want to avoid contributing to a thundering herd if
-    // the server is giving us 500/502 responses.
-    //
-    // We do the maximum of the retry-after header and an exponential
-    // backoff.
-    let backoff_scale: number;
-    if (tighter_backoff) {
-        // Starts at 1-2s and ends at 16-32s after enough failures.
-        backoff_scale = Math.min(2 ** attempts, 32);
-    } else {
-        // Starts at 1-2s and ends at 45-90s after enough failures.
-        backoff_scale = Math.min(2 ** ((attempts + 1) / 2), 90);
-    }
-    // Add a bit jitter to backoff scale.
-    const backoff_delay_secs = ((1 + Math.random()) / 2) * backoff_scale;
-    let rate_limit_delay_secs = 0;
-    const rate_limited_error_schema = z.object({
-        "retry-after": z.number(),
-        code: z.literal("RATE_LIMIT_HIT"),
-    });
-    const parsed = rate_limited_error_schema.safeParse(xhr?.responseJSON);
-    if (xhr?.status === 429 && parsed?.success && parsed?.data) {
-        // Add a bit of jitter to the required delay suggested by the
-        // server, because we may be racing with other copies of the web
-        // app.
-        rate_limit_delay_secs = parsed.data["retry-after"] + Math.random() * 0.5;
-    }
-    return Math.max(backoff_delay_secs, rate_limit_delay_secs);
-};
-
-export function rewire_get_retry_backoff_seconds(value: typeof get_retry_backoff_seconds): void {
-    get_retry_backoff_seconds = value;
 }
 
 export async function sha256_hash(text: string): Promise<string | undefined> {
@@ -608,7 +584,7 @@ export function parse_youtube_start_time(url: string): number | undefined {
     }
 
     // t can be in seconds (e.g. 120) or in #h#m#s format (e.g. 1h2m30s)
-    if (/^\d+$/.test(t)) {
+    if (is_numeric_string(t)) {
         return Number.parseInt(t, 10);
     }
 
@@ -621,4 +597,40 @@ export function parse_youtube_start_time(url: string): number | undefined {
     }
 
     return undefined;
+}
+
+// Measure the maximum rendered width of a set of candidate text
+// strings. This is used to set CSS variables for column widths
+// that need to fit their content tightly. All candidates are
+// inserted as block-level children of a single hidden container
+// sized to max-content, so only one reflow is needed.
+/* istanbul ignore next */
+export let max_text_content_width = (candidates: string[], css_class?: string): number => {
+    const container = document.createElement("div");
+    Object.assign(container.style, {
+        position: "absolute",
+        visibility: "hidden",
+        whiteSpace: "nowrap",
+        width: "max-content",
+        left: "-9999px",
+        top: "0",
+    });
+
+    for (const text of candidates) {
+        const child = document.createElement("div");
+        if (css_class !== undefined) {
+            child.className = css_class;
+        }
+        child.textContent = text;
+        container.append(child);
+    }
+
+    document.body.append(container);
+    const width = container.getBoundingClientRect().width;
+    container.remove();
+    return width;
+};
+
+export function rewire_max_text_content_width(value: typeof max_text_content_width): void {
+    max_text_content_width = value;
 }

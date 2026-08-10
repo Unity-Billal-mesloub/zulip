@@ -1,10 +1,10 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
 import * as z from "zod/mini";
 
+import render_channel_list_item from "../templates/channel_list_item.hbs";
 import render_confirm_archive_channel_folder from "../templates/confirm_dialog/confirm_archive_channel_folder.hbs";
-import render_stream_list_item from "../templates/stream_list_item.hbs";
 import render_create_channel_folder_modal from "../templates/stream_settings/create_channel_folder_modal.hbs";
 import render_edit_channel_folder_modal from "../templates/stream_settings/edit_channel_folder_modal.hbs";
 
@@ -16,7 +16,6 @@ import * as confirm_dialog from "./confirm_dialog.ts";
 import * as dialog_widget from "./dialog_widget.ts";
 import * as dropdown_widget from "./dropdown_widget.ts";
 import type {DropdownWidget, DropdownWidgetOptions} from "./dropdown_widget.ts";
-import * as hash_util from "./hash_util.ts";
 import {$t, $t_html} from "./i18n.ts";
 import * as ListWidget from "./list_widget.ts";
 import type {ListWidget as ListWidgetType} from "./list_widget.ts";
@@ -33,11 +32,7 @@ let channel_folder_stream_list_widget: ListWidgetType<StreamSubscription> | unde
 let stream_list_widget_stream_ids: Set<number> | undefined;
 let add_channel_folder_widget: DropdownWidget | undefined;
 
-function compare_by_name(a: dropdown_widget.Option, b: dropdown_widget.Option): number {
-    return util.strcmp(a.name, b.name);
-}
-
-export function add_channel_folder(): void {
+export function add_channel_folder(on_create?: (folder_id: number) => void): void {
     const modal_content_html = render_create_channel_folder_modal({
         max_channel_folder_name_length: realm.max_channel_folder_name_length,
         max_channel_folder_description_length: realm.max_channel_folder_description_length,
@@ -76,6 +71,7 @@ export function add_channel_folder(): void {
                         order: id,
                     };
                     channel_folders.add(channel_folder);
+                    on_create?.(id);
                 },
             },
             close_on_success,
@@ -155,7 +151,7 @@ function archive_folder(folder_id: number): void {
     }
 
     function on_success(): void {
-        successful_requests = successful_requests + 1;
+        successful_requests += 1;
 
         if (successful_requests === stream_ids.length) {
             // Make request to archive folder only after all channels
@@ -194,13 +190,8 @@ export function handle_archiving_channel_folder(folder_id: number): void {
 }
 
 function format_channel_item_html(stream: StreamSubscription): string {
-    return render_stream_list_item({
-        name: stream.name,
-        stream_id: stream.stream_id,
-        stream_color: stream.color,
-        invite_only: stream.invite_only,
-        is_web_public: stream.is_web_public,
-        stream_edit_url: hash_util.channels_settings_edit_url(stream, "general"),
+    return render_channel_list_item({
+        stream,
         can_manage_folder: settings_data.can_user_manage_folder(),
     });
 }
@@ -286,18 +277,13 @@ function get_edit_modal_folder_id_if_open(): number | undefined {
 function get_channel_folder_candidates(folder_id: number): dropdown_widget.Option[] {
     return stream_data
         .get_unsorted_subs()
-        .flatMap((stream) =>
-            stream.folder_id !== folder_id
-                ? [
-                      {
-                          name: stream.name,
-                          unique_id: stream.stream_id,
-                          stream,
-                      },
-                  ]
-                : [],
-        )
-        .toSorted(compare_by_name);
+        .filter((stream) => stream.folder_id !== folder_id)
+        .map((stream) => ({
+            name: stream.name,
+            unique_id: stream.stream_id,
+            stream,
+        }))
+        .toSorted((a, b) => util.compare_stream_by_archived_then_name(a.stream, b.stream));
 }
 
 function get_channel_folder_candidates_for_dropdown(): dropdown_widget.Option[] {
@@ -337,6 +323,7 @@ function render_add_channel_folder_widget(): void {
         item_click_callback: channel_dropdown_item_click_callback,
         $events_container: $("#edit_channel_folder"),
         unique_id_type: "number",
+        no_items_text: $t({defaultMessage: "No channels to add"}),
     };
     add_channel_folder_widget = new dropdown_widget.DropdownWidget(opts);
     add_channel_folder_widget.setup();

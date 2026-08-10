@@ -319,7 +319,22 @@ def do_auto_soft_deactivate_users(inactive_for_days: int, realm: Realm | None) -
 
 
 def reactivate_user_if_soft_deactivated(user_profile: UserProfile) -> UserProfile | None:
-    if user_profile.long_term_idle:
+    if not user_profile.long_term_idle:
+        return None
+
+    with transaction.atomic(savepoint=False):
+        # Lock the row and re-read the flag so concurrent reactivations of the
+        # same user run the expensive backfill at most once.
+        locked_user = (
+            UserProfile.objects.select_for_update(no_key=True)
+            .only("id", "long_term_idle")
+            .get(id=user_profile.id)
+        )
+        if not locked_user.long_term_idle:
+            # Another caller reactivated this user while we waited; sync our copy.
+            user_profile.long_term_idle = False
+            return None
+
         add_missing_messages(user_profile)
         user_profile.long_term_idle = False
         user_profile.save(update_fields=["long_term_idle"])
@@ -331,7 +346,6 @@ def reactivate_user_if_soft_deactivated(user_profile: UserProfile) -> UserProfil
         )
         logger.info("Soft reactivated user %s", user_profile.id)
         return user_profile
-    return None
 
 
 def get_users_for_soft_deactivation(
@@ -399,7 +413,10 @@ def queue_soft_reactivation(user_profile_id: int) -> None:
         "type": "soft_reactivate",
         "user_profile_id": user_profile_id,
     }
-    queue_event_on_commit("deferred_work", event)
+    if settings.DEDICATED_SOFT_REACTIVATION_QUEUE:
+        queue_event_on_commit("soft_reactivation", event)
+    else:
+        queue_event_on_commit("deferred_work", event)
 
 
 def soft_reactivate_if_personal_notification(

@@ -1,6 +1,7 @@
 import base64
 import copy
 import json
+import logging
 import os
 import re
 import secrets
@@ -48,7 +49,7 @@ from typing_extensions import override
 from confirmation.models import Confirmation, create_confirmation_link
 from zerver.actions.create_realm import do_create_realm
 from zerver.actions.create_user import do_create_user, do_reactivate_user
-from zerver.actions.invites import do_invite_users
+from zerver.actions.invites import do_invite_users, do_revoke_user_invite
 from zerver.actions.realm_settings import (
     do_deactivate_realm,
     do_reactivate_realm,
@@ -86,7 +87,7 @@ from zerver.lib.test_helpers import (
     use_s3_backend,
 )
 from zerver.lib.thumbnail import DEFAULT_AVATAR_SIZE, MEDIUM_AVATAR_SIZE, resize_avatar
-from zerver.lib.types import Validator
+from zerver.lib.types import Invitee, Validator
 from zerver.lib.url_encoding import append_url_query_string
 from zerver.lib.user_groups import (
     get_system_user_group_by_name,
@@ -122,10 +123,12 @@ from zerver.signals import JUST_CREATED_THRESHOLD
 from zerver.views.auth import log_into_subdomain, maybe_send_to_registration
 from zproject.backends import (
     AUTH_BACKEND_NAME_MAP,
+    EMAIL_WITH_ENCODED_DISCORD_ID,
     AppleAuthBackend,
     AuthFuncT,
     AzureADAuthBackend,
     DevAuthBackend,
+    DiscordAuthBackend,
     EmailAuthBackend,
     ExternalAuthDataDict,
     ExternalAuthMethod,
@@ -153,6 +156,7 @@ from zproject.backends import (
     auth_enabled_helper,
     check_password_strength,
     dev_auth_enabled,
+    discord_auth_enabled,
     email_belongs_to_ldap,
     get_external_method_dicts,
     github_auth_enabled,
@@ -1155,8 +1159,10 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
             self.assertEqual(
                 m.output,
                 [
-                    f"INFO:{self.logger_string}:Authentication attempt from 127.0.0.1: "
-                    f"subdomain=zulip;username={self.email};outcome=failed;return_data={{}}"
+                    (
+                        f"INFO:{self.logger_string}:Authentication attempt from 127.0.0.1: "
+                        f"subdomain=zulip;username={self.email};outcome=failed;return_data={{}}"
+                    )
                 ],
             )
 
@@ -1457,7 +1463,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
             self.assert_in_response("Enter your account details to complete registration.", result)
 
             # Verify that the user is asked for name but not password
-            self.assert_not_in_success_response(["id_password"], result)
+            self.assert_not_in_success_response(["id_password", "ldap-password"], result)
             self.assert_in_success_response(["id_full_name"], result)
             if expect_full_name_prepopulated:
                 # Verify the name field gets correctly pre-populated:
@@ -1580,7 +1586,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         with self.captureOnCommitCallbacks(execute=True):
             do_invite_users(
                 iago,
-                [email],
+                [Invitee(full_name=name, email=email)],
                 [],
                 include_realm_default_subscriptions=True,
                 invite_expires_in_minutes=2 * 24 * 60,
@@ -1593,6 +1599,105 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         self.stage_two_of_registration(
             result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
         )
+
+    @override_settings(TERMS_OF_SERVICE_VERSION=None)
+    def test_social_auth_registration_invitation_exists_invite_required(self) -> None:
+        """
+        A user with a pending email invitation can sign up via a social
+        backend even when the organization requires invitations to join.
+        """
+        email = "newuser@zulip.com"
+        name = "Full Name"
+        subdomain = "zulip"
+        realm = get_realm("zulip")
+        do_set_realm_property(realm, "invite_required", True, acting_user=None)
+
+        iago = self.example_user("iago")
+        with self.captureOnCommitCallbacks(execute=True):
+            do_invite_users(
+                iago,
+                [Invitee(full_name=name, email=email)],
+                [],
+                include_realm_default_subscriptions=True,
+                invite_expires_in_minutes=2 * 24 * 60,
+            )
+
+        account_data_dict = self.get_account_data_dict(email=email, name=name)
+        result = self.social_auth_test(
+            account_data_dict, expect_choose_email_screen=True, subdomain=subdomain, is_signup=True
+        )
+        self.stage_two_of_registration(
+            result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
+        )
+
+    @override_settings(TERMS_OF_SERVICE_VERSION=None)
+    def test_social_auth_registration_invite_required_invalid_invitations(self) -> None:
+        """
+        In an organization requiring invitations, PreregistrationUser rows
+        that aren't valid pending invitations to this realm do not permit
+        signup.
+        """
+        email = "newuser@zulip.com"
+        name = "Full Name"
+        subdomain = "zulip"
+        realm = get_realm("zulip")
+        do_set_realm_property(realm, "invite_required", True, acting_user=None)
+        iago = self.example_user("iago")
+
+        def invite(referred_by: UserProfile) -> PreregistrationUser:
+            with self.captureOnCommitCallbacks(execute=True):
+                do_invite_users(
+                    referred_by,
+                    [Invitee(full_name=name, email=email)],
+                    [],
+                    include_realm_default_subscriptions=True,
+                    invite_expires_in_minutes=2 * 24 * 60,
+                )
+            return PreregistrationUser.objects.get(email=email, referred_by=referred_by)
+
+        def leftover_signup_attempt() -> None:
+            # Left over from the user's own earlier signup attempt, made
+            # while the organization permitted signups; such rows have
+            # referred_by unset.
+            prereg_user = PreregistrationUser.objects.create(
+                email=email, realm=realm, password_required=False
+            )
+            create_confirmation_link(prereg_user, Confirmation.USER_REGISTRATION)
+
+        def revoked_invitation() -> None:
+            do_revoke_user_invite(invite(iago), acting_user=iago)
+
+        def expired_invitation() -> None:
+            with time_machine.travel(timezone_now() - timedelta(days=3), tick=False):
+                invite(iago)
+
+        def invitation_in_another_realm() -> None:
+            invite(self.lear_user("cordelia"))
+
+        for setup in [
+            leftover_signup_attempt,
+            revoked_invitation,
+            expired_invitation,
+            invitation_in_another_realm,
+        ]:
+            with self.subTest(setup.__name__):
+                setup()
+                account_data_dict = self.get_account_data_dict(email=email, name=name)
+                result = self.social_auth_test(
+                    account_data_dict,
+                    expect_choose_email_screen=True,
+                    subdomain=subdomain,
+                    is_signup=True,
+                )
+                result = self.client_get(result["Location"])
+                self.assertEqual(result.status_code, 200)
+                self.assert_in_success_response(
+                    [f"Please request an invite for {email} from the organization administrator."],
+                    result,
+                )
+                with self.assertRaises(UserProfile.DoesNotExist):
+                    get_user_by_delivery_email(email, realm)
+                PreregistrationUser.objects.filter(email=email).delete()
 
     @override_settings(TERMS_OF_SERVICE_VERSION=None)
     def test_social_auth_with_invalid_multiuse_invite(self) -> None:
@@ -1916,6 +2021,102 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
             ],
         )
 
+    @override_settings(TERMS_OF_SERVICE_VERSION=None)
+    def test_social_auth_with_ldap_auth_registration_user_in_ldap(self) -> None:
+        """
+        This test checks that in configurations that use the LDAP authentication
+        backend and a social backend, a user who exists in the LDAP directory
+        can create an account via the social backend, with their identity
+        having been verified by the social backend.
+        """
+        self.init_default_ldap_database()
+        email = "newuser_email@zulip.com"
+        name = "Social Fullname"
+        # The name of this user in the LDAP directory, which is expected
+        # to take precedence over the name provided by the social backend.
+        ldap_name = "New LDAP fullname"
+        realm = get_realm("zulip")
+        subdomain = "zulip"
+        ldap_user_attr_map = {"full_name": "cn"}
+
+        backend_path = f"zproject.backends.{self.BACKEND_CLASS.__name__}"
+        with self.settings(
+            POPULATE_PROFILE_VIA_LDAP=True,
+            LDAP_EMAIL_ATTR="mail",
+            AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map,
+            AUTHENTICATION_BACKENDS=(
+                backend_path,
+                "zproject.backends.ZulipLDAPAuthBackend",
+                "zproject.backends.ZulipDummyBackend",
+            ),
+        ):
+            account_data_dict = self.get_account_data_dict(email=email, name=name)
+            result = self.social_auth_test(
+                account_data_dict,
+                expect_choose_email_screen=True,
+                subdomain=subdomain,
+                is_signup=True,
+            )
+            # The full name is populated from LDAP, so the registration form
+            # is skipped and the account is created directly.
+            self.stage_two_of_registration(
+                result,
+                realm,
+                subdomain,
+                email,
+                name,
+                ldap_name,
+                skip_registration_form=True,
+            )
+
+    @override_settings(TERMS_OF_SERVICE_VERSION="1.0")
+    def test_social_auth_with_ldap_auth_registration_user_in_ldap_with_form(self) -> None:
+        """
+        Like test_social_auth_with_ldap_auth_registration_user_in_ldap, but with
+        a Terms of Service version set, so that
+        the registration form is displayed instead of being skipped. The form
+        should not prompt the user for their LDAP password, since their
+        identity was already verified by the social backend and any password
+        entered would be ignored.
+        """
+        self.init_default_ldap_database()
+        email = "newuser_email@zulip.com"
+        name = "Social Fullname"
+        # The name of this user in the LDAP directory, which is expected
+        # to take precedence over the name provided by the social backend.
+        ldap_name = "New LDAP fullname"
+        realm = get_realm("zulip")
+        subdomain = "zulip"
+        ldap_user_attr_map = {"full_name": "cn"}
+
+        backend_path = f"zproject.backends.{self.BACKEND_CLASS.__name__}"
+        with self.settings(
+            POPULATE_PROFILE_VIA_LDAP=True,
+            LDAP_EMAIL_ATTR="mail",
+            AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map,
+            AUTHENTICATION_BACKENDS=(
+                backend_path,
+                "zproject.backends.ZulipLDAPAuthBackend",
+                "zproject.backends.ZulipDummyBackend",
+            ),
+        ):
+            account_data_dict = self.get_account_data_dict(email=email, name=name)
+            result = self.social_auth_test(
+                account_data_dict,
+                expect_choose_email_screen=True,
+                subdomain=subdomain,
+                is_signup=True,
+            )
+            self.stage_two_of_registration(
+                result,
+                realm,
+                subdomain,
+                email,
+                name,
+                ldap_name,
+                skip_registration_form=False,
+            )
+
     def test_social_auth_complete(self) -> None:
         def mock_process_error(backend: BaseOAuth2, data: Mapping[str, object]) -> None:
             raise AuthFailed(backend, "Not found")
@@ -1981,7 +2182,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         with self.captureOnCommitCallbacks(execute=True):
             do_invite_users(
                 iago,
-                [email],
+                [Invitee(full_name=name, email=email)],
                 [],
                 include_realm_default_subscriptions=False,
                 invite_expires_in_minutes=invite_expires_in_minutes,
@@ -2005,7 +2206,863 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         self.assertEqual(created_user.role, UserProfile.ROLE_MEMBER)
 
 
-class SAMLAuthBackendTest(SocialAuthBase):
+class SocialAuthBaseWithSyncAttrTest(SocialAuthBase, ABC):
+    """
+    Abstract test class for providers that supports user attribute
+    sync through SOCIAL_AUTH_SYNC_ATTRS_DICT.
+    """
+
+    @staticmethod
+    def derive_extra_attrs_from_config(sync_attrs_config: dict[str, Any]) -> list[str]:
+        """
+        Derive the extra_attrs list from the sync config.
+        """
+        declared = []
+        for key, value in sync_attrs_config.items():
+            if key == "groups":
+                continue
+            if isinstance(value, str):
+                declared.append(value)
+        return declared
+
+    @abstractmethod
+    def social_auth_test_with_sync_attrs(
+        self,
+        account_data_dict: dict[str, str],
+        *,
+        subdomain: str,
+        is_signup: bool = False,
+        extra_attrs: dict[str, Any],
+        sync_attrs_config: dict[str, Any],
+        multiuse_object_key: str = "",
+    ) -> "TestHttpResponse":
+        """
+        Run social_auth_test with provider-specific settings applied.
+
+        Implementations must:
+          1. Apply SOCIAL_AUTH_SYNC_ATTRS_DICT (via sync_attrs_config) using
+             self.settings() internally.
+          2. Plumb extra_attrs to social_auth_test.
+          3. Call self.social_auth_test() and return the result.
+
+        Callers wrap this in assertLogs if they need to capture log output.
+        """
+        raise NotImplementedError
+
+    def test_social_auth_full_name_sync(self) -> None:
+        sync_attrs_dict = {"zulip": {self.BACKEND_CLASS.name: {"full_name": True}}}
+        new_name = "Updated Name"
+
+        account_data_dict = self.get_account_data_dict(email=self.email, name=new_name)
+        with self.assertLogs(self.logger_string, level="INFO"):
+            result = self.social_auth_test_with_sync_attrs(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attrs={},
+                sync_attrs_config=sync_attrs_dict,
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.full_name, new_name)
+
+        # Without full_name sync configured, the name should not be updated.
+        account_data_dict = self.get_account_data_dict(email=self.email, name="Another Name")
+        result = self.social_auth_test_with_sync_attrs(
+            account_data_dict,
+            subdomain="zulip",
+            extra_attrs={},
+            sync_attrs_config={},
+        )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.full_name, new_name)
+
+        # Name with invalid characters should be rejected with a warning.
+        account_data_dict = self.get_account_data_dict(email=self.email, name="Invalid* Name")
+        with (
+            self.assertLogs(self.logger_string, level="WARNING") as m,
+        ):
+            result = self.social_auth_test_with_sync_attrs(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attrs={},
+                sync_attrs_config=sync_attrs_dict,
+            )
+        # Logging in succeeds.
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+        self.user_profile.refresh_from_db()
+        # The name doesn't get synced however, and we log a warning.
+        self.assertEqual(self.user_profile.full_name, new_name)
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output(
+                    f"Failed to sync full_name for user {self.user_profile.id}: Invalid characters in name!",
+                    type="warning",
+                )
+            ],
+        )
+
+    def test_social_auth_profile_field_sync(self) -> None:
+        birthday_field = CustomProfileField.objects.get(
+            realm=self.user_profile.realm, name="Birthday"
+        )
+        old_birthday_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=birthday_field
+        ).value
+
+        sync_custom_attrs_dict = {
+            "zulip": {
+                self.BACKEND_CLASS.name: {
+                    "custom__phone_number": "mobilePhone",
+                    "role": "zulip_role",
+                }
+            }
+        }
+
+        # Before we procee, verify the role, which is supposed to get synced, is like
+        # we expect.
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_MEMBER)
+
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        result = self.social_auth_test_with_sync_attrs(
+            account_data_dict,
+            subdomain="zulip",
+            extra_attrs=dict(mobilePhone="123412341234", birthday="2021-01-01", zulip_role="owner"),
+            sync_attrs_config=sync_custom_attrs_dict,
+        )
+
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(data["full_name"], self.name)
+        self.assertEqual(data["subdomain"], "zulip")
+        self.assertEqual(result.status_code, 302)
+
+        phone_field = CustomProfileField.objects.get(
+            realm=self.user_profile.realm, name="Phone number"
+        )
+        phone_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=phone_field
+        ).value
+        self.assertEqual(phone_field_value, "123412341234")
+
+        # Verify the Birthday field doesn't get synced - because it isn't configured for syncing.
+        new_birthday_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=birthday_field
+        ).value
+        self.assertEqual(new_birthday_field_value, old_birthday_field_value)
+
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+
+        # Now test with an invalid role value.
+        with (
+            self.assertLogs(self.logger_string, level="WARNING") as m,
+        ):
+            result = self.social_auth_test_with_sync_attrs(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attrs=dict(zulip_role="wrongrole"),
+                sync_attrs_config=sync_custom_attrs_dict,
+            )
+
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output(
+                    f"Ignoring unsupported role value wrongrole for user {self.user_profile.id} in SOCIAL_AUTH_SYNC_ATTRS_DICT",
+                    type="warning",
+                )
+            ],
+        )
+
+        # Verify empty attribute is handled.
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        result = self.social_auth_test_with_sync_attrs(
+            account_data_dict,
+            subdomain="zulip",
+            extra_attrs=dict(mobilePhone="", zulip_role=""),
+            sync_attrs_config=sync_custom_attrs_dict,
+        )
+
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        phone_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=phone_field
+        ).value
+        self.assertEqual(phone_field_value, "123412341234")
+
+        # Verify with none of these attributes sent at all.
+        result = self.social_auth_test_with_sync_attrs(
+            account_data_dict,
+            subdomain="zulip",
+            extra_attrs=dict(),
+            sync_attrs_config=sync_custom_attrs_dict,
+        )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        phone_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=phone_field
+        ).value
+        self.assertEqual(phone_field_value, "123412341234")
+
+        # Disable syncing of role in SOCIAL_AUTH_SYNC_ATTRS_DICT, while keeping
+        # role in extra_attrs. This edge case means the attribute will be read from the
+        # data provided by the IdP, but won't be used for anything.
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        result = self.social_auth_test_with_sync_attrs(
+            account_data_dict,
+            subdomain="zulip",
+            extra_attrs=dict(zulip_role=["guest"]),
+            sync_attrs_config={},
+        )
+
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+
+        # Verify that values for text fields are truncated if they're too long.
+        long_value = "x" * 60
+        expected_value = "x" * 49 + "…"
+        with (
+            self.assertLogs(self.logger_string, level="WARNING") as m,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test_with_sync_attrs(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attrs=dict(mobilePhone=long_value),
+                sync_attrs_config=sync_custom_attrs_dict,
+            )
+
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertIn(
+            self.logger_output(
+                f"Truncated value for custom profile field phone_number of user {self.user_profile.id} to 50 characters.",
+                type="warning",
+            ),
+            m.output,
+        )
+        phone_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=phone_field
+        ).value
+        self.assertEqual(phone_field_value, expected_value)
+
+    def test_social_auth_group_sync(self) -> None:
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=hamlet)
+        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=hamlet)
+        # Sanity assert. We'll use this group name to verify that groups get created on demand by group sync.
+        assert not NamedUserGroup.objects.filter(
+            name="newtestgroup", realm_for_sharding=realm
+        ).exists()
+
+        sync_custom_attrs_dict = {
+            "zulip": {
+                self.BACKEND_CLASS.name: {
+                    "role": "zulip_role",
+                    "groups": [
+                        "testgroup1",
+                        ("group2", "testgroup2"),
+                        ("group3", "newtestgroup"),
+                    ],
+                }
+            }
+        }
+
+        with (
+            self.assertLogs(self.logger_string) as mock_log,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test_with_sync_attrs(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attrs=dict(zulip_groups=["testgroup1", "group2", "group3", "group99"]),
+                sync_attrs_config=sync_custom_attrs_dict,
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertTrue(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        # newtestgroup exists now. It was created because the zulip_groups attribute implied the user should
+        # be a member of the group.
+        new_test_group = NamedUserGroup.objects.get(name="newtestgroup", realm_for_sharding=realm)
+        self.assertTrue(
+            is_user_in_group(
+                new_test_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        # group99 is not listed in the configuration, so doesn't get created, despite being passed in
+        # the zulip_groups attribute.
+        self.assertFalse(
+            NamedUserGroup.objects.filter(name="group99", realm_for_sharding=realm).exists()
+        )
+
+        # Verify the expected log line revealing the internal details of the incoming groups -> Zulip groups translation.
+        self.assertIn(
+            self.logger_output(
+                f"social_auth_sync_user_attributes:<user:{hamlet.id}>: received group names: ['group2', 'group3', 'group99', 'testgroup1']|intended Zulip groups: ['newtestgroup', 'testgroup1', 'testgroup2']. group mapping used: {{'testgroup1': 'testgroup1', 'group2': 'testgroup2', 'group3': 'newtestgroup'}}",
+                type="info",
+            ),
+            mock_log.output,
+        )
+        self.assertIn(
+            self.logger_output(
+                f"User {hamlet.id} should be added to groups ['newtestgroup'], but they don't exist. Creating them first.",
+                type="info",
+            ),
+            mock_log.output,
+        )
+
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        result = self.social_auth_test_with_sync_attrs(
+            account_data_dict,
+            subdomain="zulip",
+            extra_attrs=dict(zulip_groups=["testgroup1"]),
+            sync_attrs_config=sync_custom_attrs_dict,
+        )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                new_test_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        result = self.social_auth_test_with_sync_attrs(
+            account_data_dict,
+            subdomain="zulip",
+            extra_attrs=dict(zulip_groups=[]),
+            sync_attrs_config=sync_custom_attrs_dict,
+        )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertFalse(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                new_test_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        bulk_add_members_to_user_groups([testgroup1, testgroup2], [hamlet.id], acting_user=None)
+
+        result = self.social_auth_test_with_sync_attrs(
+            account_data_dict,
+            subdomain="zulip",
+            extra_attrs=dict(zulip_groups=[]),
+            # If the realm is not configured for group sync, group memberships of course should be
+            # unaffected by zulip_groups attr.
+            sync_attrs_config={"zulip": {self.BACKEND_CLASS.name: {}}},
+        )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertTrue(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        # Simulate a response without zulip_groups attribute being specified in it at all.
+        # As the realm is configured for group sync, that should be treated as
+        # "user should not be a member of any of the groups configured for sync"
+        result = self.social_auth_test_with_sync_attrs(
+            account_data_dict,
+            subdomain="zulip",
+            extra_attrs={},
+            sync_attrs_config=sync_custom_attrs_dict,
+        )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertFalse(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                new_test_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+    def test_social_auth_group_sync_sync_all_groups_mode(self) -> None:
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=hamlet)
+        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=hamlet)
+
+        hamletcharacters_group = NamedUserGroup.objects.get(
+            name="hamletcharacters", realm_for_sharding=realm
+        )
+        # Sanity assert. We'll use this group name to verify that groups get created on demand by group sync.
+        assert not NamedUserGroup.objects.filter(
+            name="newtestgroup", realm_for_sharding=realm
+        ).exists()
+
+        sync_custom_attrs_dict = {
+            "zulip": {
+                self.BACKEND_CLASS.name: {
+                    "role": "zulip_role",
+                    # This config syntax enables the "sync all groups" mode.
+                    "groups": "*",
+                }
+            }
+        }
+
+        with (
+            self.assertLogs(self.logger_string) as mock_log,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test_with_sync_attrs(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attrs=dict(
+                    zulip_groups=[
+                        "testgroup1",
+                        "testgroup2",
+                        "newtestgroup",
+                        # Not a valid group name. We will want to verify it gets logged and ignored.
+                        "@@@@",
+                    ]
+                ),
+                sync_attrs_config=sync_custom_attrs_dict,
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertTrue(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                hamletcharacters_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        # newtestgroup exists now. It was created because the zulip_groups attribute implied the user should
+        # be a member of the group.
+        new_test_group = NamedUserGroup.objects.get(name="newtestgroup", realm_for_sharding=realm)
+        self.assertTrue(
+            is_user_in_group(
+                new_test_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        # Verify the expected log line revealing the internal details of the incoming groups -> Zulip groups translation.
+        self.assertIn(
+            self.logger_output(
+                f"social_auth_sync_user_attributes:<user:{hamlet.id}>: received group names: ['@@@@', 'newtestgroup', 'testgroup1', 'testgroup2']|intended Zulip groups: ['@@@@', 'newtestgroup', 'testgroup1', 'testgroup2']. group mapping used: {{'hamletcharacters': 'hamletcharacters', 'testgroup1': 'testgroup1', 'testgroup2': 'testgroup2', 'newtestgroup': 'newtestgroup', '@@@@': '@@@@'}}",
+                type="info",
+            ),
+            mock_log.output,
+        )
+        self.assertIn(
+            self.logger_output(
+                f"User {hamlet.id} should be added to groups ['@@@@', 'newtestgroup'], but they don't exist. Creating them first.",
+                type="info",
+            ),
+            mock_log.output,
+        )
+        self.assertIn(
+            self.logger_output(
+                "ensure_missing_groups: received invalid groups names: ['@@@@']",
+                type="warning",
+            ),
+            mock_log.output,
+        )
+
+    def test_social_auth_create_user_with_synced_role_and_groups(self) -> None:
+        email = "newuser@zulip.com"
+        name = "Full Name"
+        subdomain = "zulip"
+        desdemona = self.example_user("desdemona")
+        realm = get_realm("zulip")
+
+        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=desdemona)
+        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=desdemona)
+
+        # Sanity assert. We'll use this group name to verify that groups get created on demand by group sync.
+        assert not NamedUserGroup.objects.filter(
+            name="newtestgroup", realm_for_sharding=realm
+        ).exists()
+
+        sync_custom_attrs_dict = {
+            "zulip": {
+                self.BACKEND_CLASS.name: {
+                    "role": "zulip_role",
+                    "groups": [
+                        "testgroup1",
+                        ("samlgroup2", "testgroup2"),
+                        ("samlgroup3", "newtestgroup"),
+                    ],
+                }
+            }
+        }
+
+        with (
+            self.assertLogs(self.logger_string, level="INFO") as mock_logger,
+        ):
+            account_data_dict = self.get_account_data_dict(email=email, name=name)
+            result = self.social_auth_test_with_sync_attrs(
+                account_data_dict,
+                subdomain="zulip",
+                is_signup=True,
+                extra_attrs=dict(
+                    mobilePhone="123412341234",
+                    birthday="2021-01-01",
+                    zulip_role="owner",
+                    zulip_groups=["testgroup1", "samlgroup3", "samlgroup99"],
+                ),
+                sync_attrs_config=sync_custom_attrs_dict,
+            )
+
+        with (
+            self.settings(TERMS_OF_SERVICE_VERSION=None),
+            self.assertLogs("zulip.ldap", level="INFO") as mock_ldap_logger,
+        ):
+            self.stage_two_of_registration(
+                result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
+            )
+        user_profile = get_user_by_delivery_email(email, realm)
+        self.assertEqual(user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                testgroup2.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+
+        # newtestgroup exists now. It was created because the zulip_groups attribute implied the user should
+        # be a member of the group.
+        new_test_group = NamedUserGroup.objects.get(name="newtestgroup", realm_for_sharding=realm)
+        self.assertTrue(
+            is_user_in_group(
+                new_test_group.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+        # samlgroup99 is not listed in the configuration, so doesn't get created, despite being passed in
+        # the zulip_groups attribute.
+        self.assertFalse(
+            NamedUserGroup.objects.filter(name="samlgroup99", realm_for_sharding=realm).exists()
+        )
+
+        self.assertEqual(
+            mock_logger.output[0],
+            self.logger_output(
+                "social_auth_sync_user_attributes:<new user signup>: received group names: ['samlgroup3', 'samlgroup99', 'testgroup1']|intended Zulip groups: ['newtestgroup', 'testgroup1']. group mapping used: {'testgroup1': 'testgroup1', 'samlgroup2': 'testgroup2', 'samlgroup3': 'newtestgroup'}",
+                type="info",
+            ),
+        )
+        self.assertEqual(
+            mock_logger.output[1],
+            self.logger_output("Returning role owner for user creation", type="info"),
+        )
+
+        prereg_user = PreregistrationUser.objects.last()
+        assert prereg_user is not None
+        self.assertEqual(
+            mock_ldap_logger.output[0],
+            f"INFO:zulip.ldap:PreregistrationUser {prereg_user.id} should be added to groups ['newtestgroup'], but they don't exist. Creating them first.",
+        )
+
+        self.assertEqual(
+            mock_ldap_logger.output[1],
+            f"INFO:zulip.ldap:Synced user groups for PreregistrationUser {prereg_user.id} in {realm.id}: "
+            '{"newtestgroup": true, "testgroup1": true, "testgroup2": false}. Final groups set: [\'newtestgroup\', \'testgroup1\']',
+        )
+
+    def test_social_auth_create_user_from_multiuse_invite_role_and_group_sync(self) -> None:
+        email = "newuser@zulip.com"
+        name = "Full Name"
+        subdomain = "zulip"
+        desdemona = self.example_user("desdemona")
+        realm = get_realm("zulip")
+
+        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=desdemona)
+        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=desdemona)
+
+        sync_custom_attrs_dict = {
+            "zulip": {
+                self.BACKEND_CLASS.name: {
+                    "role": "zulip_role",
+                    "groups": ["testgroup1", ("samlgroup2", "testgroup2")],
+                }
+            }
+        }
+
+        invite = MultiuseInvite.objects.create(
+            realm=realm,
+            referred_by=desdemona,
+            # Set a role on the invite to verify that it gets ignored in favor
+            # of the role implied by the zulip_role attribute.
+            invited_as=PreregistrationUser.INVITE_AS["REALM_ADMIN"],
+        )
+        invite.groups.set([testgroup1, testgroup2])
+        create_confirmation_link(invite, Confirmation.MULTIUSE_INVITE)
+        multiuse_confirmation = Confirmation.objects.all().last()
+        assert multiuse_confirmation is not None
+        multiuse_object_key = multiuse_confirmation.confirmation_key
+        account_data_dict = self.get_account_data_dict(email=email, name=name)
+
+        result = self.social_auth_test_with_sync_attrs(
+            account_data_dict,
+            subdomain="zulip",
+            is_signup=True,
+            multiuse_object_key=multiuse_object_key,
+            extra_attrs=dict(
+                zulip_role="member",
+                zulip_groups=["testgroup1"],
+            ),
+            sync_attrs_config=sync_custom_attrs_dict,
+        )
+        with (
+            self.settings(TERMS_OF_SERVICE_VERSION=None),
+            self.assertLogs("zulip.ldap", level="INFO") as mock_ldap_logger,
+        ):
+            self.stage_two_of_registration(
+                result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
+            )
+        user_profile = get_user_by_delivery_email(email, realm)
+        self.assertEqual(user_profile.role, UserProfile.ROLE_MEMBER)
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                testgroup2.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+
+        prereg_user = PreregistrationUser.objects.last()
+        assert prereg_user is not None
+        self.assertEqual(
+            f"INFO:zulip.ldap:Synced user groups for PreregistrationUser {prereg_user.id} in {realm.id}: "
+            '{"testgroup1": true, "testgroup2": false}. Final groups set: [\'testgroup1\']',
+            mock_ldap_logger.output[0],
+        )
+
+    def test_social_auth_create_user_with_synced_role_only(self) -> None:
+        email = "newuser@zulip.com"
+        name = "Full Name"
+        subdomain = "zulip"
+        realm = get_realm("zulip")
+
+        sync_custom_attrs_dict = {
+            "zulip": {
+                self.BACKEND_CLASS.name: {
+                    "role": "zulip_role",
+                }
+            }
+        }
+
+        with (
+            self.assertLogs(self.logger_string, level="INFO") as mock_logger,
+        ):
+            account_data_dict = self.get_account_data_dict(email=email, name=name)
+            result = self.social_auth_test_with_sync_attrs(
+                account_data_dict,
+                subdomain="zulip",
+                is_signup=True,
+                extra_attrs=dict(
+                    zulip_role="owner",
+                    # Groups won't get synced, despite being passed - group sync
+                    # is not configured.
+                    zulip_groups=["samlgroup1"],
+                ),
+                sync_attrs_config=sync_custom_attrs_dict,
+            )
+
+        with (
+            self.settings(TERMS_OF_SERVICE_VERSION=None),
+        ):
+            self.stage_two_of_registration(
+                result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
+            )
+
+        user_profile = get_user_by_delivery_email(email, realm)
+        self.assertEqual(user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        self.assertEqual(
+            mock_logger.output[0],
+            self.logger_output("Returning role owner for user creation", type="info"),
+        )
+
+    def test_social_auth_sync_field_not_existing(self) -> None:
+        sync_custom_attrs_dict = {
+            "zulip": {
+                self.BACKEND_CLASS.name: {
+                    "custom__title": "title",
+                    "custom__phone_number": "mobilePhone",
+                    "wrongfield": "wrongfield",
+                }
+            }
+        }
+        self.assertFalse(
+            CustomProfileField.objects.filter(
+                realm=self.user_profile.realm, name__iexact="title"
+            ).exists()
+        )
+
+        with self.assertLogs(self.logger_string, level="WARNING") as m:
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test_with_sync_attrs(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attrs=dict(
+                    mobilePhone="123412341234", title="some title", birthday="2021-01-01"
+                ),
+                sync_attrs_config=sync_custom_attrs_dict,
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(data["full_name"], self.name)
+        self.assertEqual(data["subdomain"], "zulip")
+        self.assertEqual(result.status_code, 302)
+
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output(
+                    "Ignoring unsupported UserProfile field wrongfield in SOCIAL_AUTH_SYNC_ATTRS_DICT",
+                    "warning",
+                ),
+                self.logger_output(
+                    (
+                        "Exception while syncing custom profile fields for user"
+                        f" {self.user_profile.id}: Custom profile field with name title not found."
+                    ),
+                    "warning",
+                ),
+            ],
+        )
+
+
+class SAMLAuthBackendTest(SocialAuthBaseWithSyncAttrTest):
     BACKEND_CLASS = SAMLAuthBackend
     LOGIN_URL = "/accounts/login/social/saml/test_idp"
     SIGNUP_URL = "/accounts/register/social/saml/test_idp"
@@ -2089,6 +3146,41 @@ class SAMLAuthBackendTest(SocialAuthBase):
             result = self.client_post(self.AUTH_FINISH_URL, post_params, **headers)
 
         return result
+
+    @override
+    def social_auth_test_with_sync_attrs(
+        self,
+        account_data_dict: dict[str, str],
+        *,
+        subdomain: str,
+        is_signup: bool = False,
+        extra_attrs: dict[str, Any],
+        sync_attrs_config: dict[str, Any],
+        multiuse_object_key: str = "",
+    ) -> "TestHttpResponse":
+        saml_extra_attrs = {}
+        for key, value in extra_attrs.items():
+            if isinstance(value, list):
+                saml_extra_attrs[key] = value
+            else:
+                saml_extra_attrs[key] = [value]
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        if saml_sync_attrs_dict := sync_attrs_config.get(subdomain, {}).get("saml"):
+            idps_dict["test_idp"]["extra_attrs"] = self.derive_extra_attrs_from_config(
+                saml_sync_attrs_dict
+            )
+
+        with self.settings(
+            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_attrs_config,
+        ):
+            return self.social_auth_test(
+                account_data_dict,
+                subdomain=subdomain,
+                is_signup=is_signup,
+                multiuse_object_key=multiuse_object_key,
+                extra_attributes=saml_extra_attrs,
+            )
 
     def generate_saml_response(
         self,
@@ -2822,6 +3914,12 @@ class SAMLAuthBackendTest(SocialAuthBase):
             email=self.example_email("hamlet"), name="King Hamlet"
         )
 
+        # These are from the fixture
+        got_idps = [
+            "http://www.okta.com/exk1da4osrIL3Y7ip357",
+            "https://idp.testshib.org/idp/shibboleth",
+        ]
+
         # We change the entity_id of the configured test IdP, which means it won't match
         # the Entity ID in the SAMLResponse generated above.
         idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
@@ -2836,7 +3934,8 @@ class SAMLAuthBackendTest(SocialAuthBase):
                 m.output,
                 [
                     self.logger_output(
-                        "/complete/saml/: No valid IdP as issuer of the SAMLResponse.", "info"
+                        f"/complete/saml/: No valid IdP found as issuer of the SAMLResponse; got {got_idps}",
+                        "info",
                     )
                 ],
             )
@@ -2870,7 +3969,7 @@ class SAMLAuthBackendTest(SocialAuthBase):
             m.output,
             [
                 "ERROR:zulip.auth.saml:Error parsing SAMLResponse: Issuer of the Assertion not found or multiple.",
-                "INFO:zulip.auth.saml:/complete/saml/: No valid IdP as issuer of the SAMLResponse.",
+                "INFO:zulip.auth.saml:/complete/saml/: No IdP issuers in SAMLResponse (parse failure?)",
             ],
         )
 
@@ -2898,7 +3997,7 @@ class SAMLAuthBackendTest(SocialAuthBase):
             self.assertEqual(result.status_code, 302)
             self.assertIn("login", result["Location"])
 
-        self.assert_length(m.output, 3)
+        self.assert_length(m.output, 2)
 
     def test_social_auth_saml_bad_idp_param_on_login_page(self) -> None:
         with self.assertLogs(self.logger_string, level="INFO") as m:
@@ -3269,781 +4368,252 @@ class SAMLAuthBackendTest(SocialAuthBase):
             ],
         )
 
-    def test_social_auth_profile_field_sync(self) -> None:
-        birthday_field = CustomProfileField.objects.get(
-            realm=self.user_profile.realm, name="Birthday"
-        )
-        old_birthday_field_value = CustomProfileFieldValue.objects.get(
-            user_profile=self.user_profile, field=birthday_field
-        ).value
+    def test_external_auth_id_saml_login(self) -> None:
+        """Test that SAML login creates an ExternalAuthID record on first login,
+        and uses it for subsequent logins even if the email changes at the IdP."""
+        hamlet = self.example_user("hamlet")
 
-        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
-        idps_dict["test_idp"]["extra_attrs"] = ["mobilePhone", "zulip_role"]
+        # Use "uid" as the permanent_id attribute, to enable ExternalAuthID-based user lookup.
+        idps_config_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_config_dict["test_idp"]["attr_user_permanent_id"] = "uid"
+        uid_value = "testuid"
+        expected_uid = f"test_idp:{uid_value}"
 
-        sync_custom_attrs_dict = {
-            "zulip": {
-                "saml": {
-                    "custom__phone_number": "mobilePhone",
-                    "role": "zulip_role",
-                }
-            }
-        }
-
-        # Before we procee, verify the role, which is supposed to get synced, is like
-        # we expect.
-        self.assertEqual(self.user_profile.role, UserProfile.ROLE_MEMBER)
-
-        with self.settings(
-            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+        # First login: no ExternalAuthID exists yet. One should be created.
+        self.assertEqual(ExternalAuthID.objects.filter(user=hamlet).count(), 0)
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        with (
+            self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_config_dict),
+            self.assertLogs(self.logger_string, level="INFO"),
         ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
             result = self.social_auth_test(
                 account_data_dict,
                 subdomain="zulip",
-                extra_attributes=dict(
-                    mobilePhone=["123412341234"], birthday=["2021-01-01"], zulip_role=["owner"]
-                ),
+                extra_attributes={"uid": [uid_value]},
             )
+        self.assertEqual(result.status_code, 302)
         data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.assertEqual(data["full_name"], self.name)
-        self.assertEqual(data["subdomain"], "zulip")
+        self.assertEqual(data["email"], hamlet.delivery_email)
+
+        external_auth_ids = list(ExternalAuthID.objects.filter(user=hamlet))
+        self.assert_length(external_auth_ids, 1)
+        self.assertEqual(external_auth_ids[0].external_auth_method_name, "saml:test_idp")
+        self.assertEqual(external_auth_ids[0].external_auth_id, expected_uid)
+
+        # Login with changed email - user should be found by ExternalAuthID and email synced.
+        new_email = "hamlet_new@zulip.com"
+        new_account_data_dict = self.get_account_data_dict(email=new_email, name=self.name)
+        with (
+            self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_config_dict),
+            self.assertLogs(self.logger_string, level="INFO") as m,
+        ):
+            result = self.social_auth_test(
+                new_account_data_dict,
+                subdomain="zulip",
+                extra_attributes={"uid": [uid_value]},
+            )
+        self.assertEqual(result.status_code, 302)
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], new_email)
+        hamlet.refresh_from_db()
+        self.assertEqual(hamlet.delivery_email, new_email)
+
+        self.assertIn("has mismatched email. Syncing:", m.output[0])
+
+    def test_external_auth_id_saml_email_conflict(self) -> None:
+        """Test that email is NOT synced when another user has the target email."""
+        hamlet = self.example_user("hamlet")
+        othello = self.example_user("othello")
+
+        idps_config_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_config_dict["test_idp"]["attr_user_permanent_id"] = "uid"
+        uid_value = "testuid"
+        expected_uid = f"test_idp:{uid_value}"
+
+        # Create ExternalAuthID for hamlet.
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        with (
+            self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_config_dict),
+            self.assertLogs(self.logger_string, level="INFO"),
+        ):
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes={"uid": [uid_value]},
+            )
+        self.assertEqual(result.status_code, 302)
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], hamlet.delivery_email)
+
+        external_auth_ids = list(ExternalAuthID.objects.filter(user=hamlet))
+        self.assert_length(external_auth_ids, 1)
+        self.assertEqual(external_auth_ids[0].external_auth_method_name, "saml:test_idp")
+        self.assertEqual(external_auth_ids[0].external_auth_id, expected_uid)
+
+        # Try to login with othello's email - should find hamlet by ExternalAuthID
+        # but NOT sync the email since othello already has it.
+        othello_email = othello.delivery_email
+        conflict_data = self.get_account_data_dict(email=othello_email, name=self.name)
+        with (
+            self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_config_dict),
+            self.assertLogs(self.logger_string, level="INFO") as m,
+        ):
+            result = self.social_auth_test(
+                conflict_data,
+                subdomain="zulip",
+                extra_attributes={"uid": [uid_value]},
+            )
+        self.assertEqual(result.status_code, 302)
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], hamlet.delivery_email)
+
+        hamlet.refresh_from_db()
+        # Email should NOT have changed.
+        self.assertEqual(hamlet.delivery_email, self.email)
+        self.assertIn(
+            f"Can't sync email for user {hamlet.id}: "
+            f"another user exists with target email {othello_email}",
+            m.output[1],
+        )
+
+    def test_external_auth_id_saml_cross_realm_bot_email(self) -> None:
+        """Test that email is NOT synced when the target email is reserved
+        for a cross-realm system bot."""
+        hamlet = self.example_user("hamlet")
+
+        idps_config_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_config_dict["test_idp"]["attr_user_permanent_id"] = "uid"
+        uid_value = "testuid"
+
+        # Create ExternalAuthID for hamlet.
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        with (
+            self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_config_dict),
+            self.assertLogs(self.logger_string, level="INFO"),
+        ):
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes={"uid": [uid_value]},
+            )
         self.assertEqual(result.status_code, 302)
 
-        phone_field = CustomProfileField.objects.get(
-            realm=self.user_profile.realm, name="Phone number"
-        )
-        phone_field_value = CustomProfileFieldValue.objects.get(
-            user_profile=self.user_profile, field=phone_field
-        ).value
-        self.assertEqual(phone_field_value, "123412341234")
-
-        # Verify the Birthday field doesn't get synced - because it isn't configured for syncing.
-        new_birthday_field_value = CustomProfileFieldValue.objects.get(
-            user_profile=self.user_profile, field=birthday_field
-        ).value
-        self.assertEqual(new_birthday_field_value, old_birthday_field_value)
-
-        self.user_profile.refresh_from_db()
-        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
-
-        # Now test with an invalid role value.
+        # Try to login with a cross-realm bot email - should find hamlet by
+        # ExternalAuthID but refuse to sync the email onto a reserved address.
+        bot_email = "notification-bot@zulip.com"
+        assert bot_email in settings.CROSS_REALM_BOT_EMAILS
+        bot_data = self.get_account_data_dict(email=bot_email, name=self.name)
         with (
-            self.settings(
-                SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-            ),
-            self.assertLogs(self.logger_string, level="WARNING") as m,
+            self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_config_dict),
+            self.assertLogs(self.logger_string, level="INFO") as m,
         ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                bot_data,
+                subdomain="zulip",
+                extra_attributes={"uid": [uid_value]},
+            )
+        self.assertEqual(result.status_code, 302)
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], hamlet.delivery_email)
+
+        hamlet.refresh_from_db()
+        # Email should NOT have changed.
+        self.assertEqual(hamlet.delivery_email, self.email)
+        self.assertIn(
+            f"Can't sync email for user {hamlet.id}: {bot_email} is reserved for system bots",
+            m.output[1],
+        )
+
+    def test_external_auth_id_saml_deactivated_user(self) -> None:
+        """Test that a deactivated user can't log in even with ExternalAuthID."""
+        hamlet = self.example_user("hamlet")
+        idps_config_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_config_dict["test_idp"]["attr_user_permanent_id"] = "uid"
+        uid_value = "testuid"
+        expected_uid = f"test_idp:{uid_value}"
+
+        # Create ExternalAuthID for hamlet.
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        with (
+            self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_config_dict),
+            self.assertLogs(self.logger_string, level="INFO"),
+        ):
             result = self.social_auth_test(
                 account_data_dict,
                 subdomain="zulip",
-                extra_attributes=dict(zulip_role=["wrongrole"]),
+                extra_attributes={"uid": [uid_value]},
             )
-
+        self.assertEqual(result.status_code, 302)
         data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.user_profile.refresh_from_db()
-        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        self.assertEqual(data["email"], hamlet.delivery_email)
+
+        external_auth_ids = list(ExternalAuthID.objects.filter(user=hamlet))
+        self.assert_length(external_auth_ids, 1)
+        self.assertEqual(external_auth_ids[0].external_auth_method_name, "saml:test_idp")
+        self.assertEqual(external_auth_ids[0].external_auth_id, expected_uid)
+
+        # Deactivate hamlet.
+        do_deactivate_user(hamlet, acting_user=None)
+
+        # Try to log in - should fail with deactivation redirect.
+        with (
+            self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_config_dict),
+            self.assertLogs(self.logger_string, level="INFO") as m,
+        ):
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes={"uid": [uid_value]},
+            )
+        self.assertEqual(result.status_code, 302)
+        self.assertEqual(
+            result["Location"],
+            f"{hamlet.realm.url}/login/?" + urlencode({"is_deactivated": hamlet.delivery_email}),
+        )
         self.assertEqual(
             m.output,
             [
                 self.logger_output(
-                    f"Ignoring unsupported role value wrongrole for user {self.user_profile.id} in SOCIAL_AUTH_SYNC_ATTRS_DICT",
-                    type="warning",
+                    f"Failed login attempt for deactivated account: {hamlet.id}@zulip",
+                    "info",
                 )
             ],
         )
 
-        # Verify empty attribute is handled.
-        with self.settings(
-            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-        ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-                extra_attributes=dict(mobilePhone=[""], zulip_role=[""]),
-            )
-        data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.user_profile.refresh_from_db()
-        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
-        phone_field_value = CustomProfileFieldValue.objects.get(
-            user_profile=self.user_profile, field=phone_field
-        ).value
-        self.assertEqual(phone_field_value, "123412341234")
-
-        # Verify with none of these attributes sent at all.
-        with self.settings(
-            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-        ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-                extra_attributes=dict(),
-            )
-        data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.user_profile.refresh_from_db()
-        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
-        phone_field_value = CustomProfileFieldValue.objects.get(
-            user_profile=self.user_profile, field=phone_field
-        ).value
-        self.assertEqual(phone_field_value, "123412341234")
-
-        # Disable syncing of role in SOCIAL_AUTH_SYNC_ATTRS_DICT, while keeping
-        # role in extra_attrs. This edge case means the attribute will be read from the
-        # data provided by the IdP, but won't be used for anything.
-        with self.settings(
-            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-            SOCIAL_AUTH_SYNC_ATTRS_DICT={},
-        ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-                extra_attributes=dict(zulip_role=["guest"]),
-            )
-        data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.user_profile.refresh_from_db()
-        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
-
-    def test_social_auth_group_sync(self) -> None:
-        realm = get_realm("zulip")
-        hamlet = self.example_user("hamlet")
-        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=hamlet)
-        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=hamlet)
-        # Sanity assert. We'll use this group name to verify that groups get created on demand by group sync.
-        assert not NamedUserGroup.objects.filter(
-            name="newtestgroup", realm_for_sharding=realm
-        ).exists()
-
-        sync_custom_attrs_dict = {
-            "zulip": {
-                "saml": {
-                    "role": "zulip_role",
-                    "groups": [
-                        "testgroup1",
-                        ("samlgroup2", "testgroup2"),
-                        ("samlgroup3", "newtestgroup"),
-                    ],
-                }
-            }
-        }
-
-        with (
-            self.settings(
-                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-            ),
-            self.assertLogs(self.logger_string) as mock_log,
-        ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-                extra_attributes=dict(
-                    zulip_groups=["testgroup1", "samlgroup2", "samlgroup3", "samlgroup99"]
-                ),
-            )
-        data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.assertEqual(result.status_code, 302)
-
-        self.assertTrue(
-            is_user_in_group(
-                testgroup1.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        self.assertTrue(
-            is_user_in_group(
-                testgroup2.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-
-        # newtestgroup exists now. It was created because the zulip_groups attribute implied the user should
-        # be a member of the group.
-        new_test_group = NamedUserGroup.objects.get(name="newtestgroup", realm_for_sharding=realm)
-        self.assertTrue(
-            is_user_in_group(
-                new_test_group.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        # samlgroup99 is not listed in the configuration, so doesn't get created, despite being passed in
-        # the zulip_groups attribute.
-        self.assertFalse(
-            NamedUserGroup.objects.filter(name="samlgroup99", realm_for_sharding=realm).exists()
-        )
-
-        # Verify the expected log line revealing the internal details of the incoming groups -> Zulip groups translation.
-        self.assertIn(
-            self.logger_output(
-                f"social_auth_sync_user_attributes:<user:{hamlet.id}>: received group names: ['samlgroup2', 'samlgroup3', 'samlgroup99', 'testgroup1']|intended Zulip groups: ['newtestgroup', 'testgroup1', 'testgroup2']. group mapping used: {{'testgroup1': 'testgroup1', 'samlgroup2': 'testgroup2', 'samlgroup3': 'newtestgroup'}}",
-                type="info",
-            ),
-            mock_log.output,
-        )
-        self.assertIn(
-            self.logger_output(
-                f"User {hamlet.id} should be added to groups ['newtestgroup'], but they don't exist. Creating them first.",
-                type="info",
-            ),
-            mock_log.output,
-        )
-
-        with self.settings(
-            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-        ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-                extra_attributes=dict(zulip_groups=["testgroup1"]),
-            )
-        data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.assertEqual(result.status_code, 302)
-
-        self.assertTrue(
-            is_user_in_group(
-                testgroup1.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        self.assertFalse(
-            is_user_in_group(
-                testgroup2.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        self.assertFalse(
-            is_user_in_group(
-                new_test_group.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-
-        with self.settings(
-            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-        ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-                extra_attributes=dict(zulip_groups=[]),
-            )
-        data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.assertEqual(result.status_code, 302)
-
-        self.assertFalse(
-            is_user_in_group(
-                testgroup1.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        self.assertFalse(
-            is_user_in_group(
-                testgroup2.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        self.assertFalse(
-            is_user_in_group(
-                new_test_group.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-
-        bulk_add_members_to_user_groups([testgroup1, testgroup2], [hamlet.id], acting_user=None)
-
-        with self.settings(
-            # If the realm is not configured for group sync, group memberships of course should be
-            # unaffected by zulip_groups attr.
-            SOCIAL_AUTH_SYNC_ATTRS_DICT={"zulip": {"saml": {}}},
-        ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-                extra_attributes=dict(zulip_groups=[]),
-            )
-        data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.assertEqual(result.status_code, 302)
-
-        self.assertTrue(
-            is_user_in_group(
-                testgroup1.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        self.assertTrue(
-            is_user_in_group(
-                testgroup2.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-
-        with self.settings(
-            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-        ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-            # Simulate a SAMLResponse without zulip_groups attribute being specified in it at all.
-            # As the realm is configured for group sync, that should be treated as
-            # "user should not be a member of any of the groups configured for sync"
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-            )
-        data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.assertEqual(result.status_code, 302)
-
-        self.assertFalse(
-            is_user_in_group(
-                testgroup1.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        self.assertFalse(
-            is_user_in_group(
-                testgroup2.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        self.assertFalse(
-            is_user_in_group(
-                new_test_group.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-
-    def test_social_auth_group_sync_sync_all_groups_mode(self) -> None:
-        realm = get_realm("zulip")
-        hamlet = self.example_user("hamlet")
-        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=hamlet)
-        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=hamlet)
-
-        hamletcharacters_group = NamedUserGroup.objects.get(
-            name="hamletcharacters", realm_for_sharding=realm
-        )
-        # Sanity assert. We'll use this group name to verify that groups get created on demand by group sync.
-        assert not NamedUserGroup.objects.filter(
-            name="newtestgroup", realm_for_sharding=realm
-        ).exists()
-
-        sync_custom_attrs_dict = {
-            "zulip": {
-                "saml": {
-                    "role": "zulip_role",
-                    # This config syntax enables the "sync all groups" mode.
-                    "groups": "*",
-                }
-            }
-        }
-
-        with (
-            self.settings(
-                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-            ),
-            self.assertLogs(self.logger_string) as mock_log,
-        ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-                extra_attributes=dict(
-                    zulip_groups=[
-                        "testgroup1",
-                        "testgroup2",
-                        "newtestgroup",
-                        # Not a valid group name. We will want to verify it gets logged and ignored.
-                        "@@@@",
-                    ]
-                ),
-            )
-        data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.assertEqual(result.status_code, 302)
-
-        self.assertTrue(
-            is_user_in_group(
-                testgroup1.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        self.assertTrue(
-            is_user_in_group(
-                testgroup2.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-        self.assertFalse(
-            is_user_in_group(
-                hamletcharacters_group.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-
-        # newtestgroup exists now. It was created because the zulip_groups attribute implied the user should
-        # be a member of the group.
-        new_test_group = NamedUserGroup.objects.get(name="newtestgroup", realm_for_sharding=realm)
-        self.assertTrue(
-            is_user_in_group(
-                new_test_group.id,
-                hamlet,
-                direct_member_only=True,
-            )
-        )
-
-        # Verify the expected log line revealing the internal details of the incoming groups -> Zulip groups translation.
-        self.assertIn(
-            self.logger_output(
-                f"social_auth_sync_user_attributes:<user:{hamlet.id}>: received group names: ['@@@@', 'newtestgroup', 'testgroup1', 'testgroup2']|intended Zulip groups: ['@@@@', 'newtestgroup', 'testgroup1', 'testgroup2']. group mapping used: {{'hamletcharacters': 'hamletcharacters', 'testgroup1': 'testgroup1', 'testgroup2': 'testgroup2', 'newtestgroup': 'newtestgroup', '@@@@': '@@@@'}}",
-                type="info",
-            ),
-            mock_log.output,
-        )
-        self.assertIn(
-            self.logger_output(
-                f"User {hamlet.id} should be added to groups ['@@@@', 'newtestgroup'], but they don't exist. Creating them first.",
-                type="info",
-            ),
-            mock_log.output,
-        )
-        self.assertIn(
-            self.logger_output(
-                "ensure_missing_groups: received invalid groups names: ['@@@@']",
-                type="warning",
-            ),
-            mock_log.output,
-        )
-
     @override_settings(TERMS_OF_SERVICE_VERSION=None)
-    def test_social_auth_create_user_with_synced_role_and_groups(self) -> None:
+    def test_external_auth_id_saml_registration(self) -> None:
+        """Test that registering a new user via SAML creates an ExternalAuthID record."""
         email = "newuser@zulip.com"
-        name = "Full Name"
-        subdomain = "zulip"
-        desdemona = self.example_user("desdemona")
-        realm = get_realm("zulip")
-
-        account_data_dict = self.get_account_data_dict(email=email, name=name)
-        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
-        idps_dict["test_idp"]["extra_attrs"] = ["zulip_role"]
-
-        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=desdemona)
-        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=desdemona)
-
-        # Sanity assert. We'll use this group name to verify that groups get created on demand by group sync.
-        assert not NamedUserGroup.objects.filter(
-            name="newtestgroup", realm_for_sharding=realm
-        ).exists()
-
-        sync_custom_attrs_dict = {
-            "zulip": {
-                "saml": {
-                    "role": "zulip_role",
-                    "groups": [
-                        "testgroup1",
-                        ("samlgroup2", "testgroup2"),
-                        ("samlgroup3", "newtestgroup"),
-                    ],
-                }
-            }
-        }
-
-        with (
-            self.settings(
-                SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-            ),
-            self.assertLogs(self.logger_string, level="INFO") as mock_logger,
-        ):
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-                is_signup=True,
-                extra_attributes=dict(
-                    mobilePhone=["123412341234"],
-                    birthday=["2021-01-01"],
-                    zulip_role=["owner"],
-                    zulip_groups=["testgroup1", "samlgroup3", "samlgroup99"],
-                ),
-            )
-
-        with self.assertLogs("zulip.ldap", level="INFO") as mock_ldap_logger:
-            self.stage_two_of_registration(
-                result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
-            )
-        user_profile = get_user_by_delivery_email(email, realm)
-        self.assertEqual(user_profile.role, UserProfile.ROLE_REALM_OWNER)
-        self.assertTrue(
-            is_user_in_group(
-                testgroup1.id,
-                user_profile,
-                direct_member_only=True,
-            )
-        )
-        self.assertFalse(
-            is_user_in_group(
-                testgroup2.id,
-                user_profile,
-                direct_member_only=True,
-            )
-        )
-
-        # newtestgroup exists now. It was created because the zulip_groups attribute implied the user should
-        # be a member of the group.
-        new_test_group = NamedUserGroup.objects.get(name="newtestgroup", realm_for_sharding=realm)
-        self.assertTrue(
-            is_user_in_group(
-                new_test_group.id,
-                user_profile,
-                direct_member_only=True,
-            )
-        )
-        # samlgroup99 is not listed in the configuration, so doesn't get created, despite being passed in
-        # the zulip_groups attribute.
-        self.assertFalse(
-            NamedUserGroup.objects.filter(name="samlgroup99", realm_for_sharding=realm).exists()
-        )
-
-        self.assertEqual(
-            mock_logger.output[0],
-            self.logger_output(
-                "social_auth_sync_user_attributes:<new user signup>: received group names: ['samlgroup3', 'samlgroup99', 'testgroup1']|intended Zulip groups: ['newtestgroup', 'testgroup1']. group mapping used: {'testgroup1': 'testgroup1', 'samlgroup2': 'testgroup2', 'samlgroup3': 'newtestgroup'}",
-                type="info",
-            ),
-        )
-        self.assertEqual(
-            mock_logger.output[1],
-            self.logger_output("Returning role owner for user creation", type="info"),
-        )
-
-        prereg_user = PreregistrationUser.objects.last()
-        assert prereg_user is not None
-        self.assertEqual(
-            mock_ldap_logger.output[0],
-            f"INFO:zulip.ldap:PreregistrationUser {prereg_user.id} should be added to groups ['newtestgroup'], but they don't exist. Creating them first.",
-        )
-
-        self.assertEqual(
-            mock_ldap_logger.output[1],
-            f"INFO:zulip.ldap:Synced user groups for PreregistrationUser {prereg_user.id} in {realm.id}: "
-            '{"newtestgroup": true, "testgroup1": true, "testgroup2": false}. Final groups set: [\'newtestgroup\', \'testgroup1\']',
-        )
-
-    @override_settings(TERMS_OF_SERVICE_VERSION=None)
-    def test_social_auth_create_user_from_multiuse_invite_role_and_group_sync(self) -> None:
-        email = "newuser@zulip.com"
-        name = "Full Name"
-        subdomain = "zulip"
-        desdemona = self.example_user("desdemona")
-        realm = get_realm("zulip")
-
-        account_data_dict = self.get_account_data_dict(email=email, name=name)
-        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
-        idps_dict["test_idp"]["extra_attrs"] = ["zulip_role"]
-
-        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=desdemona)
-        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=desdemona)
-
-        sync_custom_attrs_dict = {
-            "zulip": {
-                "saml": {
-                    "role": "zulip_role",
-                    "groups": ["testgroup1", ("samlgroup2", "testgroup2")],
-                }
-            }
-        }
-
-        invite = MultiuseInvite.objects.create(
-            realm=realm,
-            referred_by=desdemona,
-            # Set a role on the invite to verify that it gets ignored in favor
-            # of the role implied by the zulip_role attribute.
-            invited_as=PreregistrationUser.INVITE_AS["REALM_ADMIN"],
-        )
-        invite.groups.set([testgroup1, testgroup2])
-        create_confirmation_link(invite, Confirmation.MULTIUSE_INVITE)
-        multiuse_confirmation = Confirmation.objects.all().last()
-        assert multiuse_confirmation is not None
-        multiuse_object_key = multiuse_confirmation.confirmation_key
-        account_data_dict = self.get_account_data_dict(email=email, name=name)
-        with (
-            self.settings(
-                SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-            ),
-        ):
-            result = self.social_auth_test(
-                account_data_dict,
-                subdomain="zulip",
-                is_signup=True,
-                multiuse_object_key=multiuse_object_key,
-                extra_attributes=dict(
-                    zulip_role=["member"],
-                    zulip_groups=["testgroup1"],
-                ),
-            )
-        with self.assertLogs("zulip.ldap", level="INFO") as mock_logger:
-            self.stage_two_of_registration(
-                result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
-            )
-        user_profile = get_user_by_delivery_email(email, realm)
-        self.assertEqual(user_profile.role, UserProfile.ROLE_MEMBER)
-        self.assertTrue(
-            is_user_in_group(
-                testgroup1.id,
-                user_profile,
-                direct_member_only=True,
-            )
-        )
-        self.assertFalse(
-            is_user_in_group(
-                testgroup2.id,
-                user_profile,
-                direct_member_only=True,
-            )
-        )
-
-        prereg_user = PreregistrationUser.objects.last()
-        assert prereg_user is not None
-        self.assertEqual(
-            f"INFO:zulip.ldap:Synced user groups for PreregistrationUser {prereg_user.id} in {realm.id}: "
-            '{"testgroup1": true, "testgroup2": false}. Final groups set: [\'testgroup1\']',
-            mock_logger.output[0],
-        )
-
-    @override_settings(TERMS_OF_SERVICE_VERSION=None)
-    def test_social_auth_create_user_with_synced_role_only(self) -> None:
-        email = "newuser@zulip.com"
-        name = "Full Name"
+        name = "New User"
         subdomain = "zulip"
         realm = get_realm("zulip")
+        idps_config_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_config_dict["test_idp"]["attr_user_permanent_id"] = "uid"
+        uid_value = "newuser_uid"
 
         account_data_dict = self.get_account_data_dict(email=email, name=name)
-
-        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
-        idps_dict["test_idp"]["extra_attrs"] = ["zulip_role"]
-        sync_custom_attrs_dict = {
-            "zulip": {
-                "saml": {
-                    "role": "zulip_role",
-                }
-            }
-        }
-
-        with (
-            self.settings(
-                SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-            ),
-            self.assertLogs(self.logger_string, level="INFO") as mock_logger,
-        ):
+        with self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_config_dict):
             result = self.social_auth_test(
                 account_data_dict,
-                subdomain="zulip",
+                subdomain=subdomain,
                 is_signup=True,
-                extra_attributes=dict(
-                    zulip_role=["owner"],
-                    # Groups won't get synced, despite being passed - group sync
-                    # is not configured.
-                    zulip_groups=["samlgroup1"],
-                ),
+                extra_attributes={"uid": [uid_value]},
             )
             self.stage_two_of_registration(
-                result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
+                result,
+                realm,
+                subdomain,
+                email,
+                name,
+                name,
+                self.BACKEND_CLASS.full_name_validated,
             )
-
         user_profile = get_user_by_delivery_email(email, realm)
-        self.assertEqual(user_profile.role, UserProfile.ROLE_REALM_OWNER)
-        self.assertEqual(
-            mock_logger.output[0],
-            self.logger_output("Returning role owner for user creation", type="info"),
-        )
-
-    def test_social_auth_sync_field_not_existing(self) -> None:
-        sync_custom_attrs_dict = {
-            "zulip": {
-                "saml": {
-                    "custom__title": "title",
-                    "custom__phone_number": "mobilePhone",
-                    "wrongfield": "wrongfield",
-                }
-            }
-        }
-        self.assertFalse(
-            CustomProfileField.objects.filter(
-                realm=self.user_profile.realm, name__iexact="title"
-            ).exists()
-        )
-
-        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
-        idps_dict["test_idp"]["extra_attrs"] = ["mobilePhone", "title"]
-
-        with self.settings(
-            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
-        ):
-            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-            with self.assertLogs(self.logger_string, level="WARNING") as m:
-                result = self.social_auth_test(
-                    account_data_dict,
-                    subdomain="zulip",
-                    extra_attributes=dict(
-                        mobilePhone=["123412341234"], title=["some title"], birthday=["2021-01-01"]
-                    ),
-                )
-        data = load_subdomain_token(result)
-        self.assertEqual(data["email"], self.email)
-        self.assertEqual(data["full_name"], self.name)
-        self.assertEqual(data["subdomain"], "zulip")
-        self.assertEqual(result.status_code, 302)
-
-        self.assertEqual(
-            m.output,
-            [
-                self.logger_output(
-                    "Ignoring unsupported UserProfile field wrongfield in SOCIAL_AUTH_SYNC_ATTRS_DICT",
-                    "warning",
-                ),
-                self.logger_output(
-                    (
-                        "Exception while syncing custom profile fields for user"
-                        f" {self.user_profile.id}: Custom profile field with name title not found."
-                    ),
-                    "warning",
-                ),
-            ],
-        )
+        self.assertTrue(user_profile.is_active)
+        external_auth_ids = list(ExternalAuthID.objects.filter(user=user_profile))
+        self.assert_length(external_auth_ids, 1)
+        self.assertEqual(external_auth_ids[0].external_auth_method_name, "saml:test_idp")
+        self.assertEqual(external_auth_ids[0].external_auth_id, f"test_idp:{uid_value}")
 
 
 class AppleAuthMixin:
@@ -4055,7 +4625,7 @@ class AppleAuthMixin:
     def generate_id_token(
         self, account_data_dict: dict[str, str], audience: str | None = None
     ) -> str:
-        payload = dict(email=account_data_dict["email"])
+        payload = dict(email=account_data_dict["email"], iss=AppleAuthBackend.ID_TOKEN_ISSUER)
 
         # This setup is important because python-social-auth decodes `id_token`
         # with `SOCIAL_AUTH_APPLE_CLIENT` as the `audience`
@@ -4429,7 +4999,7 @@ class AppleAuthBackendNativeFlowTest(AppleAuthMixin, SocialAuthBase):
         """
 
 
-class GenericOpenIdConnectTest(SocialAuthBase):
+class GenericOpenIdConnectTest(SocialAuthBaseWithSyncAttrTest):
     BACKEND_CLASS = GenericOpenIdConnectBackend
     CLIENT_KEY_SETTING = "SOCIAL_AUTH_TESTOIDC_KEY"
     CLIENT_SECRET_SETTING = "SOCIAL_AUTH_TESTOIDC_SECRET"
@@ -4570,6 +5140,37 @@ class GenericOpenIdConnectTest(SocialAuthBase):
             family_name=family_name,
         )
 
+    @override
+    def social_auth_test_with_sync_attrs(
+        self,
+        account_data_dict: dict[str, Any],
+        *,
+        subdomain: str,
+        is_signup: bool = False,
+        extra_attrs: dict[str, Any],
+        sync_attrs_config: dict[str, Any],
+        multiuse_object_key: str = "",
+    ) -> "TestHttpResponse":
+        # Include additional claims in account_data_dict.
+        account_data_dict.update(**extra_attrs)
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
+
+        if oidc_sync_attrs_dict := sync_attrs_config.get(subdomain, {}).get("oidc"):
+            idps_dict["testoidc"]["extra_attrs"] = self.derive_extra_attrs_from_config(
+                oidc_sync_attrs_dict
+            )
+
+        with self.settings(
+            SOCIAL_AUTH_OIDC_ENABLED_IDPS=idps_dict,
+            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_attrs_config,
+        ):
+            return self.social_auth_test(
+                account_data_dict,
+                subdomain=subdomain,
+                is_signup=is_signup,
+                multiuse_object_key=multiuse_object_key,
+            )
+
     @override_settings(TERMS_OF_SERVICE_VERSION=None)
     def test_social_auth_registration_auto_signup(self) -> None:
         """
@@ -4635,8 +5236,13 @@ class GenericOpenIdConnectTest(SocialAuthBase):
         mock_oidc_setting_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
         [idp_config_dict] = mock_oidc_setting_dict.values()
         del idp_config_dict["client_id"]
+        missing_keys_log = self.logger_output(
+            "OIDC IdP 'testoidc' is missing required configuration keys: ['client_id']",
+            "error",
+        )
         with (
             self.settings(SOCIAL_AUTH_OIDC_ENABLED_IDPS=mock_oidc_setting_dict),
+            self.assertLogs(self.logger_string, level="ERROR") as oidc_log,
             self.assertLogs("django.request", level="ERROR") as m,
         ):
             result = self.social_auth_test(
@@ -4649,9 +5255,11 @@ class GenericOpenIdConnectTest(SocialAuthBase):
                 m.output,
                 [f"ERROR:django.request:Internal Server Error: {self.LOGIN_URL}"],
             )
+            self.assertEqual(oidc_log.output, [missing_keys_log])
 
         with (
             self.settings(SOCIAL_AUTH_OIDC_ENABLED_IDPS=mock_oidc_setting_dict),
+            self.assertLogs(self.logger_string, level="ERROR") as oidc_log,
             self.assertLogs("django.request", level="ERROR") as m,
         ):
             result = self.social_auth_test(
@@ -4663,6 +5271,7 @@ class GenericOpenIdConnectTest(SocialAuthBase):
             self.assertEqual(
                 m.output, [f"ERROR:django.request:Internal Server Error: {self.SIGNUP_URL}"]
             )
+            self.assertEqual(oidc_log.output, [missing_keys_log])
 
     def test_social_auth_oidc_multiple_idps_configured(self) -> None:
         idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
@@ -4720,6 +5329,34 @@ class GenericOpenIdConnectTest(SocialAuthBase):
             m.output, [self.logger_output("/login/oidc/: Missing idp param.", type="info")]
         )
 
+    def test_social_auth_oidc_require_limit_to_subdomains(self) -> None:
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
+        idps_dict["testoidc2"] = copy.deepcopy(idps_dict["testoidc"])
+        idps_dict["testoidc2"]["oidc_url"] = "https://example.com/idp2/api/openid"
+        idps_dict["testoidc2"]["display_name"] = "Second Test IdP"
+        idps_dict["testoidc2"]["limit_to_subdomains"] = ["zulip"]
+
+        with self.settings(
+            SOCIAL_AUTH_OIDC_ENABLED_IDPS=idps_dict, OIDC_REQUIRE_LIMIT_TO_SUBDOMAINS=True
+        ):
+            with self.assertLogs(self.logger_string, level="ERROR") as m:
+                # Initialization of the backend should validate the configured IdPs
+                # with respect to the OIDC_REQUIRE_LIMIT_TO_SUBDOMAINS setting and remove
+                # the non-compliant ones.
+                GenericOpenIdConnectBackend()
+            self.assertEqual(list(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS.keys()), ["testoidc2"])
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output(
+                    "OIDC_REQUIRE_LIMIT_TO_SUBDOMAINS is enabled and the following "
+                    "IdPs don't have limit_to_subdomains specified and will be ignored: "
+                    "['testoidc']",
+                    "error",
+                )
+            ],
+        )
+
     def test_social_auth_oidc_idp_limited_to_subdomains_attempt_wrong_realm(self) -> None:
         idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
         idps_dict["testoidc"]["limit_to_subdomains"] = ["zulip"]
@@ -4735,6 +5372,31 @@ class GenericOpenIdConnectTest(SocialAuthBase):
                 self.logger_output(
                     "/complete/oidc/: Authentication request with IdP testoidc but this provider is not enabled "
                     "for this subdomain zephyr.",
+                    "info",
+                )
+            ],
+        )
+
+    def test_social_auth_state_data_expired_in_redis(self) -> None:
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+
+        # Simulate the state data having expired from redis, like when
+        # a user takes longer than REDIS_EXPIRATION_SECONDS to return
+        # from the IdP.
+        with (
+            mock.patch.object(
+                GenericOpenIdConnectBackend, "get_data_from_redis", return_value=None
+            ),
+            self.assertLogs(self.logger_string, level="INFO") as m,
+        ):
+            result = self.social_auth_test(account_data_dict, subdomain="zulip")
+        self.assertEqual(result.status_code, 302)
+        self.assertEqual("/login/", result["Location"])
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output(
+                    "State data expired in redis: authentication took too long to complete.",
                     "info",
                 )
             ],
@@ -5712,6 +6374,88 @@ class GoogleAuthBackendTest(SocialAuthBase):
         }
         result = self.get_log_into_subdomain(data)
         self.assert_json_error(result, "Invalid subdomain")
+
+
+class DiscordAuthBackendTest(SocialAuthBase):
+    BACKEND_CLASS = DiscordAuthBackend
+    CLIENT_KEY_SETTING = "SOCIAL_AUTH_DISCORD_KEY"
+    CLIENT_SECRET_SETTING = "SOCIAL_AUTH_DISCORD_SECRET"
+    LOGIN_URL = "/accounts/login/social/discord"
+    SIGNUP_URL = "/accounts/register/social/discord"
+    AUTHORIZATION_URL = "https://discord.com/api/oauth2/authorize"
+    ACCESS_TOKEN_URL = "https://discord.com/api/oauth2/token"
+    USER_INFO_URL = "https://discord.com/api/users/@me"
+    AUTH_FINISH_URL = "/complete/discord/"
+
+    def test_discord_auth_enabled(self) -> None:
+        with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.DiscordAuthBackend",)):
+            self.assertTrue(discord_auth_enabled())
+
+    @override
+    def get_account_data_dict(
+        self, email: str, name: str, id: str = "123", verified: bool = True
+    ) -> dict[str, Any]:
+        return dict(
+            id=id,
+            email=email,
+            global_name=name,
+            username=name.lower(),
+            verified=verified,
+            email_verified=True,
+        )
+
+    def test_social_auth_email_not_verified(self) -> None:
+        account_data_dict = self.get_account_data_dict(
+            email=self.email, name=self.name, verified=False
+        )
+        subdomain = "zulip"
+        realm = get_realm(subdomain)
+        with self.assertLogs(self.logger_string, level="WARNING") as m:
+            result = self.social_auth_test(account_data_dict, subdomain=subdomain)
+            self.assertEqual(result.status_code, 302)
+            self.assertEqual(result["Location"], realm.url + "/login/")
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output(
+                    "Social auth ({}) failed because user has no verified emails".format("Discord"),
+                    "warning",
+                )
+            ],
+        )
+
+    def test_authenticate_special_emails_with_encoded_user_id(self) -> None:
+        subdomain = "zulip"
+        realm = get_realm(subdomain)
+        discord_user_id = "123456"
+
+        discord_user = do_create_user(
+            EMAIL_WITH_ENCODED_DISCORD_ID.format(discord_user_id=discord_user_id),
+            None,
+            realm,
+            "Hamlet-discord",
+            acting_user=None,
+        )
+        account_data_dict = self.get_account_data_dict(
+            email="user-discord-1@zulip.com", name=discord_user.full_name, id=discord_user_id
+        )
+
+        assert account_data_dict["email"] != discord_user.delivery_email
+
+        result = self.social_auth_test(
+            account_data_dict,
+            expect_choose_email_screen=False,
+            subdomain=subdomain,
+            next="/user_uploads/image",
+        )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], discord_user.delivery_email)
+        self.assertEqual(data["full_name"], account_data_dict["global_name"])
+        self.assertEqual(data["subdomain"], subdomain)
+        self.assertEqual(result.status_code, 302)
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
 
 class JSONFetchAPIKeyTest(ZulipTestCase):
@@ -7258,7 +8002,7 @@ class TestLDAP(ZulipLDAPTestCase):
         self.assertEqual(user_profile.delivery_email, "new-hamlet-email@zulip.com")
         self.assertEqual(ExternalAuthID.objects.filter(user=hamlet).count(), 1)
         self.assertIn(
-            f"INFO:zulip.auth.ldap:User {hamlet.id}, logged in via ExternalAuthId uid=hamlet,ou=users,dc=zulip,dc=com, has mismatched email. Syncing: hamlet@zulip.com => new-hamlet-email@zulip.com",
+            f"INFO:zulip.auth.ldap:User {hamlet.id}, being synced via ExternalAuthId uid=hamlet,ou=users,dc=zulip,dc=com, has mismatched email. Syncing: hamlet@zulip.com => new-hamlet-email@zulip.com",
             mock_log.output,
         )
 
@@ -7301,7 +8045,7 @@ class TestLDAP(ZulipLDAPTestCase):
         self.assertEqual(user_profile.delivery_email, "New-Hamlet-email@zulip.com")
         self.assertEqual(ExternalAuthID.objects.filter(user=hamlet).count(), 1)
         self.assertIn(
-            f"INFO:zulip.auth.ldap:User {hamlet.id}, logged in via ExternalAuthId uid=hamlet,ou=users,dc=zulip,dc=com, has mismatched email. Syncing: new-hamlet-email@zulip.com => New-Hamlet-email@zulip.com",
+            f"INFO:zulip.auth.ldap:User {hamlet.id}, being synced via ExternalAuthId uid=hamlet,ou=users,dc=zulip,dc=com, has mismatched email. Syncing: new-hamlet-email@zulip.com => New-Hamlet-email@zulip.com",
             mock_log.output,
         )
 
@@ -8156,6 +8900,31 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
             debug_log.output,
         )
 
+    def test_update_custom_profile_field_truncation(self) -> None:
+        long_value = "x" * 60
+        expected_value = "x" * 49 + "…"
+        self.change_ldap_user_attr("hamlet", "homePhone", long_value)
+
+        with (
+            self.settings(
+                AUTH_LDAP_USER_ATTR_MAP={
+                    "full_name": "cn",
+                    "custom_profile_field__phone_number": "homePhone",
+                }
+            ),
+            self.assertLogs("zulip.ldap", "WARNING") as log_output,
+        ):
+            self.perform_ldap_sync(self.example_user("hamlet"))
+
+        hamlet = self.example_user("hamlet")
+        phone_field = CustomProfileField.objects.get(realm=hamlet.realm, name="Phone number")
+        phone_value = CustomProfileFieldValue.objects.get(user_profile=hamlet, field=phone_field)
+        self.assertEqual(phone_value.value, expected_value)
+        self.assertIn(
+            f"WARNING:zulip.ldap:Truncated value for custom profile field phone_number of user {hamlet.id} to 50 characters.",
+            log_output.output,
+        )
+
     def test_update_custom_profile_field_no_mapping(self) -> None:
         hamlet = self.example_user("hamlet")
         no_op_field = CustomProfileField.objects.get(realm=hamlet.realm, name="Phone number")
@@ -8204,6 +8973,225 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
                 "WARNING:django_auth_ldap:uid=hamlet,ou=users,dc=zulip,dc=com does not have a value for the attribute nonExistentAttr"
             ],
         )
+
+    def test_sync_creates_external_auth_id_record(self) -> None:
+        hamlet = self.example_user("hamlet")
+        realm = hamlet.realm
+        self.assertEqual(ExternalAuthID.objects.filter(user=hamlet).count(), 0)
+
+        with self.settings(
+            LDAP_EMAIL_ATTR="mail",
+            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "dn"},
+        ):
+            sync_user_from_ldap(hamlet, mock.Mock())
+
+        external_auth_ids = list(ExternalAuthID.objects.filter(user=hamlet))
+        self.assert_length(external_auth_ids, 1)
+        self.assertEqual(external_auth_ids[0].realm_id, realm.id)
+        self.assertEqual(external_auth_ids[0].external_auth_method_name, "ldap")
+        self.assertEqual(
+            external_auth_ids[0].external_auth_id, "uid=hamlet,ou=users,dc=zulip,dc=com"
+        )
+
+        ExternalAuthID.objects.filter(user=hamlet).delete()
+
+        # Now test a configuration with a different attribute as unique_account_id.
+        with self.settings(
+            LDAP_EMAIL_ATTR="mail",
+            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "homePhone"},
+        ):
+            sync_user_from_ldap(hamlet, mock.Mock())
+
+        external_auth_ids = list(ExternalAuthID.objects.filter(user=hamlet))
+        self.assert_length(external_auth_ids, 1)
+        self.assertEqual(external_auth_ids[0].external_auth_id, "123456789")
+
+        # If unique_account_id is not configured, no ExternalAuthID should be created.
+        ExternalAuthID.objects.filter(user=hamlet).delete()
+        self.perform_ldap_sync(hamlet)
+        self.assertEqual(ExternalAuthID.objects.filter(user=hamlet).count(), 0)
+
+    @override_settings(
+        LDAP_EMAIL_ATTR="mail",
+        AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "dn"},
+    )
+    def test_sync_via_external_auth_id_end_to_end(self) -> None:
+        hamlet = self.example_user("hamlet")
+        realm = get_realm("zulip")
+
+        # Initial sync will happen via email, due to no pre-existing ExternalAuthID
+        # record.
+        self.assert_length(ExternalAuthID.objects.filter(user=hamlet), 0)
+        sync_user_from_ldap(hamlet, mock.Mock())
+        external_auth_ids = list(ExternalAuthID.objects.filter(user=hamlet))
+        self.assert_length(external_auth_ids, 1)
+        self.assertEqual(external_auth_ids[0].realm_id, realm.id)
+        self.assertEqual(external_auth_ids[0].external_auth_method_name, "ldap")
+        self.assertEqual(
+            external_auth_ids[0].external_auth_id, "uid=hamlet,ou=users,dc=zulip,dc=com"
+        )
+
+        # Next we test a sync that will just update the name, no email change happens yet.
+        self.change_ldap_user_attr("hamlet", "cn", "New Name")
+        sync_user_from_ldap(hamlet, mock.Mock())
+        hamlet.refresh_from_db()
+        self.assertEqual(hamlet.delivery_email, "hamlet@zulip.com")
+        self.assertEqual(hamlet.full_name, "New Name")
+        self.assert_length(ExternalAuthID.objects.filter(user=hamlet), 1)
+
+        # Now sync with an email change involved. Hamlet's delivery_email should get updated.
+        self.change_ldap_user_attr("hamlet", "mail", "new-hamlet@zulip.com")
+        self.change_ldap_user_attr("hamlet", "cn", "New Name2")
+
+        logger = logging.getLogger("zulip.sync_ldap_user_data")
+        with self.assertLogs(logger, level="INFO") as log_output:
+            sync_user_from_ldap(hamlet, logger)
+
+        hamlet.refresh_from_db()
+        self.assertEqual(hamlet.delivery_email, "new-hamlet@zulip.com")
+        self.assertEqual(hamlet.full_name, "New Name2")
+
+        # Verify the ExternalAuthID path was used and the email was synced.
+        self.assertIn(
+            f"INFO:zulip.sync_ldap_user_data:Syncing user new-hamlet@zulip.com (id={hamlet.id})"
+            " via external auth id. Result DN: uid=hamlet,ou=users,dc=zulip,dc=com",
+            log_output.output,
+        )
+        self.assertIn(
+            f"INFO:zulip.sync_ldap_user_data:User {hamlet.id},"
+            " being synced via ExternalAuthId uid=hamlet,ou=users,dc=zulip,dc=com,"
+            " has mismatched email. Syncing: hamlet@zulip.com => new-hamlet@zulip.com",
+            log_output.output,
+        )
+
+    @override_settings(
+        LDAP_EMAIL_ATTR="mail",
+        AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "dn"},
+    )
+    def test_sync_via_external_auth_id_email_capitalization_change(self) -> None:
+        hamlet = self.example_user("hamlet")
+        ExternalAuthID.objects.create(
+            user=hamlet,
+            realm=hamlet.realm,
+            external_auth_method_name="ldap",
+            external_auth_id="uid=hamlet,ou=users,dc=zulip,dc=com",
+        )
+
+        self.change_ldap_user_attr("hamlet", "mail", "Hamlet@zulip.com")
+        mock_logger = mock.Mock()
+        sync_user_from_ldap(hamlet, mock_logger)
+
+        hamlet.refresh_from_db()
+        self.assertEqual(hamlet.delivery_email, "Hamlet@zulip.com")
+
+    @override_settings(
+        LDAP_EMAIL_ATTR="mail",
+        AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "dn"},
+    )
+    def test_sync_via_external_auth_id_email_conflict(self) -> None:
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
+        ExternalAuthID.objects.create(
+            user=hamlet,
+            realm=hamlet.realm,
+            external_auth_method_name="ldap",
+            external_auth_id="uid=hamlet,ou=users,dc=zulip,dc=com",
+        )
+
+        # Change hamlet's LDAP email to cordelia's email to cause conflict
+        # when syncing attempts to update hamlet's delivery_email.
+        self.change_ldap_user_attr("hamlet", "mail", cordelia.delivery_email)
+        with self.assertRaises(PopulateUserLDAPError):
+            sync_user_from_ldap(hamlet, mock.Mock())
+
+        # hamlet's email should not have changed, and cordelia should be unaffected.
+        hamlet.refresh_from_db()
+        cordelia.refresh_from_db()
+        self.assertEqual(hamlet.delivery_email, "hamlet@zulip.com")
+        self.assertEqual(cordelia.full_name, "Cordelia, Lear's daughter")
+        self.assertEqual(cordelia.delivery_email, "cordelia@zulip.com")
+
+    @override_settings(
+        LDAP_EMAIL_ATTR="mail",
+        AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "homePhone"},
+    )
+    def test_sync_external_auth_id_stale_value(self) -> None:
+        hamlet = self.example_user("hamlet")
+        # Create ExternalAuthID with a stale value that doesn't match LDAP.
+        ExternalAuthID.objects.create(
+            user=hamlet,
+            realm=hamlet.realm,
+            external_auth_method_name="ldap",
+            external_auth_id="old_value",
+        )
+
+        # The stale ExternalAuthID doesn't have a match in LDAP, so the sync
+        # falls back to email-based lookup and then resolves the ExternalAuthID
+        # issue.
+        with self.assertLogs("zulip.auth.ldap", level="WARNING") as log_output:
+            sync_user_from_ldap(hamlet, mock.Mock())
+
+        external_auth_id_obj = ExternalAuthID.objects.get(user=hamlet)
+        self.assertEqual(external_auth_id_obj.external_auth_id, "123456789")
+        self.assertIn(
+            f"WARNING:zulip.auth.ldap:User {hamlet.id} had mismatched ExternalAuthID record. "
+            "Updating old_value => 123456789",
+            log_output.output,
+        )
+
+    def test_sync_via_external_auth_id_deleted_ldap_user(self) -> None:
+        hamlet = self.example_user("hamlet")
+        hamlet_dn = "uid=hamlet,ou=users,dc=zulip,dc=com"
+        hamlet_ldap_entry = self.mock_ldap.directory[hamlet_dn]
+
+        # Test a DN-based lookup for a user whose record has been deleted from LDAP.
+        # Since the LDAP record can't be found, neither by ExternalAuthID nor email,
+        # no sync can happen beyond deactivating the user for having no matching
+        # LDAP record; if that configuration is enabled.
+        ExternalAuthID.objects.create(
+            user=hamlet,
+            realm=hamlet.realm,
+            external_auth_method_name="ldap",
+            external_auth_id=hamlet_dn,
+        )
+        del self.mock_ldap.directory[hamlet_dn]
+
+        with self.settings(
+            LDAP_EMAIL_ATTR="mail",
+            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "dn"},
+            LDAP_DEACTIVATE_NON_MATCHING_USERS=True,
+            AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",),
+        ):
+            sync_user_from_ldap(hamlet, mock.Mock())
+
+        hamlet.refresh_from_db()
+        self.assertFalse(hamlet.is_active)
+
+        # Restore the initial state.
+        do_reactivate_user(hamlet, acting_user=None)
+        self.mock_ldap.directory[hamlet_dn] = hamlet_ldap_entry
+        ExternalAuthID.objects.filter(user=hamlet).delete()
+
+        # Now test the same scenario as above, but with a different attribute than DN
+        # configured as the unique_account_id.
+        ExternalAuthID.objects.create(
+            user=hamlet,
+            realm=hamlet.realm,
+            external_auth_method_name="ldap",
+            external_auth_id=hamlet_ldap_entry["homePhone"],
+        )
+        del self.mock_ldap.directory[hamlet_dn]
+
+        with self.settings(
+            LDAP_EMAIL_ATTR="mail",
+            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "homePhone"},
+            LDAP_DEACTIVATE_NON_MATCHING_USERS=True,
+            AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",),
+        ):
+            sync_user_from_ldap(hamlet, mock.Mock())
+
+        hamlet.refresh_from_db()
+        self.assertFalse(hamlet.is_active)
 
 
 class TestQueryLDAP(ZulipLDAPTestCase):
@@ -8554,6 +9542,25 @@ class EmailValidatorTestCase(ZulipTestCase):
         error, is_deactivated = errors[cordelia_email]
         self.assertEqual(True, is_deactivated)
         self.assertEqual(error, "Account has been deactivated.")
+
+    def test_reject_malformed_domain(self) -> None:
+        realm = self.example_user("hamlet").realm
+        validator = get_realm_email_validator(realm)
+
+        for email in [
+            # Trailing Unicode format characters.
+            "user@gmail.com\u202c\u200f",
+            # Domain label starting with a hyphen.
+            "user@gmail.-com",
+            # Empty label.
+            "user@example..com",
+            # IP address literal.
+            "user@[192.168.0.1]",
+        ]:
+            self.assertEqual(validate_email_is_valid(email, validator), "Invalid address.")
+
+        # Non-ASCII IDN domains are still accepted.
+        self.assertIsNone(validate_email_is_valid("user@münchen.de", validator))
 
 
 class LDAPBackendTest(ZulipTestCase):
@@ -8960,6 +9967,7 @@ class LDAPGroupSyncTest(ZulipTestCase):
 
 # Don't load the base class as a test: https://bugs.python.org/issue17519.
 del SocialAuthBase
+del SocialAuthBaseWithSyncAttrTest
 
 
 class TestCustomAuthDecorator(ZulipTestCase):

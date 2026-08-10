@@ -1,6 +1,6 @@
 import autosize from "autosize";
 import ClipboardJS from "clipboard";
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
 import assert from "minimalistic-assert";
 import * as tippy from "tippy.js";
@@ -25,6 +25,7 @@ import * as channel from "./channel.ts";
 import * as compose_actions from "./compose_actions.ts";
 import * as compose_banner from "./compose_banner.ts";
 import * as compose_call from "./compose_call.ts";
+import {compose_call_session_manager} from "./compose_call_session.ts";
 import * as compose_tooltips from "./compose_tooltips.ts";
 import * as compose_ui from "./compose_ui.ts";
 import * as compose_validate from "./compose_validate.ts";
@@ -41,6 +42,7 @@ import {$t, $t_html} from "./i18n.ts";
 import * as keydown_util from "./keydown_util.ts";
 import * as loading from "./loading.ts";
 import * as markdown from "./markdown.ts";
+import * as message_fetch_raw_content from "./message_fetch_raw_content.ts";
 import * as message_lists from "./message_lists.ts";
 import * as message_live_update from "./message_live_update.ts";
 import * as message_store from "./message_store.ts";
@@ -559,7 +561,8 @@ function timer_text(seconds_left: number): string {
     const seconds = seconds_left % 60;
     if (minutes >= 1) {
         return $t({defaultMessage: "{minutes} min to edit"}, {minutes: minutes.toString()});
-    } else if (seconds_left >= 10) {
+    }
+    if (seconds_left >= 10) {
         return $t(
             {defaultMessage: "{seconds} sec to edit"},
             {seconds: (seconds - (seconds % 5)).toString()},
@@ -815,18 +818,15 @@ export function start($row: JQuery, edit_box_open_callback?: () => void): void {
     }
 
     const msg_list = message_lists.current;
-    void channel.get({
-        url: "/json/messages/" + message.id,
-        data: {allow_empty_topic_name: true, apply_markdown: false},
-        success(raw_data) {
-            const data = message_store.single_message_content_schema.parse(raw_data);
-            assert(data.message.content_type === "text/x-markdown");
-
-            const message_markdown_content = data.message.content;
+    message_fetch_raw_content.get_raw_content_for_single_message({
+        message_id: message.id,
+        on_success(raw_content) {
             if (message_lists.current === msg_list) {
-                message_store.maybe_update_raw_content(message, message_markdown_content);
-                start_edit_with_content($row, message_markdown_content, edit_box_open_callback);
+                start_edit_with_content($row, raw_content, edit_box_open_callback);
             }
+        },
+        on_error() {
+            // do nothing
         },
     });
 }
@@ -865,7 +865,8 @@ function get_resolve_topic_time_limit_error_string(
                 },
                 {N: time_limit},
             );
-        } else if (time_limit_unit === "hour") {
+        }
+        if (time_limit_unit === "hour") {
             return $t(
                 {
                     defaultMessage:
@@ -891,7 +892,8 @@ function get_resolve_topic_time_limit_error_string(
             },
             {N: time_limit},
         );
-    } else if (time_limit_unit === "hour") {
+    }
+    if (time_limit_unit === "hour") {
         return $t(
             {
                 defaultMessage:
@@ -1138,7 +1140,7 @@ export function end_message_row_edit($row: JQuery): void {
         currently_editing_messages.delete(message.id);
         resized_edit_box_height.delete(message.id);
         message_lists.current.hide_edit_message($row);
-        compose_call.abort_video_callbacks(message.id.toString());
+        compose_call_session_manager.abandon_session(message.id.toString());
     }
     if ($row.find(".could-be-condensed").length > 0) {
         if ($row.find(".condensed").length > 0) {
@@ -1223,7 +1225,7 @@ export function do_save_inline_topic_edit($row: JQuery, message: Message, new_to
     show_topic_edit_spinner($row);
 
     if (message.locally_echoed) {
-        message = echo.edit_locally(message, {new_topic});
+        echo.edit_locally(message, {new_topic});
         assert(message_lists.current !== undefined);
         $row = message_lists.current.get_row(message.id);
         end_inline_topic_edit($row);
@@ -1302,7 +1304,7 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
     }
     const msg_list = message_lists.current;
     let message_id = rows.id($row);
-    let message = message_lists.current.get(message_id);
+    const message = message_lists.current.get(message_id);
     assert(message !== undefined);
     let changed = false;
     let edit_locally_echoed = false;
@@ -1340,7 +1342,7 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
     if (message.locally_echoed) {
         if (new_content !== message.raw_content) {
             // `edit_locally` handles the case where `new_topic/new_stream_id` is undefined
-            message = echo.edit_locally(message, {
+            echo.edit_locally(message, {
                 raw_content: new_content,
             });
             $row = message_lists.current.get_row(message_id);
@@ -1372,7 +1374,7 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
             collapsed: message.collapsed,
             alerted: message.alerted,
             mentioned: message.mentioned,
-            mentioned_me_directly: message.mentioned,
+            mentioned_me_directly: message.mentioned_me_directly,
         });
         edit_locally_echoed = true;
 
@@ -1381,7 +1383,7 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
         // the message is acknowledged by the server.
         message.local_edit_timestamp = Math.round(Date.now() / 1000);
 
-        message = echo.edit_locally(message, currently_echoing_messages.get(message_id)!);
+        echo.edit_locally(message, currently_echoing_messages.get(message_id)!);
 
         $row = message_lists.current.get_row(message_id);
         end_message_row_edit($row);
@@ -1415,7 +1417,7 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
                 message_id = rows.id($row);
 
                 if (edit_locally_echoed) {
-                    let echoed_message = message_store.get(message_id);
+                    const echoed_message = message_store.get(message_id);
                     assert(echoed_message !== undefined);
                     const echo_data = currently_echoing_messages.get(message_id);
                     assert(echo_data !== undefined);
@@ -1424,7 +1426,7 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
                     currently_echoing_messages.delete(message_id);
 
                     // Restore the original content.
-                    echoed_message = echo.edit_locally(echoed_message, {
+                    echo.edit_locally(echoed_message, {
                         content: echo_data.orig_content,
                         raw_content: echo_data.orig_raw_content,
                         mentioned: echo_data.mentioned,
@@ -1457,7 +1459,8 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
                                 $container,
                             );
                             return;
-                        } else if (code === "EXPECTATION_MISMATCH") {
+                        }
+                        if (code === "EXPECTATION_MISMATCH") {
                             const message = $t({
                                 defaultMessage:
                                     "Error editing message: Message was edited by another client.",
@@ -1504,6 +1507,7 @@ function warn_user_about_unread_msgs(last_sent_msg_id: number, num_unread: numbe
         modal_content_html: render_confirm_edit_messages({
             num_unread,
         }),
+        is_compact: true,
         on_click() {
             // Select the message we want to edit to mark messages between it and the
             // current selected id as read.
@@ -1630,7 +1634,13 @@ type ToastParams = {
 };
 
 function show_message_moved_toast(toast_params: ToastParams): void {
-    const new_stream_name = sub_store.maybe_get_stream_name(toast_params.new_stream_id);
+    const new_stream = sub_store.get(toast_params.new_stream_id);
+    if (new_stream === undefined) {
+        blueslip.error("Cannot find stream for message moved toast", {
+            stream_id: toast_params.new_stream_id,
+        });
+        return;
+    }
     const new_topic_display_name = util.get_final_topic_display_name(toast_params.new_topic_name);
     const is_empty_string_topic = toast_params.new_topic_name === "";
     const new_location_url = hash_util.by_stream_topic_url(
@@ -1640,7 +1650,7 @@ function show_message_moved_toast(toast_params: ToastParams): void {
     feedback_widget.show({
         populate($container) {
             const widget_body_html = render_message_moved_widget_body({
-                new_stream_name,
+                stream: new_stream,
                 new_topic_display_name,
                 new_location_url,
                 is_empty_string_topic,
@@ -1822,15 +1832,7 @@ export function is_message_oldest_or_newest(
 
 export function show_preview_area($element: JQuery): void {
     const $row = rows.get_closest_row($element);
-
-    // Disable unneeded compose_control_buttons as we don't
-    // need them in preview mode.
-    $row.addClass("preview_mode");
-    $row.find(".preview_mode_disabled .compose_control_button").attr("tabindex", -1);
-
-    $row.find(".markdown_preview").hide();
-    $row.find(".undo_markdown_preview").show();
-
+    compose_ui.enter_preview_mode($row);
     render_preview_area($row);
 }
 
@@ -1852,14 +1854,5 @@ export function render_preview_area($row: JQuery): void {
 
 export function clear_preview_area($element: JQuery): void {
     const $row = rows.get_closest_row($element);
-
-    // While in preview mode we disable unneeded compose_control_buttons,
-    // so here we are re-enabling those compose_control_buttons
-    $row.removeClass("preview_mode");
-    $row.find(".preview_mode_disabled .compose_control_button").attr("tabindex", 0);
-
-    $row.find(".undo_markdown_preview").hide();
-    $row.find(".preview_message_area").hide();
-    $row.find(".preview_content").empty();
-    $row.find(".markdown_preview").show();
+    compose_ui.exit_preview_mode($row);
 }

@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 
 import render_first_stream_created_modal from "../templates/stream_settings/first_stream_created_modal.hbs";
@@ -109,25 +109,29 @@ export function update_property<P extends keyof UpdatableStreamProperties>(
             sub,
             group_setting_value_schema.parse(value),
         );
-        if (property === "can_subscribe_group" || property === "can_add_subscribers_group") {
-            stream_settings_ui.update_subscription_elements(sub);
-        }
-        if (property === "can_administer_channel_group") {
-            const settings_sub = stream_settings_data.get_sub_for_settings(sub);
-            stream_ui_updates.update_add_subscriptions_elements(settings_sub);
-        }
-        if (property === "can_resolve_topics_group") {
-            // Technically we just need to rerender the message recipient
-            // bars to update the buttons for editing or resolving a topic,
-            // but because these policies are changed rarely, it's fine to
-            // rerender the entire message feed.
-            message_live_update.rerender_messages_view();
-        }
-        if (property === "can_create_topic_group") {
-            stream_ui_updates.update_history_public_to_subscribers_state(
-                $("#stream_settings"),
-                sub,
-            );
+        switch (property) {
+            case "can_subscribe_group":
+            case "can_add_subscribers_group":
+                stream_settings_ui.update_subscription_elements(sub);
+                break;
+            case "can_administer_channel_group": {
+                const settings_sub = stream_settings_data.get_sub_for_settings(sub);
+                stream_ui_updates.update_add_subscriptions_elements(settings_sub);
+                break;
+            }
+            case "can_resolve_topics_group":
+                // Technically we just need to rerender the message recipient
+                // bars to update the buttons for editing or resolving a topic,
+                // but because these policies are changed rarely, it's fine to
+                // rerender the entire message feed.
+                message_live_update.rerender_messages_view();
+                break;
+            case "can_create_topic_group":
+                stream_ui_updates.update_history_public_to_subscribers_state(
+                    $("#stream_settings"),
+                    sub,
+                );
+                break;
         }
         user_group_edit.update_stream_setting_in_permissions_panel(
             stream_permission_group_settings_schema.parse(property),
@@ -195,6 +199,10 @@ export function update_property<P extends keyof UpdatableStreamProperties>(
         message_retention_days(value) {
             stream_settings_ui.update_message_retention_setting(sub, value);
         },
+        default_push_notifications(value) {
+            sub.default_push_notifications = value;
+            stream_settings_ui.update_default_push_notifications_setting(sub, value);
+        },
         topics_policy(value) {
             stream_settings_ui.update_topics_policy_setting(sub, value);
             compose_recipient.update_topic_inputbox_on_topics_policy_change();
@@ -226,8 +234,7 @@ export function update_property<P extends keyof UpdatableStreamProperties>(
             }
             stream_settings_ui.update_settings_for_archived_and_unarchived(sub);
             message_view_header.maybe_rerender_title_area_for_stream(stream_id);
-            if (is_narrowed_to_stream) {
-                assert(message_lists.current !== undefined);
+            if (is_narrowed_to_stream && message_lists.current !== undefined) {
                 message_lists.current.update_trailing_bookend(true);
             }
             message_live_update.rerender_messages_view();
@@ -235,6 +242,7 @@ export function update_property<P extends keyof UpdatableStreamProperties>(
         folder_id(value) {
             stream_settings_ui.update_channel_folder(sub, value);
             channel_folders_ui.update_channel_folder_channels_list(stream_id, value);
+            recent_view_ui.complete_rerender();
         },
     };
 
@@ -269,10 +277,14 @@ export function mark_subscribed(
     sub: StreamSubscription,
     subscribers: number[],
     color: string | undefined,
+    push_notifications: boolean | null,
 ): void {
     if (sub.subscribed) {
         return;
     }
+
+    sub.push_notifications = push_notifications;
+    update_property(sub.stream_id, "push_notifications", sub.push_notifications);
 
     // If the backend sent us a color, use that
     if (color !== undefined && sub.color !== color) {
@@ -323,8 +335,7 @@ export function mark_subscribed(
     stream_list.update_subscribe_to_more_streams_link();
     user_profile.update_user_profile_streams_list_for_users([people.my_current_user_id()]);
 
-    if (narrow_state.narrowed_to_stream_id(sub.stream_id)) {
-        assert(message_lists.current !== undefined);
+    if (narrow_state.narrowed_to_stream_id(sub.stream_id) && message_lists.current !== undefined) {
         message_lists.current.update_trailing_bookend(true);
         const then_select_id =
             typeof message_lists.current.selected_id === "function"
@@ -342,6 +353,10 @@ export function mark_subscribed(
     // The new stream in sidebar might need its unread counts
     // re-calculated.
     unread_ui.update_unread_counts();
+
+    // If the recent view folder filter is active, the new subscription
+    // may belong to the currently selected folder.
+    recent_view_ui.complete_rerender();
 }
 
 export function mark_unsubscribed(sub: StreamSubscription): void {
@@ -357,10 +372,9 @@ export function mark_unsubscribed(sub: StreamSubscription): void {
         return;
     }
 
-    if (narrow_state.narrowed_to_stream_id(sub.stream_id)) {
+    if (narrow_state.narrowed_to_stream_id(sub.stream_id) && message_lists.current !== undefined) {
         // Update UI components if we just unsubscribed from the
         // currently viewed stream.
-        assert(message_lists.current !== undefined);
         message_lists.current.update_trailing_bookend(true);
 
         // This update would likely be better implemented by having it
@@ -377,6 +391,10 @@ export function mark_unsubscribed(sub: StreamSubscription): void {
     stream_list.remove_sidebar_row(sub.stream_id);
     stream_list.update_subscribe_to_more_streams_link();
     user_profile.update_user_profile_streams_list_for_users([people.my_current_user_id()]);
+
+    // If the recent view folder filter is active, the unsubscribed
+    // channel may have been in the currently selected folder.
+    recent_view_ui.complete_rerender();
 }
 
 export function report_error_if_user_still_has_subscriptions(user_id: number): void {

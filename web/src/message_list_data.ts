@@ -6,6 +6,7 @@ import {FetchStatus} from "./fetch_status.ts";
 import type {Filter} from "./filter.ts";
 import type {Message} from "./message_store.ts";
 import * as muted_users from "./muted_users.ts";
+import * as people from "./people.ts";
 import {current_user} from "./state_data.ts";
 import * as user_topics from "./user_topics.ts";
 import * as util from "./util.ts";
@@ -33,7 +34,7 @@ export class MessageListData {
     _hash: Map<number, Message>;
     // Some views exclude muted topics / users.
     //
-    // Also, `all_messages_data` never excludes anything by definition.
+    // Also, `recent_view_messages_data` never excludes anything by definition.
     excludes_muted_topics: boolean;
     excludes_muted_users: boolean;
     // Tracks any locally echoed messages, which we know aren't present on the server.
@@ -91,6 +92,9 @@ export class MessageListData {
         this.add_messages_callback = callback;
     }
 
+    // Mute filtering for MessageListData objects depends on the values
+    // of this.excludes_muted_topics and this.excludes_muted_users. Note
+    // `recent_view_messages_data` never excludes anything by definition.
     all_messages_after_mute_filtering(): Message[] {
         return this._items;
     }
@@ -638,6 +642,14 @@ export class MessageListData {
             return [];
         }
         return msgs;
+    }
+
+    get_messages_involving_user(user_id: number): Message[] {
+        return this._items.filter(
+            (msg) =>
+                msg.sender_id === user_id ||
+                people.pm_with_user_ids(msg)?.includes(user_id) === true,
+        );
     }
 
     get_last_message_sent_by_me(): Message | undefined {

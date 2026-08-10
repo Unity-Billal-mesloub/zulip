@@ -11,7 +11,6 @@ from zulint.custom_rules import Rule, RuleList
 FILES_WITH_LEGACY_SUBJECT = {
     # This basically requires a big DB migration:
     "zerver/lib/topic.py",
-    "zerver/lib/topic_sqlalchemy.py",
     # This is tied to legacy events.
     "zerver/lib/event_types.py",
     # This is for backward compatibility.
@@ -215,6 +214,7 @@ js_rules = RuleList(
             "exclude": {
                 "web/tests/compose_paste.test.cjs",
                 "web/tests/postprocess_content.test.cjs",
+                "web/tests/lib/zjquery_element.cjs",
             },
             "good_lines": ["#my-style {color: blue;}", "const style =", 'some_style = "test"'],
             "bad_lines": ['<p style="color: blue;">Foo</p>', 'style = "color: blue;"'],
@@ -586,6 +586,7 @@ html_rules: list["Rule"] = [
         },
         "exclude": {
             "templates/corporate",
+            "templates/zerver/integrations/catalog.html",
             # We have URL template and Pygments language name as placeholders
             # in the below template which we don't want to be translatable.
             "web/templates/settings/playground_settings_admin.hbs",
@@ -902,7 +903,7 @@ help_markdown_rules = RuleList(
             "pattern": "[a-z][.][A-Z]",
             "description": "Likely missing space after end of sentence",
             "include_only": {"starlight_help/src/content/docs/"},
-            "exclude_pattern": "Rocket.Chat|org.zulip.Zulip|Directory.Read.All|RoleManagement.Read.Directory|User.Read.All",
+            "exclude_pattern": "Rocket.Chat|org.zulip.Zulip|Directory.Read.All|RoleManagement.Read.Directory|User.Read.All|ChannelMessage.Read.All",
         },
         {
             "pattern": r"\b[rR]ealm[s]?\b",

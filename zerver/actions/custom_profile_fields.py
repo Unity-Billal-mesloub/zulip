@@ -74,7 +74,7 @@ def try_add_realm_custom_profile_field(
     )
     custom_profile_field.hint = hint
     if custom_profile_field.field_type in (
-        CustomProfileField.SELECT,
+        CustomProfileField.DROPDOWN,
         CustomProfileField.EXTERNAL_ACCOUNT,
     ):
         custom_profile_field.field_data = orjson.dumps(field_data or {}).decode()
@@ -107,8 +107,27 @@ def remove_custom_profile_field_value_if_required(
     new_values = set(field_data.keys())
     removed_values = old_values - new_values
 
-    if removed_values:
-        CustomProfileFieldValue.objects.filter(field=field, value__in=removed_values).delete()
+    if not removed_values:
+        return
+
+    values_to_delete = CustomProfileFieldValue.objects.filter(
+        field=field, value__in=removed_values
+    ).select_related("user_profile")
+
+    updated_users = [field_value.user_profile for field_value in values_to_delete]
+
+    values_to_delete.delete()
+
+    for user_profile in updated_users:
+        notify_user_update_custom_profile_data(
+            user_profile,
+            {
+                "id": field.id,
+                "value": None,
+                "rendered_value": None,
+                "type": field.field_type,
+            },
+        )
 
 
 @transaction.atomic(durable=True)
@@ -137,12 +156,12 @@ def try_update_realm_custom_profile_field(
         field.use_for_user_matching = use_for_user_matching
 
     if field.field_type in (
-        CustomProfileField.SELECT,
+        CustomProfileField.DROPDOWN,
         CustomProfileField.EXTERNAL_ACCOUNT,
     ):
         # If field_data is None, field_data is unchanged and there is no need for
         # comparing field_data values.
-        if field_data is not None and field.field_type == CustomProfileField.SELECT:
+        if field_data is not None and field.field_type == CustomProfileField.DROPDOWN:
             remove_custom_profile_field_value_if_required(field, field_data)
 
         # If field.field_data is the default empty string, we will set field_data
@@ -246,7 +265,7 @@ def get_custom_profile_field_display_value(field_value: CustomProfileFieldValue)
         return ""
     type = field_value.field.field_type
 
-    if type == CustomProfileField.SELECT:
+    if type == CustomProfileField.DROPDOWN:
         field_data_dict = orjson.loads(field_value.field.field_data)
         value_key = field_value.value
         return field_data_dict[value_key]["text"]

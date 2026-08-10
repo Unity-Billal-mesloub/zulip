@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
 import * as z from "zod/mini";
@@ -288,6 +288,7 @@ function render_customize_stream_notifications_widget(): void {
         item_click_callback: change_state_of_customize_stream_notifications_widget,
         $events_container: $("#user-notification-settings .notification-settings-form"),
         unique_id_type: "number",
+        no_items_text: $t({defaultMessage: "No channels to customize"}),
     });
     customize_stream_notifications_widget.setup();
 }

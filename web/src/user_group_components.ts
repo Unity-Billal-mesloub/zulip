@@ -1,5 +1,6 @@
-import $ from "jquery";
+import {$} from "jquery";
 
+import render_nothing_selected_title from "../templates/user_group_settings/nothing_selected_title.hbs";
 import render_selected_group_title from "../templates/user_group_settings/selected_group_title.hbs";
 
 import {$t_html} from "./i18n.ts";
@@ -35,9 +36,9 @@ export function set_right_panel_title(group: UserGroup): void {
         }),
     );
     if (group.deactivated) {
-        $("#groups_overlay .deactivated-user-group-icon-right").show();
+        $("#groups_overlay .deactivated-user-group-icon").show();
     } else {
-        $("#groups_overlay .deactivated-user-group-icon-right").hide();
+        $("#groups_overlay .deactivated-user-group-icon").hide();
     }
 }
 
@@ -46,10 +47,7 @@ export const show_user_group_settings_pane = {
         $("#groups_overlay .settings, #user-group-creation").hide();
         reset_active_group_id();
         $("#groups_overlay .nothing-selected").show();
-        $("#groups_overlay .user-group-info-title").text(
-            $t_html({defaultMessage: "User group settings"}),
-        );
-        $("#groups_overlay .deactivated-user-group-icon-right").hide();
+        $("#user_group_settings_title").html(render_nothing_selected_title({}));
         resize.resize_settings_overlay($("#groups_overlay_container"));
     },
     settings(group: UserGroup) {
@@ -75,9 +73,13 @@ export const show_user_group_settings_pane = {
         $("#groups_overlay .nothing-selected, #groups_overlay .settings").hide();
         reset_active_group_id();
         $("#user-group-creation").show();
-        $("#groups_overlay .deactivated-user-group-icon-right").hide();
+        $("#groups_overlay .deactivated-user-group-icon").hide();
         resize.resize_settings_overlay($("#groups_overlay_container"));
         resize.resize_settings_creation_overlay($("#groups_overlay_container"));
+        $("#user_group_creation_form .two-pane-settings-creation-simplebar-container").toggleClass(
+            "members-visible",
+            container_name === "user_group_members_container",
+        );
     },
 };
 

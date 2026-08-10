@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 import orjson
-from altcha import verify_solution
+from altcha.v1 import verify_solution
 from django import forms
 from django.conf import settings
 from django.contrib.auth import authenticate, password_validation
@@ -271,6 +271,7 @@ class HomepageForm(forms.Form):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.realm = kwargs.pop("realm", None)
         self.from_multiuse_invite = kwargs.pop("from_multiuse_invite", False)
+        self.has_pending_invitation = kwargs.pop("has_pending_invitation", False)
         self.require_password_backend = kwargs.pop("require_password_backend", False)
         self.invited_as = kwargs.pop("invited_as", None)
         super().__init__(*args, **kwargs)
@@ -292,7 +293,7 @@ class HomepageForm(forms.Form):
             )
 
         if not from_multiuse_invite:
-            if realm.invite_required:
+            if realm.invite_required and not self.has_pending_invitation:
                 raise ValidationError(
                     _(
                         "Please request an invite for {email} from the organization administrator."
@@ -404,8 +405,8 @@ def validate_captcha_payload(request: HttpRequest, captcha_payload: str) -> None
             raise forms.ValidationError(_("Validation failed, please try again."))
     except forms.ValidationError:
         raise
-    except Exception as e:
-        logging.exception(e)
+    except Exception:
+        logging.exception("Error while validating altcha solution")
         raise forms.ValidationError(_("Validation failed, please try again."))
 
     captcha_data = orjson.loads(base64.b64decode(captcha_payload))

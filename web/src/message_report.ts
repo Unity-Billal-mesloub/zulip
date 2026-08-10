@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
 
@@ -22,7 +22,7 @@ import {update_elements} from "./rendered_markdown.ts";
 import * as rows from "./rows.ts";
 import {realm} from "./state_data.ts";
 import * as stream_data from "./stream_data.ts";
-import {process_submessages} from "./submessage.ts";
+import {render_submessage} from "./submessage.ts";
 import * as ui_report from "./ui_report.ts";
 import {toggle_user_card_popover_for_message} from "./user_card_popover.ts";
 
@@ -50,8 +50,7 @@ function register_message_preview_click_handlers(
         ".sender_name, .inline-profile-picture-wrapper",
         function (this: HTMLElement, e) {
             e.stopPropagation();
-            const user = people.get_by_user_id(sender_id);
-            toggle_user_card_popover_for_message(this, user, sender_id, true);
+            toggle_user_card_popover_for_message(this, sender_id, sender_id, true);
         },
     );
 }
@@ -59,7 +58,7 @@ function register_message_preview_click_handlers(
 function get_message_group_for_message_preview(message: Message): MessageGroup {
     // This creates a simpler recipient_row without element like the
     // topic menu and topic visibility policy menu.
-    const message_group = populate_group_from_message(message, false, false, undefined);
+    const message_group = populate_group_from_message(message, false, false);
     if (message_group.is_stream) {
         message_group.user_can_resolve_topic = false;
         message_group.is_topic_editable = false;
@@ -97,6 +96,7 @@ function get_message_container_for_preview(message: Message): MessageContainer {
         message_edit_notices_in_left_col: false,
         modified: false,
         moved: false,
+        widget_edited: false,
         year_changed: false,
     };
     return {
@@ -109,7 +109,7 @@ function post_process_message_preview($row: JQuery): void {
     const $content = $row.find(".message_content");
     update_elements($content);
     const id = rows.id($row);
-    process_submessages({
+    render_submessage({
         $row,
         message_id: id,
     });

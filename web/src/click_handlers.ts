@@ -1,6 +1,6 @@
 // You won't find every click handler here, but it's a good place to start!
 
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as tippy from "tippy.js";
 import * as z from "zod/mini";
@@ -28,6 +28,7 @@ import * as navigate from "./navigate.ts";
 import {page_params} from "./page_params.ts";
 import * as pm_list from "./pm_list.ts";
 import * as popover_menus from "./popover_menus.ts";
+import * as popover_menus_data from "./popover_menus_data.ts";
 import * as reactions from "./reactions.ts";
 import * as recent_view_ui from "./recent_view_ui.ts";
 import * as rows from "./rows.ts";
@@ -226,7 +227,7 @@ export function initialize(): void {
                 // This might happen for locally echoed messages, for example.
                 return;
             }
-            window.location.href = hash_util.by_conversation_and_time_url(message);
+            window.location.assign(hash_util.by_conversation_and_time_url(message));
             return;
         }
 
@@ -294,6 +295,11 @@ export function initialize(): void {
     });
 
     $("#main_div").on("click", "a.stream", function (this: HTMLAnchorElement, e) {
+        if (e.metaKey || e.ctrlKey || e.shiftKey) {
+            // Let the browser handle modified clicks (open in a new
+            // tab/window) using the link's href.
+            return;
+        }
         e.preventDefault();
         // Note that we may have an href here, but we trust the stream id more,
         // so we re-encode the hash.
@@ -302,7 +308,7 @@ export function initialize(): void {
             browser_history.go_to_location(hash_util.channel_url_by_user_setting(stream_id));
             return;
         }
-        window.location.href = this.href;
+        window.location.assign(this.href);
     });
 
     $("body").on("click", ".not-subscribed-banner .load-newer-messages-button", (e) => {
@@ -460,12 +466,6 @@ export function initialize(): void {
         );
     }
 
-    function get_start_of_day(date: Date): Date {
-        const start = new Date(date);
-        start.setHours(0, 0, 0, 0);
-        return start;
-    }
-
     function open_scroll_to_time_popover(trigger_element: HTMLElement, message_id: number): void {
         popover_menus.toggle_popover_menu(trigger_element, {
             theme: "popover-menu",
@@ -482,7 +482,14 @@ export function initialize(): void {
             },
             onShow(instance) {
                 popover_menus.on_show_prep(instance);
-                instance.setContent(parse_html(render_scroll_to_time_popover()));
+                assert(message_lists.current !== undefined);
+                const messages = message_lists.current.all_messages();
+                const clicked_message = message_lists.current.get(message_id)!;
+                const suggested_dates = popover_menus_data.get_scroll_to_date_suggestions(
+                    messages,
+                    clicked_message.timestamp,
+                );
+                instance.setContent(parse_html(render_scroll_to_time_popover({suggested_dates})));
             },
             onMount(instance) {
                 const $popper = $(instance.popper);
@@ -493,28 +500,9 @@ export function initialize(): void {
                     popover_menus.hide_current_popover_if_visible(instance);
                 });
 
-                $popper.on("click", "#scroll_to_last_week", () => {
-                    const week_ago = get_start_of_day(new Date());
-                    week_ago.setDate(week_ago.getDate() - 7);
-                    message_view.fast_track_current_msg_list_to_anchor(
-                        "date",
-                        week_ago.toISOString(),
-                    );
-                    popover_menus.hide_current_popover_if_visible(instance);
-                });
-
-                $popper.on("click", "#scroll_to_yesterday", () => {
-                    const yesterday = get_start_of_day(new Date());
-                    yesterday.setDate(yesterday.getDate() - 1);
-                    message_view.fast_track_current_msg_list_to_anchor(
-                        "date",
-                        yesterday.toISOString(),
-                    );
-                    popover_menus.hide_current_popover_if_visible(instance);
-                });
-
-                $popper.on("click", "#scroll_to_newest", () => {
-                    message_view.fast_track_current_msg_list_to_anchor("newest");
+                $popper.on("click", ".scroll-to-suggested-date", function (this: HTMLElement) {
+                    const iso_date = $(this).attr("data-iso-date")!;
+                    message_view.fast_track_current_msg_list_to_anchor("date", iso_date);
                     popover_menus.hide_current_popover_if_visible(instance);
                 });
 
@@ -545,6 +533,15 @@ export function initialize(): void {
         open_scroll_to_time_popover(this, message_id);
     });
 
+    $("body").on("click", ".search-shared-history", function (this: HTMLElement, e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const url = $(this).attr("data-url");
+        if (url) {
+            browser_history.go_to_location(url);
+        }
+    });
+
     // RESOLVED TOPICS
     $("body").on("click", ".message_header .on_hover_topic_resolve", (e) => {
         e.stopPropagation();
@@ -569,17 +566,24 @@ export function initialize(): void {
         return nearest.id;
     }
 
-    $("#message_feed_container").on("click", ".narrows_by_topic", function (this: HTMLElement, e) {
-        if (e.metaKey || e.ctrlKey || e.shiftKey) {
-            return;
-        }
-        e.preventDefault();
-        if (mouse_drag.is_drag(e)) {
-            return;
-        }
-        const row_id = get_row_id_for_narrowing(this);
-        message_view.narrow_by_topic(row_id, {trigger: "message header"});
-    });
+    $("#message_feed_container").on(
+        "click",
+        ".narrows_by_topic, .narrows_by_recipient",
+        function (this: HTMLElement, e) {
+            if (e.metaKey || e.ctrlKey || e.shiftKey) {
+                return;
+            }
+            if (mouse_drag.is_drag(e)) {
+                e.preventDefault();
+                return;
+            }
+            if ($(this).hasClass("narrows_by_topic")) {
+                e.preventDefault();
+                const row_id = get_row_id_for_narrowing(this);
+                message_view.narrow_by_topic(row_id, {trigger: "message header"});
+            }
+        },
+    );
 
     // SIDEBARS
     $("body").on("click", ".compose-new-direct-message", (e) => {
@@ -814,7 +818,7 @@ export function initialize(): void {
     // Recent conversations direct messages (Not displayed on small widths)
     $("body").on(
         "mouseenter",
-        ".recent_topic_stream .pm_status_icon",
+        ".recent_topic_name .pm_status_icon",
         function (this: HTMLElement, e) {
             e.stopPropagation();
             const $elem = $(this);
@@ -909,7 +913,7 @@ export function initialize(): void {
         // ...less the width of the two scroller buttons.
         const button_adjusted_scroll_shift =
             button_bar_scroll_percentage * (button_container_width - 2 * scroller_button_width_px);
-        let new_scroll_position = 0;
+        let new_scroll_position;
 
         assert(typeof button_bar_scroll_left === "number");
 
@@ -988,7 +992,7 @@ export function initialize(): void {
         topic_list.clear_topic_search,
     );
 
-    $("body").on("click", "#direct-messages-section-header.zoom-out", (e) => {
+    $("body").on("click", "#direct-messages-section-header", (e) => {
         if ($(e.target).closest(".show-all-direct-messages").length === 1) {
             // Let the browser handle the "direct message feed" widget.
             return;
@@ -1018,7 +1022,7 @@ export function initialize(): void {
     /* The DIRECT MESSAGES label's click behavior is complicated;
      * only when zoomed in does it have a navigation effect, so we need
      * this click handler rather than just a link. */
-    $("body").on("click", "#direct-messages-section-header.zoom-in", (e) => {
+    $("body").on("click", "#direct-messages-modal-section-header", (e) => {
         e.preventDefault();
         e.stopPropagation();
 
@@ -1028,13 +1032,18 @@ export function initialize(): void {
     $("body").on("click", ".direct-messages-search-section", (e) => {
         // We don't want clicking on the filter to trigger the DM
         // narrow defined on click for
-        // `#direct-messages-section-header.zoom-in`.
+        // `#direct-messages-modal-section-header`.
         e.stopPropagation();
     });
 
     // disable the draggability for left-sidebar components
     $("#stream_filters, #left-sidebar-navigation-list").on("dragstart", (e) => {
-        e.target.blur();
+        // e.target is the innermost node where the drag started, which is
+        // not necessarily an element with a blur() method; for instance,
+        // dragging a text selection makes it a Text node.
+        if (e.target instanceof HTMLElement) {
+            e.target.blur();
+        }
         return false;
     });
 
@@ -1098,7 +1107,8 @@ export function initialize(): void {
                 // into compose and modify it.
                 $("textarea#compose-textarea").trigger("focus");
                 return;
-            } else if (
+            }
+            if (
                 !window.getSelection()?.toString() &&
                 // Clicking any input or text area should not close
                 // the compose box; this means using the sidebar

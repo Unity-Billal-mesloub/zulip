@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 
 import * as blueslip from "./blueslip.ts";
 import {realm} from "./state_data.ts";
@@ -8,6 +8,13 @@ type GifRating = "pg" | "pg-13" | "r" | "g";
 export function is_tenor_enabled(): boolean {
     return (
         realm.tenor_api_key !== "" &&
+        realm.realm_gif_rating_policy !== realm.gif_rating_policy_options.disabled.id
+    );
+}
+
+export function is_klipy_enabled(): boolean {
+    return (
+        realm.klipy_api_key !== "" &&
         realm.realm_gif_rating_policy !== realm.gif_rating_policy_options.disabled.id
     );
 }

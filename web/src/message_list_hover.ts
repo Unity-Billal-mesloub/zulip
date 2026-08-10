@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 
 import * as message_edit from "./message_edit.ts";
@@ -47,6 +47,31 @@ export function message_hover($message_row: JQuery): void {
     }
 
     change_edit_content_button($message_row, message);
+}
+
+export function reapply_hover_on_row_replace(
+    $old_row: JQuery,
+    $new_row: JQuery,
+    message: Message,
+): void {
+    // When a hovered message row is re-rendered (e.g., after an edit),
+    // the browser does not refire `mouseover` for the replacement row
+    // even if the cursor is still positioned over it. Without this
+    // transfer, the new row would be missing the
+    // `can-edit-content` / `can-move-message` classes that the hover
+    // handler normally applies, and `$current_message_hover` would
+    // still point at the detached old row.
+    if ($current_message_hover === undefined) {
+        return;
+    }
+    if (rows.id($current_message_hover) !== rows.id($old_row)) {
+        return;
+    }
+    $current_message_hover = $new_row;
+    if (!message.sent_by_me || message.locally_echoed) {
+        return;
+    }
+    change_edit_content_button($new_row, message);
 }
 
 function change_edit_content_button($message_row: JQuery, message: Message): void {
@@ -126,12 +151,12 @@ export function initialize(): void {
                 return;
             }
             const $img = $(this);
-            $img.closest(".message-media-preview-image, .message-media-inline-image").removeClass(
-                "message_inline_animated_image_still",
+            $img.closest(".message-media-preview-image, .message-media-inline-image").addClass(
+                "animated-preview-hover",
             );
             $img.attr(
                 "src",
-                $img.attr("src")!.replace(/\/[^/]+$/, "/" + thumbnail.animated_format.name),
+                $img.attr("src")!.replace(/\/[^/]+$/, () => "/" + thumbnail.animated_format.name),
             );
         },
     );
@@ -144,12 +169,12 @@ export function initialize(): void {
                 return;
             }
             const $img = $(this);
-            $img.closest(".message-media-preview-image, .message-media-inline-image").addClass(
-                "message_inline_animated_image_still",
+            $img.closest(".message-media-preview-image, .message-media-inline-image").removeClass(
+                "animated-preview-hover",
             );
             $img.attr(
                 "src",
-                $img.attr("src")!.replace(/\/[^/]+$/, "/" + thumbnail.preferred_format.name),
+                $img.attr("src")!.replace(/\/[^/]+$/, () => "/" + thumbnail.preferred_format.name),
             );
         },
     );

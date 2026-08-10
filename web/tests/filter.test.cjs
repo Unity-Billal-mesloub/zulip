@@ -7,13 +7,13 @@ const {parseOneAddress} = require("email-addresses");
 const {make_realm} = require("./lib/example_realm.cjs");
 const {make_stream} = require("./lib/example_stream.cjs");
 const {make_user, Role} = require("./lib/example_user.cjs");
-const {mock_esm, with_overrides, zrequire} = require("./lib/namespace.cjs");
+const {mock_esm, with_overrides, zrequire, clock} = require("./lib/namespace.cjs");
 const {run_test} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 const {page_params} = require("./lib/zpage_params.cjs");
 
-const message_store = mock_esm("../src/message_store");
+const message_store = zrequire("message_store");
 const user_topics = mock_esm("../src/user_topics");
 
 const resolved_topic = zrequire("resolved_topic");
@@ -73,6 +73,32 @@ const annie = make_user({
     role: Role.GUEST,
 });
 
+// Multi-word names, to exercise resolving typed full names to user ids.
+const karl = make_user({
+    email: "karl@foo.com",
+    user_id: 36,
+    full_name: "Karl Stolley",
+});
+
+const shubham = make_user({
+    email: "shubham@foo.com",
+    user_id: 37,
+    full_name: "Shubham Padia",
+});
+
+// Two users sharing a full name, to exercise duplicate-name handling.
+const sam_one = make_user({
+    email: "sam1@foo.com",
+    user_id: 38,
+    full_name: "Sam Park",
+});
+
+const sam_two = make_user({
+    email: "sam2@foo.com",
+    user_id: 39,
+    full_name: "Sam Park",
+});
+
 // Add users to `valid_user_ids`.
 const source = "server_events";
 people.add_active_user(me, source);
@@ -81,6 +107,10 @@ people.add_active_user(steve, source);
 people.add_active_user(alice, source);
 people.add_active_user(jeff, source);
 people.add_active_user(annie, source);
+people.add_active_user(karl, source);
+people.add_active_user(shubham, source);
+people.add_active_user(sam_one, source);
+people.add_active_user(sam_two, source);
 people.initialize_current_user(me.user_id);
 state_data.set_current_user(me);
 muted_users.add_muted_user(jeff.user_id);
@@ -159,6 +189,7 @@ test("basics", () => {
     assert.ok(!filter.is_keyword_search());
     assert.ok(!filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.allow_use_first_unread_when_narrowing());
     assert.ok(filter.includes_full_stream_history());
@@ -209,6 +240,7 @@ test("basics", () => {
     assert.ok(!filter.is_keyword_search());
     assert.ok(!filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.allow_use_first_unread_when_narrowing());
     assert.ok(filter.includes_full_stream_history());
@@ -229,6 +261,7 @@ test("basics", () => {
     assert.ok(filter.is_keyword_search());
     assert.ok(!filter.can_mark_messages_read());
     assert.ok(!filter.contains_no_partial_conversations());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.allow_use_first_unread_when_narrowing());
     assert.ok(!filter.can_apply_locally());
@@ -248,15 +281,16 @@ test("basics", () => {
     filter = new Filter(terms);
 
     assert.ok(!filter.is_keyword_search());
-    assert.ok(!filter.can_mark_messages_read());
+    assert.ok(filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.allow_use_first_unread_when_narrowing());
     assert.ok(filter.can_apply_locally());
     assert.ok(!filter.is_personal_filter());
     assert.ok(filter.can_bucket_by("channel"));
     assert.ok(filter.can_bucket_by("channel", "topic"));
-    assert.ok(!filter.is_conversation_view());
+    assert.ok(filter.is_conversation_view());
     assert.ok(!filter.is_channel_view());
     assert.ok(filter.is_conversation_view_with_near());
     assert.ok(!filter.may_contain_multiple_conversations());
@@ -269,6 +303,7 @@ test("basics", () => {
     // want to have the channel in the tab bar or unsubscribe messaging, etc.
     terms = [{operator: "channel", operand: invalid_sub_id.toString(), negated: true}];
     filter = new Filter(terms);
+    assert.ok(filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.has_operator("channel"));
     assert.ok(!filter.can_mark_messages_read());
@@ -284,6 +319,7 @@ test("basics", () => {
     // be false, and we want "Search results" in the tab bar.
     terms = [{operator: "search", operand: "stop_word", negated: true}];
     filter = new Filter(terms);
+    assert.ok(filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(filter.has_operator("search"));
     assert.ok(!filter.can_apply_locally());
@@ -314,6 +350,7 @@ test("basics", () => {
 
     terms = [{operator: "channels", operand: "public", negated: true}];
     filter = new Filter(terms);
+    assert.ok(filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.has_operator("channels"));
     assert.ok(!filter.can_mark_messages_read());
@@ -328,11 +365,41 @@ test("basics", () => {
 
     terms = [{operator: "channels", operand: "public"}];
     filter = new Filter(terms);
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(filter.has_operator("channels"));
     assert.ok(!filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
     assert.ok(!filter.has_negated_operand("channels", "public"));
+    assert.ok(filter.can_apply_locally());
+    assert.ok(filter.includes_full_stream_history());
+    assert.ok(!filter.is_personal_filter());
+    assert.ok(!filter.is_conversation_view());
+    assert.ok(!filter.is_channel_view());
+    assert.ok(filter.may_contain_multiple_conversations());
+    assert.ok(!filter.has_exactly_channel_topic_operators());
+
+    terms = [{operator: "channels", operand: "archived", negated: true}];
+    filter = new Filter(terms);
+    assert.ok(!filter.contains_only_private_messages());
+    assert.ok(!filter.has_operator("channels"));
+    assert.ok(filter.can_mark_messages_read());
+    assert.ok(filter.contains_no_partial_conversations());
+    assert.ok(filter.has_negated_operand("channels", "archived"));
+    assert.ok(filter.can_apply_locally());
+    assert.ok(!filter.is_personal_filter());
+    assert.ok(!filter.is_conversation_view());
+    assert.ok(!filter.is_channel_view());
+    assert.ok(filter.may_contain_multiple_conversations());
+    assert.ok(!filter.has_exactly_channel_topic_operators());
+
+    terms = [{operator: "channels", operand: "archived"}];
+    filter = new Filter(terms);
+    assert.ok(!filter.contains_only_private_messages());
+    assert.ok(filter.has_operator("channels"));
+    assert.ok(!filter.can_mark_messages_read());
+    assert.ok(filter.contains_no_partial_conversations());
+    assert.ok(!filter.has_negated_operand("channels", "archived"));
     assert.ok(filter.can_apply_locally());
     assert.ok(filter.includes_full_stream_history());
     assert.ok(!filter.is_personal_filter());
@@ -351,6 +418,7 @@ test("basics", () => {
 
     terms = [{operator: "is", operand: "dm"}];
     filter = new Filter(terms);
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(filter.contains_only_private_messages());
     assert.ok(filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
@@ -366,6 +434,7 @@ test("basics", () => {
 
     terms = [{operator: "is", operand: "dm", negated: true}];
     filter = new Filter(terms);
+    assert.ok(filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
@@ -391,6 +460,7 @@ test("basics", () => {
 
     terms = [{operator: "is", operand: "mentioned"}];
     filter = new Filter(terms);
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.can_mark_messages_read());
     assert.ok(!filter.contains_no_partial_conversations());
@@ -406,6 +476,7 @@ test("basics", () => {
 
     terms = [{operator: "is", operand: "starred"}];
     filter = new Filter(terms);
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.can_mark_messages_read());
     assert.ok(!filter.contains_no_partial_conversations());
@@ -420,6 +491,7 @@ test("basics", () => {
     terms = [{operator: "dm", operand: [joe.user_id]}];
     filter = new Filter(terms);
     assert.ok(filter.is_search_for_specific_group_or_user());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(filter.contains_only_private_messages());
     assert.ok(filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
@@ -438,13 +510,14 @@ test("basics", () => {
     ];
     filter = new Filter(terms);
     assert.ok(filter.is_search_for_specific_group_or_user());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(filter.contains_only_private_messages());
-    assert.ok(!filter.can_mark_messages_read());
+    assert.ok(filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
     assert.ok(!filter.has_operator("search"));
     assert.ok(filter.can_apply_locally());
     assert.ok(!filter.is_personal_filter());
-    assert.ok(!filter.is_conversation_view());
+    assert.ok(filter.is_conversation_view());
     assert.ok(filter.is_conversation_view_with_near());
     assert.ok(!filter.may_contain_multiple_conversations());
     assert.ok(!filter.is_channel_view());
@@ -453,6 +526,7 @@ test("basics", () => {
     terms = [{operator: "dm", operand: [joe.user_id, steve.user_id]}];
     filter = new Filter(terms);
     assert.ok(filter.is_search_for_specific_group_or_user());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(filter.contains_only_private_messages());
     assert.ok(filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
@@ -469,6 +543,7 @@ test("basics", () => {
         {operator: "with", operand: "12"},
     ];
     filter = new Filter(terms);
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(filter.contains_only_private_messages());
     assert.ok(filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
@@ -491,6 +566,7 @@ test("basics", () => {
     terms = [{operator: "dm-including", operand: [joe.user_id]}];
     filter = new Filter(terms);
     assert.ok(filter.is_search_for_specific_group_or_user());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(filter.contains_only_private_messages());
     assert.ok(!filter.has_operator("search"));
     assert.ok(!filter.can_mark_messages_read());
@@ -512,6 +588,7 @@ test("basics", () => {
 
     terms = [{operator: "is", operand: "resolved"}];
     filter = new Filter(terms);
+    assert.ok(filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.has_operator("search"));
     assert.ok(filter.can_mark_messages_read());
@@ -536,6 +613,7 @@ test("basics", () => {
         {operator: "in", operand: "all"},
     ];
     filter = new Filter(terms);
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.has_operator("search"));
     assert.ok(!filter.can_mark_messages_read());
@@ -558,6 +636,7 @@ test("basics", () => {
     assert.ok(!filter.is_keyword_search());
     assert.ok(filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(filter.allow_use_first_unread_when_narrowing());
     assert.ok(filter.includes_full_stream_history());
@@ -579,6 +658,7 @@ test("basics", () => {
     assert.ok(!filter.is_keyword_search());
     assert.ok(filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(filter.allow_use_first_unread_when_narrowing());
     assert.ok(filter.includes_full_stream_history());
@@ -601,6 +681,7 @@ test("basics", () => {
     assert.ok(!filter.is_keyword_search());
     assert.ok(filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(filter.allow_use_first_unread_when_narrowing());
     assert.ok(filter.includes_full_stream_history());
@@ -620,6 +701,7 @@ test("basics", () => {
     assert.ok(!filter.is_keyword_search());
     assert.ok(!filter.can_mark_messages_read());
     assert.ok(filter.contains_no_partial_conversations());
+    assert.ok(!filter.may_have_incomplete_message_history());
     assert.ok(!filter.contains_only_private_messages());
     assert.ok(!filter.allow_use_first_unread_when_narrowing());
     assert.ok(filter.includes_full_stream_history());
@@ -647,6 +729,17 @@ test("basics", () => {
     filter = new Filter(terms);
     assert.ok(filter.is_channel_view());
 
+    terms = [{operator: "mentions", operand: joe.user_id}];
+    filter = new Filter(terms);
+    assert.ok(!filter.contains_only_private_messages());
+    assert.ok(!filter.has_operator("search"));
+    assert.ok(!filter.can_mark_messages_read());
+    assert.ok(!filter.contains_no_partial_conversations());
+    assert.ok(!filter.can_apply_locally());
+    assert.ok(!filter.is_personal_filter());
+    assert.ok(!filter.is_conversation_view());
+    assert.ok(!filter.is_channel_view());
+
     // Throw error on invalid operator.
     assert.throws(() => get_predicate([["bogus", "33"]]), {
         name: "$ZodError",
@@ -654,7 +747,7 @@ test("basics", () => {
 });
 
 function assert_not_mark_read_with_has_operands(additional_terms_to_test) {
-    additional_terms_to_test = additional_terms_to_test || [];
+    additional_terms_to_test ||= [];
     let has_link_term = [{operator: "has", operand: "link"}];
     let filter = new Filter([...additional_terms_to_test, ...has_link_term]);
     assert.ok(!filter.can_mark_messages_read());
@@ -684,7 +777,7 @@ function assert_not_mark_read_with_has_operands(additional_terms_to_test) {
     assert.ok(!filter.can_mark_messages_read());
 }
 function assert_not_mark_read_with_is_operands(additional_terms_to_test) {
-    additional_terms_to_test = additional_terms_to_test || [];
+    additional_terms_to_test ||= [];
     let is_operator = [{operator: "is", operand: "starred"}];
     let filter = new Filter([...additional_terms_to_test, ...is_operator]);
     assert.ok(!filter.can_mark_messages_read());
@@ -735,7 +828,7 @@ function assert_not_mark_read_with_is_operands(additional_terms_to_test) {
 }
 
 function assert_not_mark_read_when_searching(additional_terms_to_test) {
-    additional_terms_to_test = additional_terms_to_test || [];
+    additional_terms_to_test ||= [];
     let search_op = [{operator: "search", operand: "keyword"}];
     let filter = new Filter([...additional_terms_to_test, ...search_op]);
     assert.ok(!filter.can_mark_messages_read());
@@ -957,6 +1050,7 @@ test("public_terms", ({override}) => {
         {operator: "channel", operand: some_channel_id.toString()},
         {operator: "in", operand: "all"},
         {operator: "topic", operand: "bar"},
+        {operator: "date", operand: "2025-04-01"},
     ];
     let filter = new Filter(terms);
     const expected_terms = [
@@ -1012,6 +1106,11 @@ test("canonicalization", () => {
     assert.equal(term.operator, "sender");
     assert.equal(term.operand, me.user_id);
 
+    // mentions:me redirects to is:mentioned
+    term = Filter.convert_suggestion_to_term({operator: "mentions", operand: "me"});
+    assert.equal(term.operator, "is");
+    assert.equal(term.operand, "mentioned");
+
     // "pm-with" was renamed to "dm"
     term = Filter.convert_suggestion_to_term({operator: "pm-with", operand: "me"});
     assert.equal(term.operator, "dm");
@@ -1038,6 +1137,10 @@ test("canonicalization", () => {
     assert.equal(term.operator, "search");
     assert.equal(term.operand, 'abc "xyz"');
 
+    term = Filter.canonicalize_term({operator: "date", operand: "2022-06-10"});
+    assert.equal(term.operator, "date");
+    assert.equal(term.operand, "2022-06-10");
+
     term = Filter.canonicalize_term({operator: "has", operand: "attachments"});
     assert.equal(term.operator, "has");
     assert.equal(term.operand, "attachment");
@@ -1053,6 +1156,10 @@ test("canonicalization", () => {
     term = Filter.canonicalize_term({operator: "has", operand: "reactions"});
     assert.equal(term.operator, "has");
     assert.equal(term.operand, "reaction");
+
+    term = Filter.canonicalize_term({operator: "mentions", operand: joe.user_id});
+    assert.equal(term.operator, "mentions");
+    assert.equal(term.operand, joe.user_id);
 });
 
 test("ensure_channel_topic_terms", () => {
@@ -1146,6 +1253,7 @@ test("predicate_basics", ({override}) => {
     const old_sub_id = new_stream_id();
     const private_sub_id = new_stream_id();
     const web_public_sub_id = new_stream_id();
+    const archived_sub_id = new_stream_id();
     const old_sub = {
         name: "old-subscription",
         stream_id: old_sub_id,
@@ -1167,9 +1275,18 @@ test("predicate_basics", ({override}) => {
         invite_only: false,
         is_web_public: true,
     };
+    const archived_sub = {
+        name: "archived-subscription",
+        stream_id: archived_sub_id,
+        subscribed: true,
+        invite_only: false,
+        is_web_public: true,
+        is_archived: true,
+    };
     stream_data.add_sub_for_tests(old_sub);
     stream_data.add_sub_for_tests(private_sub);
     stream_data.add_sub_for_tests(web_public_sub);
+    stream_data.add_sub_for_tests(archived_sub);
     predicate = get_predicate([
         ["channel", old_sub_id.toString()],
         ["topic", "Bar"],
@@ -1193,7 +1310,11 @@ test("predicate_basics", ({override}) => {
     assert.ok(!predicate({type: stream_message, stream_id: private_sub_id}));
     assert.ok(predicate({type: stream_message, stream_id: web_public_sub_id}));
 
+    predicate = get_predicate([["channels", "archived"]]);
+    assert.ok(predicate({type: stream_message, stream_id: archived_sub_id}));
+
     predicate = get_predicate([["channels", "web-public"]]);
+    assert.ok(predicate({type: stream_message, stream_id: archived_sub_id}));
     assert.ok(predicate({type: stream_message, stream_id: web_public_sub_id}));
     assert.ok(!predicate({type: stream_message, stream_id: old_sub_id}));
 
@@ -1388,6 +1509,19 @@ test("predicate_basics", ({override}) => {
     );
     assert.ok(!predicate({type: stream_message}));
 
+    const inline_audio_msg = {
+        content:
+            '<p><audio controls preload="metadata" src="/user_uploads/randompath/test.mp3" title="zulip.mp3"></audio></p>',
+    };
+
+    predicate = get_predicate([["mentions", joe.user_id]]);
+    assert.ok(predicate({}));
+
+    const inline_img_msg = {
+        content:
+            '<p><img alt="Screenshot" class="inline-image" data-original-content-type="image/png" data-original-dimensions="1488x1130" data-original-src="/user_uploads/randompath/test.png" src="/user_uploads/thumbnail/randompath/test.png/840x560.webp"></p>',
+    };
+
     const img_msg = {
         // Even though the HTML class `message_inline_image` is modified
         // in post_process for rendered message, the raw content stays the same.
@@ -1432,6 +1566,8 @@ test("predicate_basics", ({override}) => {
     };
 
     predicate = get_predicate([["has", "non_valid_operand"]]);
+    assert.ok(!predicate(inline_audio_msg));
+    assert.ok(!predicate(inline_img_msg));
     assert.ok(!predicate(img_msg));
     assert.ok(!predicate(non_img_attachment_msg));
     assert.ok(!predicate(link_msg));
@@ -1445,33 +1581,48 @@ test("predicate_basics", ({override}) => {
     }
 
     const has_link = get_predicate([["has", "link"]]);
+    set_find_results_for_msg_content(inline_audio_msg, "a", []);
+    assert.ok(!has_link(inline_audio_msg));
+    set_find_results_for_msg_content(inline_img_msg, "a", []);
+    assert.ok(!has_link(inline_img_msg));
     set_find_results_for_msg_content(img_msg, "a", ["stub"]);
     assert.ok(has_link(img_msg));
     set_find_results_for_msg_content(non_img_attachment_msg, "a", ["stub"]);
     assert.ok(has_link(non_img_attachment_msg));
     set_find_results_for_msg_content(link_msg, "a", ["stub"]);
     assert.ok(has_link(link_msg));
-    set_find_results_for_msg_content(no_has_filter_matching_msg, "a", false);
+    set_find_results_for_msg_content(no_has_filter_matching_msg, "a", []);
     assert.ok(!has_link(no_has_filter_matching_msg));
 
     const has_attachment = get_predicate([["has", "attachment"]]);
-    set_find_results_for_msg_content(img_msg, "a[href^='/user_uploads']", ["stub"]);
+    const attachment_selector_string =
+        "a[href^='/user_uploads'], img[src^='/user_uploads'], audio[src^='/user_uploads']";
+    set_find_results_for_msg_content(inline_audio_msg, attachment_selector_string, ["stub"]);
+    assert.ok(has_attachment(inline_audio_msg));
+    set_find_results_for_msg_content(inline_img_msg, attachment_selector_string, ["stub"]);
+    assert.ok(has_attachment(inline_img_msg));
+    set_find_results_for_msg_content(img_msg, attachment_selector_string, ["stub"]);
     assert.ok(has_attachment(img_msg));
-    set_find_results_for_msg_content(non_img_attachment_msg, "a[href^='/user_uploads']", ["stub"]);
+    set_find_results_for_msg_content(non_img_attachment_msg, attachment_selector_string, ["stub"]);
     assert.ok(has_attachment(non_img_attachment_msg));
-    set_find_results_for_msg_content(link_msg, "a[href^='/user_uploads']", false);
+    set_find_results_for_msg_content(link_msg, attachment_selector_string, []);
     assert.ok(!has_attachment(link_msg));
-    set_find_results_for_msg_content(no_has_filter_matching_msg, "a[href^='/user_uploads']", false);
+    set_find_results_for_msg_content(no_has_filter_matching_msg, attachment_selector_string, []);
     assert.ok(!has_attachment(no_has_filter_matching_msg));
 
     const has_image = get_predicate([["has", "image"]]);
-    set_find_results_for_msg_content(img_msg, ".message_inline_image", ["stub"]);
+    const image_selector_string = ".message_inline_image, .inline-image";
+    set_find_results_for_msg_content(inline_audio_msg, image_selector_string, []);
+    assert.ok(!has_image(inline_audio_msg));
+    set_find_results_for_msg_content(inline_img_msg, image_selector_string, ["stub"]);
+    assert.ok(has_image(inline_img_msg));
+    set_find_results_for_msg_content(img_msg, image_selector_string, ["stub"]);
     assert.ok(has_image(img_msg));
-    set_find_results_for_msg_content(non_img_attachment_msg, ".message_inline_image", false);
+    set_find_results_for_msg_content(non_img_attachment_msg, image_selector_string, []);
     assert.ok(!has_image(non_img_attachment_msg));
-    set_find_results_for_msg_content(link_msg, ".message_inline_image", false);
+    set_find_results_for_msg_content(link_msg, image_selector_string, []);
     assert.ok(!has_image(link_msg));
-    set_find_results_for_msg_content(no_has_filter_matching_msg, ".message_inline_image", false);
+    set_find_results_for_msg_content(no_has_filter_matching_msg, image_selector_string, []);
     assert.ok(!has_image(no_has_filter_matching_msg));
 
     const has_reaction = get_predicate([["has", "reaction"]]);
@@ -1543,6 +1694,19 @@ test("parse", () => {
     ];
     _test();
 
+    // A digit-leading channel name resolves by name, not by reading
+    // its leading digits as a stream id.
+    make_sub("7th", 7000);
+    string = "channel:7th";
+    terms = [{operator: "channel", operand: "7000"}];
+    _test();
+
+    // A digit-leading operand with no matching channel is left as-is,
+    // not coerced into a stream id.
+    string = "channel:9th";
+    terms = [{operator: "channel", operand: "9th"}];
+    _test();
+
     string = `channel:${foo_stream_id} topic:bar yo`;
     terms = [
         {operator: "channel", operand: foo_stream_id.toString()},
@@ -1574,6 +1738,14 @@ test("parse", () => {
 
     string = "-sender:me";
     terms = [{operator: "sender", operand: `${me.user_id}`, negated: true}];
+    _test(true);
+
+    string = "mentions:me";
+    terms = [{operator: "is", operand: "mentioned"}];
+    _test(true);
+
+    string = "-mentions:me";
+    terms = [{operator: "is", operand: "mentioned", negated: true}];
     _test(true);
 
     string = "https://www.google.com";
@@ -1662,6 +1834,20 @@ test("parse", () => {
     string = "https://www.google.com";
     terms = [{operator: "search", operand: "https://www.google.com"}];
     _test();
+
+    string = "date:a week ago";
+    terms = [
+        {operator: "date", operand: "a"},
+        {operator: "search", operand: "week ago"},
+    ];
+    _test();
+
+    string = "date:2025-03-12 hello";
+    terms = [
+        {operator: "date", operand: "2025-03-12"},
+        {operator: "search", operand: "hello"},
+    ];
+    _test();
 });
 
 test("unparse", () => {
@@ -1713,7 +1899,7 @@ test("unparse", () => {
     string = `channel:${foo_stream_id} topic:Bar`;
     assert.deepEqual(Filter.unparse(terms), string);
 
-    terms = [{operator: "topic", operand: '\t "%+.\u00A0'}];
+    terms = [{operator: "topic", operand: '\t "%+.\u{A0}'}];
     string = "topic:%09+%22%25%2B.%C2%A0";
     assert.equal(Filter.unparse(terms), string);
     assert_same_terms(Filter.parse(string), terms);
@@ -1731,6 +1917,14 @@ test("describe", ({mock_template, override}) => {
 
     narrow = [{operator: "channels", operand: "public", negated: true}];
     string = "exclude all public channels";
+    assert.equal(Filter.search_description_as_html(narrow, false), string);
+
+    narrow = [{operator: "channels", operand: "archived"}];
+    string = "archived channels";
+    assert.equal(Filter.search_description_as_html(narrow, false), string);
+
+    narrow = [{operator: "channels", operand: "archived", negated: true}];
+    string = "exclude archived channels";
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     narrow = [{operator: "channels", operand: "web-public"}];
@@ -1755,6 +1949,17 @@ test("describe", ({mock_template, override}) => {
     assert.equal(Filter.search_description_as_html(narrow, false), string);
     page_params.is_spectator = false;
 
+    narrow = [{operator: "date", operand: ""}];
+    string = "messages sent around a specific date";
+    assert.equal(Filter.search_description_as_html(narrow, true), string);
+
+    narrow = [{operator: "date", operand: "2026-03-15"}];
+    string = "messages sent around March 15, 2026";
+    assert.equal(Filter.search_description_as_html(narrow, false), string);
+
+    const devel_decorated = `<span class="decorated-channel-name-wrapper inline-decorated-channel-name"><span class="channel-privacy-type-icon"><i class="zulip-icon zulip-icon-hashtag" aria-hidden="true"></i></span><span class="decorated-channel-name">devel</span></span>`;
+    const river_decorated = `<span class="decorated-channel-name-wrapper inline-decorated-channel-name"><span class="channel-privacy-type-icon"><i class="zulip-icon zulip-icon-hashtag" aria-hidden="true"></i></span><span class="decorated-channel-name">river</span></span>`;
+
     const devel_id = new_stream_id();
     make_sub("devel", devel_id);
 
@@ -1762,7 +1967,7 @@ test("describe", ({mock_template, override}) => {
         {operator: "channel", operand: devel_id.toString()},
         {operator: "is", operand: "starred"},
     ];
-    string = "messages in #devel, starred messages";
+    string = `messages in ${devel_decorated}, starred messages`;
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     const river_id = new_stream_id();
@@ -1771,14 +1976,14 @@ test("describe", ({mock_template, override}) => {
         {operator: "channel", operand: river_id.toString()},
         {operator: "is", operand: "unread"},
     ];
-    string = "messages in #river, unread messages";
+    string = `messages in ${river_decorated}, unread messages`;
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     narrow = [
         {operator: "channel", operand: devel_id.toString()},
         {operator: "topic", operand: "JS"},
     ];
-    string = "messages in #devel > JS";
+    string = `messages in ${devel_decorated} > JS`;
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     narrow = [
@@ -1837,7 +2042,7 @@ test("describe", ({mock_template, override}) => {
         {operator: "channel", operand: devel_id.toString()},
         {operator: "topic", operand: "JS", negated: true},
     ];
-    string = "messages in #devel, exclude topic JS";
+    string = `messages in ${devel_decorated}, exclude topic JS`;
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     narrow = [
@@ -1851,28 +2056,28 @@ test("describe", ({mock_template, override}) => {
         {operator: "channel", operand: devel_id.toString()},
         {operator: "is", operand: "starred", negated: true},
     ];
-    string = "messages in #devel, exclude starred messages";
+    string = `messages in ${devel_decorated}, exclude starred messages`;
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     narrow = [
         {operator: "channel", operand: devel_id.toString()},
         {operator: "has", operand: "image", negated: true},
     ];
-    string = "messages in #devel, exclude messages with images";
+    string = `messages in ${devel_decorated}, exclude messages with images`;
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     narrow = [
         {operator: "has", operand: "abc", negated: true},
         {operator: "channel", operand: devel_id.toString()},
     ];
-    string = "invalid abc operand for has operator, messages in #devel";
+    string = `invalid abc operand for has operator, messages in ${devel_decorated}`;
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     narrow = [
         {operator: "has", operand: "image", negated: true},
         {operator: "channel", operand: devel_id.toString()},
     ];
-    string = "exclude messages with images, messages in #devel";
+    string = `exclude messages with images, messages in ${devel_decorated}`;
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     narrow = [];
@@ -1883,7 +2088,7 @@ test("describe", ({mock_template, override}) => {
         {operator: "channel", operand: devel_id.toString()},
         {operator: "subject", operand: "JS", negated: true},
     ];
-    string = "messages in #devel, exclude topic JS";
+    string = `messages in ${devel_decorated}, exclude topic JS`;
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     // Empty string topic involved.
@@ -1892,8 +2097,7 @@ test("describe", ({mock_template, override}) => {
         {operator: "channel", operand: devel_id.toString()},
         {operator: "topic", operand: ""},
     ];
-    string =
-        'messages in #devel > <span class="empty-topic-display">translated: general chat</span>';
+    string = `messages in ${devel_decorated} > <span class="empty-topic-display">translated: general chat</span>`;
     assert.equal(Filter.search_description_as_html(narrow, false), string);
 
     narrow = [
@@ -1927,6 +2131,10 @@ test("describe", ({mock_template, override}) => {
 
     terms = [{operator: "dm-including", operand: ""}];
     string = "direct messages including";
+    assert.equal(Filter.search_description_as_html(terms, true), string);
+
+    terms = [{operator: "mentions", operand: ""}];
+    string = "messages mentioning";
     assert.equal(Filter.search_description_as_html(terms, true), string);
 });
 
@@ -2095,22 +2303,36 @@ test("term_type", () => {
     assert.ok(!filter._build_sorted_term_types_called);
 });
 
-test("first_valid_id_from", ({override}) => {
+test("first_valid_id_from", () => {
     const terms = [{operator: "is", operand: "alerted"}];
 
     const filter = new Filter(terms);
 
-    const messages = {
-        5: {id: 5, alerted: true},
-        10: {id: 10},
-        20: {id: 20, alerted: true},
-        30: {id: 30, type: stream_message},
-        40: {id: 40, alerted: false},
-    };
+    const messages = [
+        {
+            message: {
+                id: 5,
+                alerted: true,
+            },
+        },
+        {
+            message: {
+                id: 12,
+            },
+        },
+        {
+            message: {id: 20, alerted: true},
+        },
+        {
+            message: {id: 30, type: stream_message},
+        },
+        {
+            message: {id: 40, alerted: false},
+        },
+    ];
 
+    message_store.set_messages_for_tests(messages);
     const msg_ids = [10, 20, 30, 40];
-
-    override(message_store, "get", (msg_id) => messages[msg_id]);
 
     assert.equal(filter.first_valid_id_from([999]), undefined);
 
@@ -2132,6 +2354,11 @@ test("convert_suggestion_to_term", () => {
         ["in:home", true],
         ["in:nowhere", false],
         ["id:4", true],
+        ["-id:4", false],
+        ["near:1", true],
+        ["-near:1", false],
+        ["with:1", true],
+        ["-with:1", false],
         ["near:home", false],
         ["channel:" + denmark.stream_id, true],
         [`channel:${invalid_sub_id}`, false],
@@ -2143,13 +2370,64 @@ test("convert_suggestion_to_term", () => {
         ["sender:me", true],
         [`dm:${[alice.user_id, -1]}`, false],
         [`dm:${[alice.user_id, joe.user_id]}`, true],
+        [`mentions:${alice.user_id}`, true],
+        ["mentions:me", true],
+        ["mentions:-1", false],
+        ["mentions:invalid", false],
+        // A typed full name resolves to a user id, matching the help center
+        // docs. Quotes keep a multi-word name a single operand through the
+        // parser. A third tuple element pins down the resolved term, so a
+        // name maps to the right user id and not merely to some valid term.
+        [`sender:"${karl.full_name}"`, true, {operator: "sender", operand: karl.user_id}],
+        [`mentions:"${karl.full_name}"`, true, {operator: "mentions", operand: karl.user_id}],
+        // dm and dm-including resolve a comma-separated list of names to the
+        // corresponding user ids.
+        [`dm:"${karl.full_name}"`, true, {operator: "dm", operand: [karl.user_id]}],
+        [
+            `dm:"${karl.full_name}, ${shubham.full_name}"`,
+            true,
+            {operator: "dm", operand: [karl.user_id, shubham.user_id]},
+        ],
+        [
+            `dm-including:"${karl.full_name}, ${shubham.full_name}"`,
+            true,
+            {operator: "dm-including", operand: [karl.user_id, shubham.user_id]},
+        ],
+        // A name that matches no user is invalid.
+        ['dm:"No Such Person"', false],
+        // An ambiguous (duplicate) full name is invalid on its own...
+        [`dm:"${sam_one.full_name}"`, false],
+        // ...but the `Full Name|user_id` form disambiguates it, resolving to
+        // exactly the requested user and not the other duplicate.
+        [
+            `dm:"${sam_one.full_name}|${sam_one.user_id}"`,
+            true,
+            {operator: "dm", operand: [sam_one.user_id]},
+        ],
+        [
+            `dm:"${sam_two.full_name}|${sam_two.user_id}"`,
+            true,
+            {operator: "dm", operand: [sam_two.user_id]},
+        ],
+        [`-date:2022-01-01`, false],
+        [`date:2022-01-01`, true],
+        // Not a valid date string.
+        [`date:2022-01-01abcd`, false],
+        // In the past
+        [`date:1500-01-06`, false],
+        // Not in the `yyyy-MM-dd` format
+        [`date:2020-`, false],
     ];
-    for (const [search_term_string, expected_is_valid] of test_data) {
-        assert.equal(
-            Filter.convert_suggestion_to_term(Filter.parse(search_term_string)[0]) !== undefined,
-            expected_is_valid,
-        );
+    const today = new Date(2024, 0, 15, 2, 0, 0);
+    clock.setSystemTime(today.getTime());
+    for (const [search_term_string, expected_is_valid, expected_term] of test_data) {
+        const term = Filter.convert_suggestion_to_term(Filter.parse(search_term_string)[0]);
+        assert.equal(term !== undefined, expected_is_valid);
+        if (expected_term !== undefined) {
+            assert.deepEqual(term, {negated: false, ...expected_term});
+        }
     }
+    clock.reset();
 
     // Invalid operator.
     assert.equal(
@@ -2161,30 +2439,39 @@ test("convert_suggestion_to_term", () => {
     );
 });
 
-test("try_adjusting_for_moved_with_target", ({override}) => {
+test("try_adjusting_for_moved_with_target", () => {
     const scotland_id = new_stream_id();
     make_sub("Scotland", scotland_id);
     const verona_id = new_stream_id();
     make_sub("Verona", verona_id);
-    const messages = {
-        12: {
-            type: "stream",
-            stream_id: scotland_id,
-            display_recipient: "Scotland",
-            topic: "Test 1",
-            id: 12,
+    const messages = [
+        {
+            message: {
+                type: "stream",
+                stream_id: scotland_id,
+                display_recipient: "Scotland",
+                topic: "Test 1",
+                id: 12,
+            },
         },
-        17: {
-            type: "stream",
-            stream_id: verona_id,
-            display_recipient: "Verona",
-            topic: "Test 2",
-            id: 17,
+        {
+            message: {
+                type: "stream",
+                stream_id: verona_id,
+                display_recipient: "Verona",
+                topic: "Test 2",
+                id: 17,
+            },
         },
-        2: {type: "direct", id: 2, display_recipient: [{id: 3, email: "user3@zulip.com"}]},
-    };
-
-    override(message_store, "get", (msg_id) => messages[msg_id]);
+        {
+            message: {
+                type: "direct",
+                id: 2,
+                display_recipient: [{id: 3, email: "user3@zulip.com"}],
+            },
+        },
+    ];
+    message_store.set_messages_for_tests(messages);
 
     // When the narrow terms are correct, it returns the same terms
     let terms = [
@@ -2281,7 +2568,7 @@ test("try_adjusting_for_moved_with_target", ({override}) => {
     filter.try_adjusting_for_moved_with_target();
     // now messages are fetched from server, and a single
     // fetched message is used to adjust narrow terms.
-    filter.try_adjusting_for_moved_with_target(messages["17"]);
+    filter.try_adjusting_for_moved_with_target(message_store.get(17));
     assert.deepEqual(filter.narrow_requires_hash_change, false);
 
     // When message id attached to `with` operator is found locally,
@@ -2308,7 +2595,7 @@ test("try_adjusting_for_moved_with_target", ({override}) => {
     filter.try_adjusting_for_moved_with_target();
     // now messages are fetched from server, and a single
     // fetched message is used to adjust narrow terms.
-    filter.try_adjusting_for_moved_with_target(messages["12"]);
+    filter.try_adjusting_for_moved_with_target(message_store.get(12));
     assert.deepEqual(filter.narrow_requires_hash_change, true);
 });
 
@@ -2410,6 +2697,8 @@ test("navbar_helpers", ({override}) => {
     const is_resolved = [{operator: "is", operand: "resolved"}];
     const is_followed = [{operator: "is", operand: "followed"}];
     const channels_public = [{operator: "channels", operand: "public"}];
+    const channels_archived = [{operator: "channels", operand: "archived"}];
+    const not_channels_archived = [{operator: "channels", operand: "archived", negated: true}];
     const channels_web_public = [{operator: "channels", operand: "web-public"}];
     const channel_topic_terms = [
         {operator: "channel", operand: foo_stream_id.toString()},
@@ -2596,6 +2885,20 @@ test("navbar_helpers", ({override}) => {
             icon: undefined,
             title: "translated: Messages in all public channels",
             redirect_url_with_search: "/#narrow/channels/public",
+        },
+        {
+            terms: channels_archived,
+            is_common_narrow: true,
+            icon: undefined,
+            title: "translated: Messages in your archived channels",
+            redirect_url_with_search: "/#narrow/channels/archived",
+        },
+        {
+            terms: not_channels_archived,
+            is_common_narrow: true,
+            icon: undefined,
+            title: "translated: Messages not in archived channels",
+            redirect_url_with_search: "/#narrow/-channels/archived",
         },
         {
             terms: channels_web_public,
@@ -2914,6 +3217,7 @@ run_test("is_spectator_compatible", () => {
     assert.ok(!Filter.is_spectator_compatible([{operator: "is", operand: "starred"}]));
     assert.ok(!Filter.is_spectator_compatible([{operator: "is", operand: "dm"}]));
     assert.ok(Filter.is_spectator_compatible([{operator: "channels", operand: "public"}]));
+    assert.ok(Filter.is_spectator_compatible([{operator: "channels", operand: "archived"}]));
 
     // Malformed input not allowed
     assert.ok(!Filter.is_spectator_compatible([{operator: "has"}]));
@@ -2931,6 +3235,9 @@ run_test("is_spectator_compatible", () => {
     // "group-pm-with:" was replaced with "dm-including:"
     assert.ok(
         !Filter.is_spectator_compatible([{operator: "group-pm-with", operand: "hamlet@zulip.com"}]),
+    );
+    assert.ok(
+        !Filter.is_spectator_compatible([{operator: "mentions", operand: "hamlet@zulip.com"}]),
     );
 });
 
@@ -3132,11 +3439,11 @@ run_test("adjusted_terms_if_moved", ({override}) => {
 });
 
 run_test("can_newly_match_moved_messages", () => {
-    // Matches stream
-    let filter = new Filter([{operator: "channel", operand: "general"}]);
-    assert.deepEqual(filter.can_newly_match_moved_messages("general", "test"), true);
-    assert.deepEqual(filter.can_newly_match_moved_messages("General", "test"), true);
-    assert.deepEqual(filter.can_newly_match_moved_messages("random-stream", "test"), false);
+    // Matches channel by ID
+    const stream_id_str = general_sub.stream_id.toString();
+    let filter = new Filter([{operator: "channel", operand: stream_id_str}]);
+    assert.deepEqual(filter.can_newly_match_moved_messages(stream_id_str, "test"), true);
+    assert.deepEqual(filter.can_newly_match_moved_messages("99999", "test"), false);
 
     // Matches topic
     filter = new Filter([{operator: "topic", operand: "Test topic"}]);
@@ -3160,6 +3467,20 @@ run_test("can_newly_match_moved_messages", () => {
     assert.deepEqual(filter.can_newly_match_moved_messages("general", "test"), true);
 });
 
+run_test("terms_for_server_query", () => {
+    // Returns the raw terms unchanged (channel operand stays a
+    // string), only dropping the client-side-only `date` operator.
+    const filter = new Filter([
+        {operator: "channel", operand: "1"},
+        {operator: "date", operand: "2025-03-01"},
+        {operator: "topic", operand: "bar"},
+    ]);
+    assert.deepEqual(filter.terms_for_server_query(), [
+        {operator: "channel", operand: "1", negated: false},
+        {operator: "topic", operand: "bar", negated: false},
+    ]);
+});
+
 run_test("get_stringified_narrow_for_server_query", () => {
     const filter = new Filter([
         {operator: "channel", operand: "1"},
@@ -3168,6 +3489,18 @@ run_test("get_stringified_narrow_for_server_query", () => {
     const narrow = filter.get_stringified_narrow_for_server_query();
     assert.equal(
         narrow,
+        '[{"operator":"channel","operand":1,"negated":false},{"operator":"topic","operand":"bar","negated":false}]',
+    );
+
+    // Excludes date term if it is present in the filter.
+    const filter2 = new Filter([
+        {operator: "channel", operand: "1"},
+        {operator: "date", operand: "2025-03-01"},
+        {operator: "topic", operand: "bar"},
+    ]);
+    const narrow2 = filter2.get_stringified_narrow_for_server_query();
+    assert.equal(
+        narrow2,
         '[{"operator":"channel","operand":1,"negated":false},{"operator":"topic","operand":"bar","negated":false}]',
     );
 });

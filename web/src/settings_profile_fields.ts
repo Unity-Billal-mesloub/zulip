@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import SortableJS from "sortablejs";
 import type * as tippy from "tippy.js";
@@ -20,7 +20,7 @@ import * as ListWidget from "./list_widget.ts";
 import * as loading from "./loading.ts";
 import * as people from "./people.ts";
 import * as settings_components from "./settings_components.ts";
-import type {FieldData, SelectFieldData} from "./settings_components.ts";
+import type {SelectFieldData} from "./settings_components.ts";
 import * as settings_ui from "./settings_ui.ts";
 import type {CustomProfileField} from "./state_data.ts";
 import {current_user, realm} from "./state_data.ts";
@@ -47,6 +47,7 @@ function setup_external_accounts_dropdown_widget(): void {
     const custom_option = {
         name: $t_html({defaultMessage: "Custom"}),
         unique_id: "custom",
+        make_italic: true,
     };
 
     function get_options_for_external_accounts_dropdown_widget(): Option[] {
@@ -121,13 +122,6 @@ let order: number[] = [];
 export function field_type_id_to_string(type_id: number): string | undefined {
     for (const field_type of Object.values(realm.custom_profile_field_types)) {
         if (field_type.id === type_id) {
-            // Few necessary modifications in field-type-name for
-            // table-list view of custom fields UI in org settings
-            if (field_type.name === "Date picker") {
-                return "Date";
-            } else if (field_type.name === "Person picker") {
-                return "Person";
-            }
             return field_type.name;
         }
     }
@@ -137,7 +131,7 @@ export function field_type_id_to_string(type_id: number): string | undefined {
 // Checking custom profile field type is valid for showing display on user card checkbox field.
 function is_valid_to_display_in_summary(field_type: number): boolean {
     const field_types = realm.custom_profile_field_types;
-    if (field_type === field_types.LONG_TEXT.id || field_type === field_types.USER.id) {
+    if (field_type === field_types.USER.id) {
         return false;
     }
     return true;
@@ -234,6 +228,15 @@ function initialize_form_to_defaults(): void {
     external_accounts_dropdown_widget.render();
 }
 
+function should_check_user_matching_for_external_account(
+    account_type: string | number | undefined,
+): boolean {
+    const unchecked_account_types = new Set(["atlassian", "mastodon"]);
+    const should_uncheck_checkbox =
+        typeof account_type === "string" && unchecked_account_types.has(account_type);
+    return !should_uncheck_checkbox;
+}
+
 function external_account_item_click_callback(
     event: JQuery.ClickEvent,
     dropdown: tippy.Instance,
@@ -260,6 +263,10 @@ function external_account_item_click_callback(
     assert(external_account !== undefined);
     $("#profile_field_name").val(external_account.name).prop("disabled", true);
     $("#profile_field_hint").val(external_account.hint).prop("disabled", true);
+    $("#profile_field_use_for_user_matching").prop(
+        "checked",
+        should_check_user_matching_for_external_account(external_account.text.toLowerCase()),
+    );
     widget.render();
 }
 
@@ -296,7 +303,7 @@ function update_form_for_field_type_selection(): void {
             $("#profile_field_hint").val(default_hint);
             break;
         }
-        case field_types.SELECT.id: {
+        case field_types.DROPDOWN.id: {
             $("#profile_field_choices_row").show();
         }
     }
@@ -318,7 +325,11 @@ function update_form_for_field_type_selection(): void {
 
     if (is_valid_to_use_for_user_matching(profile_field_type)) {
         $("#profile_field_use_for_user_matching").closest(".input-group").show();
-        const check_use_for_user_mentions = profile_field_type === field_types.EXTERNAL_ACCOUNT.id;
+        const check_use_for_user_mentions =
+            profile_field_type === field_types.EXTERNAL_ACCOUNT.id &&
+            should_check_user_matching_for_external_account(
+                external_accounts_dropdown_widget.value(),
+            );
         $("#profile_field_use_for_user_matching").prop("checked", check_use_for_user_mentions);
     } else {
         $("#profile_field_use_for_user_matching").closest(".input-group").hide();
@@ -337,11 +348,10 @@ function open_custom_profile_field_creation_form_modal(): void {
     });
 
     function create_profile_field(): void {
-        let field_data: FieldData | undefined = {};
         const field_type = $<HTMLSelectOneElement>(
             "select:not([multiple])#profile_field_type",
         ).val()!;
-        field_data = settings_components.read_field_data_from_form(
+        const field_data = settings_components.read_field_data_from_form(
             Number.parseInt(field_type, 10),
             $(".new-profile-field-form"),
             undefined,
@@ -368,7 +378,7 @@ function open_custom_profile_field_creation_form_modal(): void {
     }
 
     function initialize_custom_profile_field_form(): void {
-        set_up_select_field();
+        set_up_custom_profile_field_choices();
         setup_external_accounts_dropdown_widget();
 
         $("#profile_field_type").on("change", () => {
@@ -438,18 +448,18 @@ function delete_choice_row_for_edit(
 
 function show_modal_for_deleting_options(
     field: CustomProfileField,
-    deleted_values: Record<string, string>,
+    deleted_values: Map<string, string>,
     update_profile_field: () => void,
 ): void {
     const active_user_ids = people.get_active_user_ids();
     let users_count_with_deleted_option_selected = 0;
     for (const user_id of active_user_ids) {
         const field_value = people.get_custom_profile_data(user_id, field.id);
-        if (field_value !== undefined && deleted_values[field_value.value]) {
+        if (field_value !== undefined && deleted_values.has(field_value.value)) {
             users_count_with_deleted_option_selected += 1;
         }
     }
-    const deleted_options_count = Object.keys(deleted_values).length;
+    const deleted_options_count = deleted_values.size;
     const modal_content_html = render_confirm_delete_profile_field_option({
         count: users_count_with_deleted_option_selected,
         field_name: field.name,
@@ -551,7 +561,7 @@ function alphabetize_profile_field_choices($sortable_element: JQuery): void {
     sortable_instance.sort(choices_array.map((v) => v[1]));
 }
 
-function set_up_select_field_edit_form(
+function set_up_custom_profile_field_choices_edit_form(
     $profile_field_form: JQuery,
     field: CustomProfileField,
 ): void {
@@ -560,7 +570,7 @@ function set_up_select_field_edit_form(
     $choice_list.off();
     $choice_list.empty();
     const choices_data = parse_field_choices_from_field_data(
-        settings_components.select_field_data_schema.parse(JSON.parse(field.field_data)),
+        settings_components.custom_profile_field_choices_schema.parse(JSON.parse(field.field_data)),
     );
 
     for (const choice of choices_data) {
@@ -601,9 +611,10 @@ function open_custom_profile_field_edit_form_modal(this: HTMLElement): void {
         field_data = JSON.parse(field.field_data);
     }
     let choices: FieldChoice[] = [];
-    if (field.type === field_types.SELECT.id) {
-        const select_field_data = settings_components.select_field_data_schema.parse(field_data);
-        choices = parse_field_choices_from_field_data(select_field_data);
+    if (field.type === field_types.DROPDOWN.id) {
+        const custom_profile_field_choices =
+            settings_components.custom_profile_field_choices_schema.parse(field_data);
+        choices = parse_field_choices_from_field_data(custom_profile_field_choices);
     }
 
     const modal_content_html = render_edit_custom_profile_field_form({
@@ -616,7 +627,7 @@ function open_custom_profile_field_edit_form_modal(this: HTMLElement): void {
             required: field.required,
             editable_by_user: field.editable_by_user,
             use_for_user_matching: field.use_for_user_matching,
-            is_select_field: field.type === field_types.SELECT.id,
+            is_dropdown_field: field.type === field_types.DROPDOWN.id,
             is_external_account_field: field.type === field_types.EXTERNAL_ACCOUNT.id,
             valid_to_display_in_summary: is_valid_to_display_in_summary(field.type),
             valid_to_use_for_user_matching: is_valid_to_use_for_user_matching(field.type),
@@ -638,8 +649,8 @@ function open_custom_profile_field_edit_form_modal(this: HTMLElement): void {
                 .addClass("display_in_profile_summary_tooltip disabled_label");
         }
 
-        if (field.type === field_types.SELECT.id) {
-            set_up_select_field_edit_form($profile_field_form, field);
+        if (field.type === field_types.DROPDOWN.id) {
+            set_up_custom_profile_field_choices_edit_form($profile_field_form, field);
         }
 
         if (field.type === field_types.EXTERNAL_ACCOUNT.id) {
@@ -718,28 +729,28 @@ function open_custom_profile_field_edit_form_modal(this: HTMLElement): void {
             dialog_widget.submit_api_request(channel.patch, url, data, opts);
         }
 
-        if (field.type === field_types.SELECT.id && data["field_data"] !== undefined) {
+        if (field.type === field_types.DROPDOWN.id && data["field_data"] !== undefined) {
             const new_values = new Set(
                 Object.keys(
-                    settings_components.select_field_data_schema.parse(
+                    settings_components.custom_profile_field_choices_schema.parse(
                         JSON.parse(data["field_data"].toString()),
                     ),
                 ),
             );
-            const deleted_values: Record<string, string> = {};
-            const select_field_data =
-                settings_components.select_field_data_schema.parse(field_data);
-            for (const [value, option] of Object.entries(select_field_data)) {
+            const deleted_values = new Map<string, string>();
+            const custom_profile_field_choices =
+                settings_components.custom_profile_field_choices_schema.parse(field_data);
+            for (const [value, option] of Object.entries(custom_profile_field_choices)) {
                 if (!new_values.has(value)) {
-                    deleted_values[value] = option.text;
+                    deleted_values.set(value, option.text);
                 }
             }
 
-            if (Object.keys(deleted_values).length > 0) {
-                const edit_select_field_modal_callback = (): void => {
+            if (deleted_values.size > 0) {
+                const edit_custom_profile_field_modal_callback = (): void => {
                     show_modal_for_deleting_options(field, deleted_values, update_profile_field);
                 };
-                dialog_widget.close(edit_select_field_modal_callback);
+                dialog_widget.close(edit_custom_profile_field_modal_callback);
                 return;
             }
         }
@@ -837,8 +848,6 @@ export function populate_profile_fields(profile_fields_data: CustomProfileField[
 }
 
 export function do_populate_profile_fields(profile_fields_data: CustomProfileField[]): void {
-    const field_types = realm.custom_profile_field_types;
-
     // We should only call this internally or from tests.
     const $profile_fields_table = $("#admin_profile_fields_table").expectOne();
 
@@ -862,14 +871,6 @@ export function do_populate_profile_fields(profile_fields_data: CustomProfileFie
             return profile_field;
         },
         modifier_html(profile_field) {
-            let choices: FieldChoice[] = [];
-            if (profile_field.field_data && profile_field.type === field_types.SELECT.id) {
-                const field_data = settings_components.select_field_data_schema.parse(
-                    JSON.parse(profile_field.field_data),
-                );
-                choices = parse_field_choices_from_field_data(field_data);
-            }
-
             const display_in_profile_summary = profile_field.display_in_profile_summary === true;
             const required = profile_field.required;
 
@@ -879,10 +880,6 @@ export function do_populate_profile_fields(profile_fields_data: CustomProfileFie
                     name: profile_field.name,
                     hint: profile_field.hint,
                     type: field_type_id_to_string(profile_field.type),
-                    choices,
-                    is_select_field: profile_field.type === field_types.SELECT.id,
-                    is_external_account_field:
-                        profile_field.type === field_types.EXTERNAL_ACCOUNT.id,
                     display_in_profile_summary,
                     valid_to_display_in_summary: is_valid_to_display_in_summary(profile_field.type),
                     required,
@@ -911,7 +908,7 @@ export function do_populate_profile_fields(profile_fields_data: CustomProfileFie
     loading.destroy_indicator($("#admin_page_profile_fields_loading_indicator"));
 }
 
-function set_up_select_field(): void {
+function set_up_custom_profile_field_choices(): void {
     const $profile_field_choices = $("#profile_field_choices");
 
     create_choice_row($profile_field_choices);

@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
 
 import * as drafts from "./drafts.ts";
@@ -76,12 +76,10 @@ export let update_dom_with_unread_counts = function (
     const $mentioned_li = $(".top_left_mentions");
     const $home_view_li = $(".selected-home-view");
     const $condensed_view_li = $(".top_left_condensed_unread_marker");
-    const $back_to_streams = $("#topics_header");
 
     ui_util.update_unread_count_in_dom($mentioned_li, counts.mentioned_message_count);
     ui_util.update_unread_count_in_dom($home_view_li, counts.home_unread_messages);
     ui_util.update_unread_count_in_dom($condensed_view_li, counts.home_unread_messages);
-    ui_util.update_unread_count_in_dom($back_to_streams, counts.stream_unread_messages);
 
     if (!skip_animations) {
         animate_unread_changes($mentioned_li, counts.mentioned_message_count, last_mention_count);
@@ -128,7 +126,8 @@ export function handle_narrow_activated(filter: Filter): void {
         if (filter_name === "starred") {
             select_top_left_corner_item(".top_left_starred_messages");
             return;
-        } else if (filter_name === "mentioned") {
+        }
+        if (filter_name === "mentioned") {
             select_top_left_corner_item(".top_left_mentions");
             return;
         }
@@ -328,8 +327,8 @@ export function get_built_in_popover_condensed_views(): navigation_views.BuiltIn
             view.unread_count = drafts.draft_model.getDraftCount();
         }
         // Remove views that are already visible.
-        return !visible_condensed_views.some(
-            (visible_view) => visible_view.fragment === view.fragment,
+        return visible_condensed_views.every(
+            (visible_view) => visible_view.fragment !== view.fragment,
         );
     });
 }

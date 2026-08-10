@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Union, cast
 from unittest import TestResult, mock, skipUnless
 from urllib.parse import parse_qs, quote, urlencode
@@ -115,6 +116,7 @@ from zerver.models import (
 )
 from zerver.models.clients import get_client
 from zerver.models.realms import clear_supported_auth_backends_cache, get_realm
+from zerver.models.recipients import get_or_create_direct_message_group
 from zerver.models.streams import StreamTopicsPolicyEnum, get_realm_stream, get_stream
 from zerver.models.users import get_system_bot, get_user, get_user_by_delivery_email
 from zerver.openapi.openapi import validate_test_request, validate_test_response
@@ -665,6 +667,7 @@ Output:
         webhook_bot="webhook-bot@zulip.com",
         outgoing_webhook_bot="outgoing-webhook@zulip.com",
         default_bot="default-bot@zulip.com",
+        imported_user="imported-user@zulip.com",
     )
 
     mit_user_map = dict(
@@ -1001,6 +1004,36 @@ Output:
             payload,
         )
 
+    def create_demo_organization_owner(self) -> UserProfile:
+        assert settings.DEMO_ORG_DEADLINE_DAYS is not None
+
+        # Create a demo organization
+        result = self.submit_demo_creation_form()
+        realm = Realm.objects.filter(
+            demo_organization_scheduled_deletion_date__isnull=False
+        ).latest("date_created")
+        self.assertEqual(result.status_code, 302)
+        self.assertTrue(
+            result["Location"].startswith(
+                f"http://{realm.string_id}.testserver/accounts/login/subdomain"
+            )
+        )
+        expected_deletion_date = realm.date_created + timedelta(
+            days=settings.DEMO_ORG_DEADLINE_DAYS
+        )
+        self.assertEqual(realm.demo_organization_scheduled_deletion_date, expected_deletion_date)
+        result = self.client_get(result["Location"], subdomain=realm.string_id)
+        self.assertEqual(result.status_code, 302)
+        self.assertEqual(result["Location"], f"http://{realm.string_id}.testserver")
+
+        # Get demo organization owner account
+        user_profile = realm.get_first_human_user()
+        assert user_profile is not None
+        self.assert_logged_in_user_id(user_profile.id)
+        self.assertEqual(user_profile.delivery_email, "")
+
+        return user_profile
+
     def get_confirmation_url_from_outbox(
         self,
         email_address: str,
@@ -1136,6 +1169,22 @@ Output:
             headers=None,
             query_params=None,
             intentionally_undocumented=intentionally_undocumented,
+            **extra,
+        )
+
+    def api_put(
+        self, user: UserProfile, url: str, info: Mapping[str, Any] = {}, **extra: str
+    ) -> "TestHttpResponse":
+        assert not url.startswith("/json/"), "Invalid URL for API authentication"
+        extra["HTTP_AUTHORIZATION"] = self.encode_user(user)
+        return self.client_put(
+            url,
+            info,
+            skip_user_agent=False,
+            follow=False,
+            secure=False,
+            headers=None,
+            query_params=None,
             **extra,
         )
 
@@ -1279,14 +1328,18 @@ Output:
         anchor: int | str = 1,
         num_before: int = 100,
         num_after: int = 100,
-        use_first_unread_anchor: bool = False,
+        use_first_unread_anchor: bool | None = None,
         include_anchor: bool = True,
     ) -> dict[str, list[dict[str, Any]]]:
         post_params = {
             "anchor": anchor,
             "num_before": num_before,
             "num_after": num_after,
-            "use_first_unread_anchor": orjson.dumps(use_first_unread_anchor).decode(),
+            **(
+                {}
+                if use_first_unread_anchor is None
+                else {"use_first_unread_anchor": orjson.dumps(use_first_unread_anchor).decode()}
+            ),
             "include_anchor": orjson.dumps(include_anchor).decode(),
         }
         result = self.client_get("/json/messages", dict(post_params))
@@ -1298,7 +1351,7 @@ Output:
         anchor: str | int = 1,
         num_before: int = 100,
         num_after: int = 100,
-        use_first_unread_anchor: bool = False,
+        use_first_unread_anchor: bool | None = None,
     ) -> list[dict[str, Any]]:
         data = self.get_messages_response(anchor, num_before, num_after, use_first_unread_anchor)
         return data["messages"]
@@ -2385,6 +2438,13 @@ class ZulipTestCase(ZulipTestCaseMixin, TestCase):
         """
         do_change_user_role(user, role, acting_user=None, notify=False)
 
+    def get_dm_group_recipient(self, sender: UserProfile, *other_users: UserProfile) -> Recipient:
+        direct_group_message = get_or_create_direct_message_group(
+            id_list=[sender.id] + [user.id for user in other_users],
+        )
+        assert direct_group_message.recipient is not None
+        return direct_group_message.recipient
+
     def set_user_setting(self, user: UserProfile, setting_name: str, value: bool) -> None:
         with self.captureOnCommitCallbacks(execute=True):
             do_change_user_setting(user, setting_name, value, acting_user=None)
@@ -2826,7 +2886,10 @@ class PushNotificationTestCase(BouncerTestCase):
         self.user_profile = self.example_user("hamlet")
         self.sending_client = get_client("test")
         self.sender = self.example_user("hamlet")
-        self.personal_recipient_user = self.example_user("othello")
+        self.dm_recipient_user = self.example_user("othello")
+        self.dm_group = get_or_create_direct_message_group(
+            [self.sender.id, self.dm_recipient_user.id]
+        )
 
     def get_message(self, type: int, type_id: int, realm_id: int) -> Message:
         recipient, _ = Recipient.objects.get_or_create(

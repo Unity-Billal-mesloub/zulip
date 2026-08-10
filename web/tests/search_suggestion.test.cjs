@@ -98,6 +98,33 @@ function test(label, f) {
     });
 }
 
+test("person_multi_word_completion", () => {
+    // The help center documents searching person operators by full name,
+    // e.g. `sender:Elena García` and the multi-user `dm:Bo Lin, Elena
+    // García`. An unquoted multi-word name parses with a trailing `search:`
+    // term, which get_suggestions merges back into the person operand before
+    // resolving each name to a user id.
+    assert.deepEqual(get_suggestions("sender:Ted Smith"), [`sender:${ted.user_id}`]);
+    assert.deepEqual(get_suggestions("mentions:Ted Smith"), [`mentions:${ted.user_id}`]);
+    assert.deepEqual(get_suggestions("dm:Ted Smith"), [`dm:${ted.user_id}`]);
+    assert.deepEqual(get_suggestions("dm-including:Ted Smith"), [`dm-including:${ted.user_id}`]);
+
+    // dm and dm-including resolve a comma-separated list of names, with or
+    // without a space after the comma.
+    assert.deepEqual(get_suggestions("dm:Ted Smith, Alice Ignore"), [
+        `dm:${ted.user_id},${alice.user_id}`,
+    ]);
+    assert.deepEqual(get_suggestions("dm:Ted Smith,Alice Ignore"), [
+        `dm:${ted.user_id},${alice.user_id}`,
+    ]);
+    assert.deepEqual(get_suggestions("dm-including:Ted Smith, Alice Ignore"), [
+        `dm-including:${ted.user_id},${alice.user_id}`,
+    ]);
+    assert.deepEqual(get_suggestions("dm-including:Ted Smith,Alice Ignore"), [
+        `dm-including:${ted.user_id},${alice.user_id}`,
+    ]);
+});
+
 test("basic_get_suggestions", ({override}) => {
     const query = "fred";
 
@@ -125,6 +152,7 @@ test("basic_get_suggestions_for_spectator", () => {
     assert.deepEqual(suggestions, [
         "channels:",
         "channel:",
+        "date:",
         "is:resolved",
         "-is:resolved",
         "has:link",
@@ -136,7 +164,7 @@ test("basic_get_suggestions_for_spectator", () => {
     stream_data.delete_sub(sub.stream_id);
     query = "channels:";
     suggestions = get_suggestions(query);
-    assert.deepEqual(suggestions, []);
+    assert.deepEqual(suggestions, ["channels:archived"]);
     page_params.is_spectator = false;
 });
 
@@ -165,13 +193,16 @@ test("get_is_suggestions_for_spectator", () => {
 test("dm_suggestions", ({override}) => {
     let query = "is:dm";
     let suggestions = get_suggestions(query);
+    // Empty query: compare_users_for_dms sorts alphabetically
+    // by full_name (no direct message history, and no name-length
+    // tiebreaker without a query).
     let expected = [
         "is:dm",
-        `dm:${alice.user_id}`,
-        `dm:${bob.user_id}`,
-        `dm:${jeff.user_id}`,
-        `dm:${me.user_id}`,
-        `dm:${ted.user_id}`,
+        `dm:${alice.user_id}`, // Alice Ignore
+        `dm:${bob.user_id}`, // Bob Roberts
+        `dm:${jeff.user_id}`, // Jeff Zoolipson
+        `dm:${me.user_id}`, // Me Myself
+        `dm:${ted.user_id}`, // Ted Smith
     ];
     assert.deepEqual(suggestions, expected);
 
@@ -183,6 +214,7 @@ test("dm_suggestions", ({override}) => {
         `is:dm dm:${alice.user_id}`,
         `is:dm sender:${alice.user_id}`,
         `is:dm dm-including:${alice.user_id}`,
+        `is:dm mentions:${alice.user_id}`,
     ];
     assert.deepEqual(suggestions, expected);
 
@@ -196,14 +228,14 @@ test("dm_suggestions", ({override}) => {
 
     query = "is:private";
     suggestions = get_suggestions(query);
-    // Same search suggestions as for "is:dm"
+    // Same search suggestions and order as for "is:dm".
     expected = [
         "is:dm",
-        `dm:${alice.user_id}`,
-        `dm:${bob.user_id}`,
-        `dm:${jeff.user_id}`,
-        `dm:${me.user_id}`,
-        `dm:${ted.user_id}`,
+        `dm:${alice.user_id}`, // Alice Ignore
+        `dm:${bob.user_id}`, // Bob Roberts
+        `dm:${jeff.user_id}`, // Jeff Zoolipson
+        `dm:${me.user_id}`, // Me Myself
+        `dm:${ted.user_id}`, // Ted Smith
     ];
     assert.deepEqual(suggestions, expected);
 
@@ -273,6 +305,7 @@ test("dm_suggestions", ({override}) => {
         `is:starred has:link is:dm dm:${alice.user_id}`,
         `is:starred has:link is:dm sender:${alice.user_id}`,
         `is:starred has:link is:dm dm-including:${alice.user_id}`,
+        `is:starred has:link is:dm mentions:${alice.user_id}`,
     ];
     assert.deepEqual(suggestions, expected);
 
@@ -295,6 +328,39 @@ test("dm_suggestions", ({override}) => {
     assert.deepEqual(suggestions, expected);
 });
 
+test("dm_suggestions_for_exact_full_name", () => {
+    // When the typed text exactly matches a unique full name, it is
+    // resolved to that user's id internally. We must still suggest other
+    // users whose names match the typed text as a prefix, rather than
+    // collapsing to just the exactly-named user.
+    const john = make_user({
+        email: "john@zulip.com",
+        user_id: 200,
+        full_name: "John",
+    });
+    const john_doe = make_user({
+        email: "john-doe@zulip.com",
+        user_id: 201,
+        full_name: "John Doe",
+    });
+    people.add_active_user(john, "server_events");
+    people.add_active_user(john_doe, "server_events");
+
+    // A partial query matches both users by name prefix.
+    let suggestions = get_suggestions("dm:joh");
+    assert.deepEqual(suggestions, [`dm:${john.user_id}`, `dm:${john_doe.user_id}`]);
+
+    // Completing the unique full name "John" must still suggest "John Doe",
+    // not collapse to just "John".
+    suggestions = get_suggestions("dm:John");
+    assert.deepEqual(suggestions, [`dm:${john.user_id}`, `dm:${john_doe.user_id}`]);
+
+    // A multi-word continuation after the resolved name still matches by
+    // name, narrowing to "John Doe".
+    suggestions = get_suggestions("dm:John Do");
+    assert.deepEqual(suggestions, [`dm:${john_doe.user_id}`]);
+});
+
 test("group_suggestions", () => {
     // If there's an existing completed user pill right before
     // the input string, we suggest a user group as one of the
@@ -307,6 +373,7 @@ test("group_suggestions", () => {
         `dm:${bob.user_id},${alice.user_id}`,
         `dm:${bob.user_id} sender:${alice.user_id}`,
         `dm:${bob.user_id} dm-including:${alice.user_id}`,
+        `dm:${bob.user_id} mentions:${alice.user_id}`,
     ];
     assert.deepEqual(suggestions, expected);
 
@@ -318,6 +385,7 @@ test("group_suggestions", () => {
         `dm:${ted.user_id} my`,
         `dm:${ted.user_id} sender:${me.user_id}`,
         `dm:${ted.user_id} dm-including:${me.user_id}`,
+        `dm:${ted.user_id} mentions:${me.user_id}`,
     ];
     assert.deepEqual(suggestions, expected);
 
@@ -339,6 +407,7 @@ test("group_suggestions", () => {
         `dm:${bob.user_id},${alice.user_id}`,
         `dm:${bob.user_id} sender:${alice.user_id}`,
         `dm:${bob.user_id} dm-including:${alice.user_id}`,
+        `dm:${bob.user_id} mentions:${alice.user_id}`,
     ];
     assert.deepEqual(suggestions, expected);
 
@@ -351,6 +420,7 @@ test("group_suggestions", () => {
         `is:starred has:link dm:${bob.user_id},${ted.user_id}`,
         `is:starred has:link dm:${bob.user_id} sender:${ted.user_id}`,
         `is:starred has:link dm:${bob.user_id} dm-including:${ted.user_id}`,
+        `is:starred has:link dm:${bob.user_id} mentions:${ted.user_id}`,
     ];
     assert.deepEqual(suggestions, expected);
 
@@ -401,6 +471,7 @@ test("empty_query_suggestions", () => {
     const expected = [
         "channels:",
         "channel:",
+        "date:",
         "is:dm",
         "is:starred",
         "is:mentioned",
@@ -504,6 +575,7 @@ test("check_is_suggestions", ({override}) => {
         `dm:${alice.user_id}`,
         `sender:${alice.user_id}`,
         `dm-including:${alice.user_id}`,
+        `mentions:${alice.user_id}`,
         "has:image",
     ];
     assert.deepEqual(suggestions, expected);
@@ -636,7 +708,7 @@ test("sent_by_me_suggestions", ({override}) => {
     assert.deepEqual(suggestions, expected);
 });
 
-test("topic_suggestions", ({override}) => {
+test("topic_suggestions", ({override, override_rewire}) => {
     let suggestions;
     let expected;
 
@@ -668,7 +740,13 @@ test("topic_suggestions", ({override}) => {
     );
 
     suggestions = get_suggestions("te");
-    expected = ["te", `dm:${ted.user_id}`, `sender:${ted.user_id}`, `dm-including:${ted.user_id}`];
+    expected = [
+        "te",
+        `dm:${ted.user_id}`,
+        `sender:${ted.user_id}`,
+        `dm-including:${ted.user_id}`,
+        `mentions:${ted.user_id}`,
+    ];
     assert.deepEqual(suggestions, expected);
 
     stream_topic_history.add_message({
@@ -689,6 +767,7 @@ test("topic_suggestions", ({override}) => {
         `dm:${ted.user_id}`,
         `sender:${ted.user_id}`,
         `dm-including:${ted.user_id}`,
+        `mentions:${ted.user_id}`,
         `channel:${office_id} topic:team`,
         `channel:${office_id} topic:✔+team+work`,
         `channel:${office_id} topic:test`,
@@ -762,6 +841,7 @@ test("topic_suggestions", ({override}) => {
         });
     }
 
+    override_rewire(stream_data, "set_max_channel_width_css_variable", noop);
     stream_data.subscribe_myself(stream_data.get_sub("devel"));
     stream_data.subscribe_myself(stream_data.get_sub("office"));
     suggestions = get_suggestions("topic:");
@@ -817,6 +897,28 @@ test("topic_suggestions", ({override}) => {
         "channel:6 topic:talks",
         "channel:6 topic:tower",
     ];
+    assert.deepEqual(suggestions, expected);
+
+    // This is the case where the last term's
+    // operand is not a stringified channel id.
+    // We avoid suggesting topics in this case.
+    suggestions = get_suggestions("channel:foobar");
+    expected = [];
+    assert.deepEqual(suggestions, expected);
+
+    // We shouldn't see topic suggestions for the case
+    // where the last term is a channel with an operand
+    // that couldn't be converted to a string id by the
+    // Filter.parse step.
+    suggestions = get_suggestions("hello channel:foobar");
+    expected = [];
+    assert.deepEqual(suggestions, expected);
+
+    // We shouldn't see topic suggestions for an
+    // empty operand with channel as the operator for
+    // the last term.
+    suggestions = get_suggestions("hello channel:");
+    expected = ["hello channel:5", "hello channel:6"];
     assert.deepEqual(suggestions, expected);
 });
 
@@ -964,14 +1066,18 @@ test("people_suggestions", ({override}) => {
 
     let suggestions = get_suggestions(query);
 
+    // Both match "te"; compare_users_for_dms called without query
+    // so no name-length tiebreaker — alphabetical by full_name.
     let expected = [
         "te",
-        `dm:${bob.user_id}`, // bob térry
-        `dm:${ted.user_id}`,
+        `dm:${bob.user_id}`, // Bob Térry
+        `dm:${ted.user_id}`, // Ted Smith
         `sender:${bob.user_id}`,
         `sender:${ted.user_id}`,
         `dm-including:${bob.user_id}`,
         `dm-including:${ted.user_id}`,
+        `mentions:${bob.user_id}`,
+        `mentions:${ted.user_id}`,
     ];
 
     assert.deepEqual(suggestions, expected);
@@ -984,23 +1090,33 @@ test("people_suggestions", ({override}) => {
     people.add_active_user(accessible_user, "server_events");
     suggestions = get_suggestions(query);
 
+    // Same order with Test unknown user added (alphabetical).
     expected = [
         "te",
-        `dm:${bob.user_id}`,
-        `dm:${ted.user_id}`,
-        `dm:${inaccessible_user.user_id}`,
+        `dm:${bob.user_id}`, // Bob Térry
+        `dm:${ted.user_id}`, // Ted Smith
+        `dm:${inaccessible_user.user_id}`, // Test unknown user
         `sender:${bob.user_id}`,
         `sender:${ted.user_id}`,
         `sender:${inaccessible_user.user_id}`,
         `dm-including:${bob.user_id}`,
         `dm-including:${ted.user_id}`,
         `dm-including:${inaccessible_user.user_id}`,
+        `mentions:${bob.user_id}`,
+        `mentions:${ted.user_id}`,
+        `mentions:${inaccessible_user.user_id}`,
     ];
     assert.deepEqual(suggestions, expected);
 
     suggestions = get_suggestions("Ted "); // note space
 
-    expected = ["Ted", `dm:${ted.user_id}`, `sender:${ted.user_id}`, `dm-including:${ted.user_id}`];
+    expected = [
+        "Ted",
+        `dm:${ted.user_id}`,
+        `sender:${ted.user_id}`,
+        `dm-including:${ted.user_id}`,
+        `mentions:${ted.user_id}`,
+    ];
 
     assert.deepEqual(suggestions, expected);
 
@@ -1009,13 +1125,17 @@ test("people_suggestions", ({override}) => {
     suggestions = get_suggestions(query);
     assert.deepEqual(suggestions, expected);
 
+    // The search bar typeahead always converts person operators to
+    // user_id-based pills, so raw email operands are not reachable.
+    // Both valid and invalid emails get merged with the trailing
+    // search term, producing no person match.
     query = "sender:ted@zulip.com new";
-    expected = ["new"];
+    expected = [];
     suggestions = get_suggestions(query);
     assert.deepEqual(suggestions, expected);
 
     query = "sender:ted@tulip.com new";
-    expected = []; // Invalid email
+    expected = [];
     suggestions = get_suggestions(query);
     assert.deepEqual(suggestions, expected);
 });

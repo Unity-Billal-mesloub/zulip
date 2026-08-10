@@ -162,6 +162,12 @@ class RealmTopicsPolicyEnum(Enum):
     disable_empty_topic = 3
 
 
+class RealmMediaPreviewSizeEnum(IntEnum):
+    SMALL = 100
+    MEDIUM = 150
+    LARGE = 200
+
+
 class Realm(models.Model):
     MAX_REALM_NAME_LENGTH = 40
     MAX_REALM_DESCRIPTION_LENGTH = 1000
@@ -225,6 +231,10 @@ class Realm(models.Model):
     # Whether the organization has enabled inline image and URL previews.
     inline_image_preview = models.BooleanField(default=True)
     inline_url_embed_preview = models.BooleanField(default=False)
+
+    media_preview_size = models.PositiveSmallIntegerField(
+        default=RealmMediaPreviewSizeEnum.SMALL.value
+    )
 
     # Whether digest emails are enabled for the organization.
     digest_emails_enabled = models.BooleanField(default=False)
@@ -666,6 +676,10 @@ class Realm(models.Model):
             "name": "Nextcloud Talk",
             "id": 7,
         },
+        "webex": {
+            "name": "Webex",
+            "id": 8,
+        },
     }
 
     video_chat_provider = models.PositiveSmallIntegerField(
@@ -678,12 +692,13 @@ class Realm(models.Model):
     # Please access this via get_gif_rating_policy_options.
     GIF_RATING_POLICY_OPTIONS = {
         "disabled": {
-            "name": gettext_lazy("GIF integration disabled"),
+            "name": gettext_lazy("Disabled"),
             "id": 0,
         },
         # Source:
         # 1. https://developers.giphy.com/docs/optional-settings/#rating
         # 2. https://developers.google.com/tenor/guides/content-filtering#ContentFilter-options
+        # 3. https://docs.klipy.com/migrate-from-tenor/content-filtering
         "g": {
             "name": gettext_lazy("Allow GIFs rated G (General audience)"),
             "id": 1,
@@ -719,6 +734,11 @@ class Realm(models.Model):
     # Whether to notify client when a DM has a guest recipient.
     enable_guest_user_dm_warning = models.BooleanField(default=True)
 
+    # UserGroup whose users will be considered as workplace users for billing.
+    workplace_users_group = models.ForeignKey(
+        "UserGroup", on_delete=models.RESTRICT, related_name="+"
+    )
+
     # Avatar source for new users
     AVATAR_FROM_GRAVATAR = "G"
     AVATAR_FROM_JDENTICON = "J"
@@ -727,7 +747,7 @@ class Realm(models.Model):
         (AVATAR_FROM_JDENTICON, "Generated using Jdenticon"),
     )
     default_avatar_source = models.CharField(
-        default=AVATAR_FROM_GRAVATAR, choices=AVATAR_SOURCES, max_length=1
+        default=AVATAR_FROM_JDENTICON, choices=AVATAR_SOURCES, max_length=1
     )
 
     # Define the types of the various automatically managed properties
@@ -748,6 +768,7 @@ class Realm(models.Model):
         enable_read_receipts=bool,
         enable_spectator_access=bool,
         gif_rating_policy=int,
+        media_preview_size=int,
         inline_image_preview=bool,
         inline_url_embed_preview=bool,
         invite_required=bool,
@@ -901,6 +922,11 @@ class Realm(models.Model):
             default_group_name=SystemGroups.EVERYONE,
         ),
         direct_message_permission_group=GroupPermissionSetting(
+            allow_nobody_group=True,
+            allow_everyone_group=True,
+            default_group_name=SystemGroups.EVERYONE,
+        ),
+        workplace_users_group=GroupPermissionSetting(
             allow_nobody_group=True,
             allow_everyone_group=True,
             default_group_name=SystemGroups.EVERYONE,
@@ -1095,6 +1121,10 @@ class Realm(models.Model):
                 settings.NEXTCLOUD_SERVER is None
                 or settings.NEXTCLOUD_TALK_USERNAME is None
                 or settings.NEXTCLOUD_TALK_PASSWORD is None
+            ):
+                continue
+            if provider == "webex" and (
+                settings.VIDEO_WEBEX_CLIENT_ID is None or settings.VIDEO_WEBEX_CLIENT_SECRET is None
             ):
                 continue
             enabled_video_chat_providers[provider] = self.VIDEO_CHAT_PROVIDERS[provider]
@@ -1451,6 +1481,7 @@ class RealmExport(models.Model):
     SUCCEEDED = 3
     FAILED = 4
     DELETED = 5
+    EXPORT_FROM_PRIOR_SERVER = 6
     status = models.PositiveSmallIntegerField(default=REQUESTED)
 
     date_requested = models.DateTimeField()

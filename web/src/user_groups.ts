@@ -139,15 +139,8 @@ export function get_user_group_from_name(name: string): UserGroup | undefined {
     return user_group_name_dict.get(name);
 }
 
-export function realm_has_deactivated_user_groups(): boolean {
-    const realm_user_groups = get_realm_user_groups(true);
-    const deactivated_group_count = realm_user_groups.filter((group) => group.deactivated).length;
-
-    return deactivated_group_count > 0;
-}
-
 export function get_realm_user_groups(include_deactivated = false): UserGroup[] {
-    const user_groups = [...user_group_by_id_dict.values()];
+    const user_groups = user_group_by_id_dict.values().toArray();
     user_groups.sort((a, b) => a.id - b.id);
     return user_groups.filter((group) => {
         if (group.is_system_group) {
@@ -167,7 +160,7 @@ export function get_all_realm_user_groups(
     include_internet_group = false,
     force_include_full_members_group = false,
 ): UserGroup[] {
-    const user_groups = [...user_group_by_id_dict.values()];
+    const user_groups = user_group_by_id_dict.values().toArray();
     user_groups.sort((a, b) => a.id - b.id);
     return user_groups.filter((group) => {
         if (!include_deactivated && group.deactivated) {
@@ -314,6 +307,7 @@ export function is_empty_group(user_group_id: number): boolean {
             return false;
         }
         for (const direct_subgroup_id of subgroup.direct_subgroup_ids) {
+            // eslint-disable-next-line unicorn/no-loop-iterable-mutation
             subgroup_ids.add(direct_subgroup_id);
         }
     }
@@ -373,6 +367,7 @@ export function get_recursive_subgroups(target_user_group: UserGroup): Set<numbe
         }
 
         for (const direct_subgroup_id of subgroup.direct_subgroup_ids) {
+            // eslint-disable-next-line unicorn/no-loop-iterable-mutation
             subgroup_ids.add(direct_subgroup_id);
         }
     }
@@ -611,6 +606,30 @@ export function is_user_in_setting_group(
         }
     }
     return false;
+}
+
+export function get_user_ids_in_setting_group(setting_value: GroupSettingValue): Set<number> {
+    const user_ids = new Set<number>();
+    const group_ids: number[] =
+        typeof setting_value === "number" ? [setting_value] : [...setting_value.direct_subgroups];
+
+    if (typeof setting_value !== "number") {
+        for (const user_id of setting_value.direct_members) {
+            user_ids.add(user_id);
+        }
+    }
+
+    for (const group_id of group_ids) {
+        const group = user_group_by_id_dict.get(group_id);
+        if (group === undefined) {
+            blueslip.error("Could not find user group", {group_id});
+            continue;
+        }
+        for (const member_id of get_recursive_group_members(group)) {
+            user_ids.add(member_id);
+        }
+    }
+    return user_ids;
 }
 
 export function check_system_user_group_allowed_for_setting(

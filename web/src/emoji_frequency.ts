@@ -1,11 +1,11 @@
 import assert from "minimalistic-assert";
 
-import * as all_messages_data from "./all_messages_data.ts";
 import * as emoji_frequency_data from "./emoji_frequency_data.ts";
 import * as emoji_picker from "./emoji_picker.ts";
 import * as message_store from "./message_store.ts";
 import * as muted_users from "./muted_users.ts";
 import * as reactions from "./reactions.ts";
+import * as recent_view_messages_data from "./recent_view_messages_data.ts";
 import {current_user} from "./state_data.ts";
 import * as stream_data from "./stream_data.ts";
 import * as typeahead from "./typeahead.ts";
@@ -111,8 +111,10 @@ export function update_emoji_frequency_on_messages_deletion(message_ids: number[
             continue;
         }
         assert(message !== undefined);
-        const message_reactions = [...message.clean_reactions.values()];
-        const emoji_ids = message_reactions.map((reaction) => reaction.local_id);
+        const emoji_ids = message.clean_reactions
+            .values()
+            .map((reaction) => reaction.local_id)
+            .toArray();
 
         emoji_frequency_data.remove_message_reactions({
             message_id,
@@ -123,7 +125,7 @@ export function update_emoji_frequency_on_messages_deletion(message_ids: number[
 }
 
 export function initialize_frequently_used_emojis(): void {
-    const message_data = all_messages_data.all_messages_data;
+    const message_data = recent_view_messages_data.recent_view_messages_data;
     const messages = message_data.all_messages_after_mute_filtering();
     const popular_emojis = typeahead.get_popular_emojis();
 

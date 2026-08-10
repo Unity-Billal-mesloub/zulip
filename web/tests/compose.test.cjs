@@ -2,17 +2,15 @@
 
 const assert = require("node:assert/strict");
 
-const MockDate = require("mockdate");
-
 const {mock_banners} = require("./lib/compose_banner.cjs");
 const {FakeComposeBox} = require("./lib/compose_helpers.cjs");
 const {make_user_group} = require("./lib/example_group.cjs");
 const {make_realm} = require("./lib/example_realm.cjs");
 const {make_stream} = require("./lib/example_stream.cjs");
 const {make_bot, make_user} = require("./lib/example_user.cjs");
-const {mock_esm, set_global, zrequire} = require("./lib/namespace.cjs");
+const {clock, mock_esm, set_global, zrequire} = require("./lib/namespace.cjs");
 const {run_test, noop} = require("./lib/test.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 const {page_params} = require("./lib/zpage_params.cjs");
 
 const user_groups = zrequire("user_groups");
@@ -51,7 +49,9 @@ const sent_messages = mock_esm("../src/sent_messages");
 const server_events_state = mock_esm("../src/server_events_state");
 const transmit = mock_esm("../src/transmit");
 const upload = mock_esm("../src/upload");
-const onboarding_steps = mock_esm("../src/onboarding_steps");
+const onboarding_steps = mock_esm("../src/onboarding_steps", {
+    ONE_TIME_NOTICES_TO_DISPLAY: new Set(),
+});
 mock_esm("../src/settings_data", {
     user_has_permission_for_group_setting: () => true,
 });
@@ -172,10 +172,6 @@ function simulate_draft_ui_interactions() {
     $(".top_left_drafts").set_find_results(".unread_count", $.create("draft-unread-count-stub"));
 }
 
-function assert_compose_send_button_attr_is_undefined() {
-    assert.equal($("#compose-send-button").attr(), undefined);
-}
-
 test_ui("send_message_success", ({override, override_rewire}) => {
     mock_banners();
 
@@ -262,7 +258,7 @@ test_ui("send_message_success", ({override, override_rewire}) => {
 
 test_ui("send_message", ({override, override_rewire, mock_template}) => {
     mock_banners();
-    MockDate.set(new Date(fake_now * 1000));
+    clock.setSystemTime(new Date(fake_now * 1000));
 
     const fake_compose_box = new FakeComposeBox();
 
@@ -305,6 +301,7 @@ test_ui("send_message", ({override, override_rewire, mock_template}) => {
 
         const server_message_id = 127;
         override(markdown, "render", noop);
+        override(markdown, "get_topic_links", () => []);
 
         override_rewire(echo, "try_deliver_locally", (message_request) => {
             const local_id_float = 123.04;
@@ -453,10 +450,18 @@ test_ui("handle_enter_key_with_preview_open", ({override, override_rewire}) => {
     override(realm, "realm_topics_policy", "allow_empty_topic");
 
     compose.handle_enter_key_with_preview_open();
-    fake_compose_box.assert_preview_mode_is_off();
+    // Preview mode should remain on after finish() returns, because
+    // clear_preview_area() is now called inside clear_compose_box(),
+    // which only runs when the server confirms the send.
+    fake_compose_box.assert_preview_mode_is_on();
 
     assert.ok(send_message_called);
     assert.ok(show_button_spinner_called);
+
+    // Verify that preview mode is cleared when the compose box is
+    // cleared, as would happen asynchronously on send success.
+    compose.clear_compose_box();
+    fake_compose_box.assert_preview_mode_is_off();
 
     override(user_settings, "enter_sends", false);
     fake_compose_box.blur_textarea();
@@ -491,17 +496,14 @@ test_ui("finish", ({override, override_rewire}) => {
         fake_compose_box.set_textarea_val("burrito");
         compose_state.set_message_type("stream");
 
-        fake_compose_box.set_textarea_toggle_class_function((classname, value) => {
-            assert.equal(classname, "invalid");
-            assert.equal(value, true);
-        });
-
+        assert.ok(!fake_compose_box.$content_textarea.hasClass("invalid"));
         fake_compose_box.set_textarea_val("");
 
         override_rewire(compose_ui, "compose_spinner_visible", false);
         const res = compose.finish();
         assert.equal(res, false);
 
+        assert.ok(fake_compose_box.$content_textarea.hasClass("invalid"));
         assert.ok(!fake_compose_box.is_recipient_not_subscribed_banner_visible());
         assert.ok(!fake_compose_box.is_submit_button_spinner_visible());
 
@@ -526,8 +528,16 @@ test_ui("finish", ({override, override_rewire}) => {
 
         assert.ok(compose.finish());
 
-        fake_compose_box.assert_preview_mode_is_off();
+        // Preview mode should remain on after finish() returns, because
+        // clear_preview_area() is now called inside clear_compose_box(),
+        // which only runs when the server confirms the send.
+        fake_compose_box.assert_preview_mode_is_on();
         assert.ok(send_message_called);
+
+        // Verify that preview mode is cleared when the compose box is
+        // cleared, as would happen asynchronously on send success.
+        compose.clear_compose_box();
+        fake_compose_box.assert_preview_mode_is_off();
     })();
 });
 
@@ -602,10 +612,30 @@ test_ui("initialize", ({override}) => {
 
         compose_setup.abort_xhr();
 
-        // I'm not sure this proves anything interesting.
-        assert_compose_send_button_attr_is_undefined();
         assert.ok(uppy_cancel_all_called);
     })();
+});
+
+test_ui("update_draft_if_composing", ({override_rewire}) => {
+    let update_draft_call_count = 0;
+    override_rewire(drafts, "update_draft", (opts) => {
+        assert.deepEqual(opts, {no_notify: true});
+        update_draft_call_count += 1;
+        return "draft-id";
+    });
+
+    // Autosave does nothing once the compose box has closed, so a
+    // delayed call can't resurrect a draft the user is done with.
+    compose_state.set_message_type(undefined);
+    assert.ok(!compose_state.composing());
+    compose_setup.update_draft_if_composing();
+    assert.equal(update_draft_call_count, 0);
+
+    // While the user is still composing, autosave persists the draft.
+    compose_state.set_message_type("stream");
+    assert.ok(compose_state.composing());
+    compose_setup.update_draft_if_composing();
+    assert.equal(update_draft_call_count, 1);
 });
 
 test_ui("update_fade", ({override, override_rewire}) => {
@@ -694,6 +724,11 @@ test_ui("on_events", ({override, override_rewire}) => {
     })();
 
     (function test_markdown_preview_compose_clicked() {
+        $("#compose .preview_content").set_find_results(
+            ".image-loading-placeholder",
+            $.create("no-images", {elements: []}),
+        );
+
         function setup_mock_markdown_contains_backend_only_syntax(msg_content, return_val) {
             override(markdown, "contains_backend_only_syntax", (msg) => {
                 assert.equal(msg, msg_content);
@@ -834,24 +869,15 @@ test_ui("DM policy disabled", ({override}) => {
     // Disable sending direct messages in the organisation
     override(realm, "realm_direct_message_permission_group", nobody.id);
     override(realm, "realm_direct_message_initiator_group", everyone.id);
-    // For no specified direct message recipient, the "Message X"button
-    // is not disabled
-    override(narrow_state, "pm_ids_string", () => undefined);
-    let reply_disabled = compose_closed_ui.should_disable_compose_reply_button_for_direct_message();
-    assert.ok(!reply_disabled);
     // For single bot recipient, Bot, the "Message X" button is not disabled
-    override(narrow_state, "pm_ids_string", () => "33");
-    reply_disabled = compose_closed_ui.should_disable_compose_reply_button_for_direct_message();
+    let reply_disabled =
+        compose_closed_ui.should_disable_compose_reply_button_for_direct_message("33");
     assert.ok(!reply_disabled);
     // For human user, Alice, the "Message X" button is disabled
-    override(narrow_state, "pm_ids_string", () => "31,33");
-    reply_disabled = compose_closed_ui.should_disable_compose_reply_button_for_direct_message();
+    reply_disabled = compose_closed_ui.should_disable_compose_reply_button_for_direct_message("31");
     assert.ok(reply_disabled);
     // For human user and bot user, the "Message X" button is disabled
-    reply_disabled = compose_closed_ui.should_disable_compose_reply_button_for_direct_message();
+    reply_disabled =
+        compose_closed_ui.should_disable_compose_reply_button_for_direct_message("31,33");
     assert.ok(reply_disabled);
-});
-
-run_test("reset MockDate", () => {
-    MockDate.reset();
 });

@@ -3,17 +3,16 @@
 const assert = require("node:assert/strict");
 const path = require("node:path");
 
-require("@date-fns/tz"); // To prevent mockdate from interfering with it
+require("@date-fns/tz"); // To prevent @sinonjs/fake-timers from interfering with it
 require("css.escape");
 require("handlebars/runtime.js");
 const {JSDOM} = require("jsdom");
-const _ = require("lodash");
 
 const handlebars = require("./handlebars.cjs");
 const namespace = require("./namespace.cjs");
 const test = require("./test.cjs");
 const blueslip = require("./zblueslip.cjs");
-const zjquery = require("./zjquery.cjs");
+const {$} = require("./zjquery.cjs");
 const zpage_billing_params = require("./zpage_billing_params.cjs");
 const zpage_params = require("./zpage_params.cjs");
 
@@ -32,20 +31,10 @@ Object.defineProperty(global, "navigator", {
     writable: true,
 });
 
-require("@babel/register")({
+require("@babel/register").default({
     extensions: [".cjs", ".cts", ".js", ".mjs", ".mts", ".ts"],
-    only: [new RegExp("^" + _.escapeRegExp(path.resolve(__dirname, "../../src") + path.sep))],
-    plugins: [
-        ...(process.env.USING_INSTRUMENTED_CODE ? [["istanbul", {exclude: []}]] : []),
-        ["@babel/plugin-transform-modules-commonjs", {lazy: () => true}],
-    ],
     root: path.resolve(__dirname, "../.."),
 });
-
-// Create a helper function to avoid sneaky delays in tests.
-function immediate(f) {
-    return () => f();
-}
 
 // Find the files we need to run.
 const files = process.argv.slice(2);
@@ -79,12 +68,10 @@ const localStorage = {
 // Set up Handlebars
 handlebars.hook_require();
 
-const noop = function () {};
-
 require("../../src/templates.ts"); // register Zulip extensions
 
 async function run_one_module(file) {
-    zjquery.clear_all_elements();
+    $.clear_all_elements();
     console.info("running test " + path.basename(file, ".test.cjs"));
     test.set_current_file_name(file);
     test.suite.length = 0;
@@ -109,12 +96,8 @@ process.exitCode = 1;
         namespace.set_global("window", window);
         namespace.set_global("location", dom.window.location);
         window.location.href = "http://zulip.zulipdev.com/#";
-        namespace.set_global("setTimeout", noop);
-        namespace.set_global("setInterval", noop);
         namespace.set_global("localStorage", localStorage);
         ls_container.clear();
-        _.throttle = immediate;
-        _.debounce = immediate;
         zpage_billing_params.reset();
         zpage_params.reset();
 
@@ -143,6 +126,4 @@ process.exitCode = 1;
     }
 
     process.exitCode = exit_code;
-})().catch((error) => /* istanbul ignore next */ {
-    console.error(error);
-});
+})();

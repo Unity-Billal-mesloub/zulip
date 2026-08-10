@@ -54,8 +54,17 @@ def remove_attachment(user_profile: UserProfile, attachment: Attachment) -> None
     attachment.delete()
 
 
-def validate_attachment_request_for_spectator_access(realm: Realm, attachment: Attachment) -> bool:
+def validate_attachment_request_for_spectator_access(
+    realm: Realm, attachment: Attachment
+) -> bool | None:
+    """Returns whether the spectator is authorized to access the
+    attachment, or None if the attachment was deleted concurrently
+    with the request.
+    """
     if attachment.realm != realm:
+        return False
+
+    if not realm.web_public_streams_enabled():
         return False
 
     # Update cached is_web_public property, if necessary.
@@ -74,7 +83,11 @@ def validate_attachment_request_for_spectator_access(realm: Realm, attachment: A
                 ),
             ),
         )
-        attachment.refresh_from_db()
+
+        try:
+            attachment.refresh_from_db()
+        except Attachment.DoesNotExist:
+            return None
 
     if not attachment.is_web_public:
         return False
@@ -102,7 +115,13 @@ def validate_attachment_request(
 
     if isinstance(maybe_user_profile, AnonymousUser):
         assert realm is not None
-        return validate_attachment_request_for_spectator_access(realm, attachment), attachment
+        is_authorized = validate_attachment_request_for_spectator_access(realm, attachment)
+        if is_authorized is None:
+            # The attachment was deleted concurrently with this
+            # request; report it as not existing, just as if we
+            # had observed that initially.
+            return False, None
+        return is_authorized, attachment
 
     user_profile = maybe_user_profile
     assert isinstance(user_profile, UserProfile)
@@ -122,7 +141,13 @@ def validate_attachment_request(
                 ),
             ),
         )
-        attachment.refresh_from_db()
+        try:
+            attachment.refresh_from_db()
+        except Attachment.DoesNotExist:
+            # The attachment was deleted concurrently with this
+            # request; report it as not existing, just as if we
+            # had observed that initially.
+            return False, None
 
     if user_profile.id == attachment.owner_id:
         # If you own the file, you can access it.
@@ -222,22 +247,34 @@ def get_old_unclaimed_attachments(
 
     # The Attachment vs ArchivedAttachment queries are asymmetric because only
     # Attachment has the scheduled_messages relation.
-    old_attachments = Attachment.objects.alias(
-        has_other_messages=Exists(
-            ArchivedAttachment.objects.filter(id=OuterRef("id")).exclude(messages=None)
-        )
-    ).filter(
-        messages=None,
-        scheduled_messages=None,
-        create_time__lt=delta_weeks_ago,
-        has_other_messages=False,
-    )
-    old_archived_attachments = ArchivedAttachment.objects.alias(
-        has_other_messages=Exists(
-            Attachment.objects.filter(id=OuterRef("id")).exclude(
-                messages=None, scheduled_messages=None
+    old_attachments = (
+        Attachment.objects.alias(
+            has_other_messages=Exists(
+                ArchivedAttachment.objects.filter(id=OuterRef("id")).exclude(messages=None)
             )
         )
-    ).filter(messages=None, create_time__lt=delta_weeks_ago, has_other_messages=False)
+        .filter(
+            messages=None,
+            scheduled_messages=None,
+            create_time__lt=delta_weeks_ago,
+            has_other_messages=False,
+        )
+        .order_by("id")
+    )
+    old_archived_attachments = (
+        ArchivedAttachment.objects.alias(
+            has_other_messages=Exists(
+                Attachment.objects.filter(id=OuterRef("id")).exclude(
+                    messages=None, scheduled_messages=None
+                )
+            )
+        )
+        .filter(
+            messages=None,
+            create_time__lt=delta_weeks_ago,
+            has_other_messages=False,
+        )
+        .order_by("id")
+    )
 
     return old_attachments, old_archived_attachments

@@ -15,7 +15,7 @@ from zerver.actions.message_flags import do_mark_stream_messages_as_read
 from zerver.actions.message_send import internal_send_private_message
 from zerver.actions.realm_export import notify_realm_export
 from zerver.actions.realm_settings import scrub_deactivated_realm
-from zerver.lib.export import export_realm_wrapper
+from zerver.lib.export import export_realm_wrapper, export_tarball_prefix
 from zerver.lib.push_notifications import clear_push_device_tokens
 from zerver.lib.queue import retry_event
 from zerver.lib.remote_server import (
@@ -80,9 +80,9 @@ class DeferredWorker(QueueProcessingWorker):
 
                 retry_event(self.queue_name, event, failure_processor)
         elif event["type"] == "realm_export":
-            output_dir = tempfile.mkdtemp(prefix="zulip-export-")
             user_profile = get_user_profile_by_id(event["user_profile_id"])
             realm = user_profile.realm
+            output_dir = tempfile.mkdtemp(prefix=export_tarball_prefix(realm))
             export_event = None
 
             if "realm_export_id" in event:
@@ -173,6 +173,13 @@ class DeferredWorker(QueueProcessingWorker):
             logger.info("Processing reupload_realm_emoji event for realm %s", realm.id)
             handle_reupload_emojis_event(realm, logger)
         elif event["type"] == "soft_reactivate":
+            # Soft reactivations are normally enqueued here. A server can
+            # opt into a dedicated soft_reactivation queue via the
+            # dedicated_soft_reactivation_queue setting; even then, do not
+            # remove this handler. It remains the default path, and it
+            # drains any soft_reactivate events already in this queue when
+            # that option is enabled -- stale deferred_work events can
+            # linger across upgrades for a long time.
             logger.info(
                 "Starting soft reactivation for user_profile_id %s",
                 event["user_profile_id"],

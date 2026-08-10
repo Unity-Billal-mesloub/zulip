@@ -118,7 +118,7 @@ export async function page_url_with_fragment(page: Page): Promise<string> {
 // replace it with the text.
 export async function clear_and_type(page: Page, selector: string, text: string): Promise<void> {
     // Select all text currently in the element.
-    await page.click(selector, {clickCount: 3});
+    await page.click(selector, {count: 3});
     await page.keyboard.press("Delete");
     await page.type(selector, text);
 }
@@ -175,8 +175,7 @@ export async function check_form_contents(
     form_selector: string,
     params: Record<string, boolean | string>,
 ): Promise<void> {
-    for (const name of Object.keys(params)) {
-        const expected_value = params[name];
+    for (const [name, expected_value] of Object.entries(params)) {
         if (typeof expected_value === "boolean") {
             assert.equal(
                 await page.$eval(
@@ -286,7 +285,7 @@ export async function log_out(page: Page): Promise<void> {
     await page.waitForSelector(menu_selector, {visible: true});
     await page.click(menu_selector);
     await page.waitForSelector(logout_selector);
-    await page.click(logout_selector);
+    await Promise.all([page.waitForNavigation(), page.click(logout_selector)]);
 
     // Wait for a email input in login page so we know login
     // page is loaded. Then check that we are at the login url.
@@ -409,7 +408,7 @@ export async function select_stream_in_compose_via_dropdown(
     const stream_to_select = `.dropdown-list-container .list-item[data-name="${stream_name}"]`;
     await page.waitForSelector(stream_to_select, {visible: true});
     await page.click(stream_to_select);
-    assert.ok((await page.$(".dropdown-list-container")) === null);
+    await page.waitForSelector(".dropdown-list-container", {hidden: true});
 }
 
 // Wait for any previous send to finish, then send a message.

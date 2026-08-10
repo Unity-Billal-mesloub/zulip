@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
 
@@ -198,6 +198,7 @@ export function register_click_handlers(): void {
     });
 
     $("body").on("click", ".view_user_group", function (this: HTMLElement, e) {
+        e.preventDefault();
         e.stopPropagation();
         toggle_user_group_info_popover(this, undefined);
     });

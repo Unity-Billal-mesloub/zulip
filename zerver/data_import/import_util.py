@@ -5,17 +5,22 @@ import secrets
 import shutil
 import subprocess
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeAlias, TypeVar
+from email.errors import HeaderDefect
+from email.headerregistry import Address
+from typing import Any, Generic, Protocol, TypeAlias, TypeVar
+from urllib.parse import SplitResult
 
 import orjson
 import requests
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.forms.models import model_to_dict
 from django.utils.timezone import now as timezone_now
+from urllib3.util import Retry
 
 from zerver.data_import.sequencer import NEXT_ID
 from zerver.lib.avatar_hash import user_avatar_base_path_from_ids
@@ -23,6 +28,7 @@ from zerver.lib.emoji import get_emoji_file_name
 from zerver.lib.markdown import get_markdown_link_for_url
 from zerver.lib.message import normalize_body_for_import
 from zerver.lib.mime_types import INLINE_MIME_TYPES, bare_content_type, guess_type
+from zerver.lib.outgoing_http import OutgoingSession
 from zerver.lib.parallel import run_parallel
 from zerver.lib.partial import partial
 from zerver.lib.stream_color import STREAM_ASSIGNMENT_COLORS as STREAM_COLORS
@@ -49,6 +55,7 @@ ZerverFieldsT: TypeAlias = dict[str, Any]
 class AttachmentLinkResult:
     path_id: str
     markdown_link: str
+    url: str
 
 
 @dataclass
@@ -82,17 +89,21 @@ class UploadRecordData:
 
 @dataclass
 class UploadFileRequest:
-    output_file_path: str
+    output_file_path_id: str
     request_url: str
     params: dict[str, Any] | None
     headers: dict[str, Any] | None
     kwargs: dict[str, Any]
 
 
-class SubscriberHandler:
+GroupDMKey = TypeVar("GroupDMKey", bound=Hashable)
+
+
+class SubscriberHandler(Generic[GroupDMKey]):
     def __init__(self) -> None:
         self.stream_info: dict[int, set[int]] = {}
         self.direct_message_group_info: dict[int, set[int]] = {}
+        self.group_dm_key_to_zulip_recipient_id: dict[GroupDMKey, int] = {}
 
     def set_info(
         self,
@@ -106,6 +117,16 @@ class SubscriberHandler:
             self.direct_message_group_info[direct_message_group_id] = users
         else:
             raise AssertionError("stream_id or direct_message_group_id is required")
+
+    def add_group_dm_key_to_zulip_recipient_id(
+        self, key: GroupDMKey, group_recipient_id: int
+    ) -> None:
+        # TODO: Currently only Mattermost importer uses this. Maybe refactor this into
+        # self.set_info() once other importers starts using this method too.
+        self.group_dm_key_to_zulip_recipient_id[key] = group_recipient_id
+
+    def get_zulip_recipient_id(self, key: GroupDMKey) -> int | None:
+        return self.group_dm_key_to_zulip_recipient_id.get(key)
 
     def get_users(
         self, stream_id: int | None = None, direct_message_group_id: int | None = None
@@ -218,7 +239,6 @@ def make_subscriber_map(zerver_subscription: list[ZerverFieldsT]) -> dict[int, s
 def make_user_messages(
     zerver_message: list[ZerverFieldsT],
     subscriber_map: dict[int, set[int]],
-    is_pm_data: bool,
     mention_map: dict[int, set[int]],
     wildcard_mention_map: Mapping[int, bool] = {},
 ) -> list[ZerverFieldsT]:
@@ -228,6 +248,7 @@ def make_user_messages(
         message_id = message["id"]
         recipient_id = message["recipient"]
         sender_id = message["sender"]
+        is_private = not message["is_channel_message"]
         mention_user_ids = mention_map[message_id]
         wildcard_mention = wildcard_mention_map.get(message_id, False)
         subscriber_ids = subscriber_map.get(recipient_id, set())
@@ -238,7 +259,7 @@ def make_user_messages(
             user_message = build_user_message(
                 user_id=user_id,
                 message_id=message_id,
-                is_private=is_pm_data,
+                is_private=is_private,
                 is_mentioned=is_mentioned,
                 wildcard_mention=wildcard_mention,
             )
@@ -318,26 +339,6 @@ def build_direct_message_group_subscriptions(
     return subscriptions
 
 
-def build_personal_subscriptions(zerver_recipient: list[ZerverFieldsT]) -> list[ZerverFieldsT]:
-    subscriptions: list[ZerverFieldsT] = []
-
-    personal_recipients = [
-        recipient for recipient in zerver_recipient if recipient["type"] == Recipient.PERSONAL
-    ]
-
-    for recipient in personal_recipients:
-        recipient_id = recipient["id"]
-        user_id = recipient["type_id"]
-        subscription = build_subscription(
-            recipient_id=recipient_id,
-            user_id=user_id,
-            subscription_id=NEXT_ID("subscription"),
-        )
-        subscriptions.append(subscription)
-
-    return subscriptions
-
-
 def build_recipient(type_id: int, recipient_id: int, type: int) -> ZerverFieldsT:
     recipient = Recipient(
         type_id=type_id,  # stream id
@@ -360,17 +361,6 @@ def build_recipients(
     """
 
     recipients = []
-
-    for user in zerver_userprofile:
-        type_id = user["id"]
-        type = Recipient.PERSONAL
-        recipient = Recipient(
-            type_id=type_id,
-            id=NEXT_ID("recipient"),
-            type=type,
-        )
-        recipient_dict = model_to_dict(recipient)
-        recipients.append(recipient_dict)
 
     for stream in zerver_stream:
         type_id = stream["id"]
@@ -576,13 +566,36 @@ def build_message(
     return zulip_message_dict
 
 
+# Keep this in sync with the Attachment table.
+@dataclass
+class AttachmentRecordData:
+    content_type: str
+    create_time: float
+    file_name: str
+    id: int
+    is_realm_public: bool
+    is_web_public: bool
+    messages: list[int]
+    owner: int
+    path_id: str
+    realm: int
+    scheduled_messages: list[int]
+    size: int
+
+
+@dataclass
+class ScrubbedRecords:
+    zerver_attachments: list[AttachmentRecordData]
+    upload_records: list[UploadRecordData]
+
+
 def build_attachment(
     realm_id: int,
     message_ids: set[int],
     user_id: int,
     fileinfo: ZerverFieldsT,
     s3_path: str,
-    zerver_attachment: list[ZerverFieldsT],
+    zerver_attachment: list[AttachmentRecordData],
 ) -> None:
     """
     This function should be passed a 'fileinfo' dictionary, which contains
@@ -605,7 +618,7 @@ def build_attachment(
     attachment_dict["messages"] = list(message_ids)
     attachment_dict["realm"] = realm_id
 
-    zerver_attachment.append(attachment_dict)
+    zerver_attachment.append(AttachmentRecordData(**attachment_dict))
 
 
 def get_avatar(avatar_dir: str, size_url_suffix: str, avatar_upload_item: list[str]) -> None:
@@ -619,8 +632,7 @@ def get_avatar(avatar_dir: str, size_url_suffix: str, avatar_upload_item: list[s
         avatar_url += size_url_suffix
 
     response = request_file_stream(avatar_url)
-    with open(image_path, "wb") as image_file:
-        shutil.copyfileobj(response.raw, image_file)
+    write_response_file_stream_to_path(response, image_path)
     shutil.copy(image_path, original_image_path)
 
 
@@ -684,6 +696,15 @@ def process_avatars(
     return avatar_list + avatar_original_list
 
 
+# Retry on 429 (rate-limited) and common server errors that are
+# typically transient for file-hosting services like Slack's CDN.
+_data_import_session = OutgoingSession(
+    role="data_import",
+    timeout=60,
+    max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]),
+)
+
+
 def request_file_stream(
     url: str,
     params: dict[str, Any] | None = None,
@@ -693,7 +714,7 @@ def request_file_stream(
     if "stream" not in kwargs:
         kwargs.update(stream=True)
 
-    response = requests.get(
+    response = _data_import_session.get(
         url,
         params=params,
         headers=headers,
@@ -706,10 +727,22 @@ def request_file_stream(
     return response
 
 
+WRITE_RESPONSE_FILE_STREAM_CHUNK_SIZE = 64 * 1024
+
+
+def write_response_file_stream_to_path(
+    response: requests.Response,
+    file_path: str,
+    chunk_size: int = WRITE_RESPONSE_FILE_STREAM_CHUNK_SIZE,
+) -> None:
+    with open(file_path, "wb") as file_destination:
+        file_destination.writelines(response.iter_content(chunk_size=chunk_size))
+
+
 def download_and_export_upload_file(
     output_dir: str, upload_file_request: UploadFileRequest
 ) -> None:
-    file_output_path = os.path.join(output_dir, "uploads", upload_file_request.output_file_path)
+    file_output_path = os.path.join(output_dir, "uploads", upload_file_request.output_file_path_id)
 
     response = request_file_stream(
         upload_file_request.request_url,
@@ -719,8 +752,7 @@ def download_and_export_upload_file(
     )
 
     os.makedirs(os.path.dirname(file_output_path), exist_ok=True)
-    with open(file_output_path, "wb") as upload_file:
-        shutil.copyfileobj(response.raw, upload_file)
+    write_response_file_stream_to_path(response, file_output_path)
 
 
 def build_realm_emoji(realm_id: int, name: str, id: int, file_name: str) -> ZerverFieldsT:
@@ -747,7 +779,7 @@ def get_emojis(
     Raises `BadImageError` when the content-type is not guessable, or
     not in both `THUMBNAIL_ACCEPT_IMAGE_TYPES` and `INLINE_MIME_TYPES`.
     """
-    response = requests.get(emoji_url, stream=True)
+    response = request_file_stream(emoji_url)
     content_type_raw = response.headers.get("Content-Type")
     if content_type_raw is None:
         logging.warning(
@@ -770,10 +802,8 @@ def get_emojis(
     )
     upload_emoji_path = os.path.join(emoji_dir, emoji_path)
 
-    response = request_file_stream(emoji_url)
     os.makedirs(os.path.dirname(upload_emoji_path), exist_ok=True)
-    with open(upload_emoji_path, "wb") as emoji_file:
-        shutil.copyfileobj(response.raw, emoji_file)
+    write_response_file_stream_to_path(response, upload_emoji_path)
 
     return GetEmojiResult(path_id=emoji_path, filename=emoji_file_name)
 
@@ -928,4 +958,80 @@ def get_attachment_path_and_content(
     attachment_url = f"/user_uploads/{path_id}"
     markdown_link = get_markdown_link_for_url(link_name, attachment_url)
 
-    return AttachmentLinkResult(path_id=path_id, markdown_link=markdown_link)
+    return AttachmentLinkResult(path_id=path_id, markdown_link=markdown_link, url=attachment_url)
+
+
+def get_domain_name_for_import() -> str:
+    hostname = SplitResult("", settings.EXTERNAL_HOST, "", "", "").hostname
+    assert hostname is not None
+    return hostname
+
+
+class ImportedBotEmail:
+    duplicate_email_count: dict[str, int] = {}
+    # Mapping of `bot_id` to final email assigned to the bot.
+    assigned_email: dict[str, str] = {}
+
+    @classmethod
+    def get_email(
+        cls,
+        user_profile: ZerverFieldsT,
+        domain_name: str,
+        bot_id: str,
+        bot_name_getter: Callable[[ZerverFieldsT], str],
+    ) -> str:
+        if bot_id in cls.assigned_email:
+            return cls.assigned_email[bot_id]
+
+        bot_name = bot_name_getter(user_profile)
+
+        email = Address(
+            username=bot_name.replace("Bot", "").replace(" ", "").lower() + "-bot",
+            domain=domain_name,
+        ).addr_spec
+        # The address formed above may not be a valid email format - e.g. containing
+        # non-ASCII characters in the local part, if the bot_name contains them.
+        # Only Address(addr_spec=...) triggers the necessary validation.
+        # Thus we call it here, and if issues are detected, we fall back to forming the
+        # email address in a safer way - using the bot id string.
+        try:
+            Address(addr_spec=email)
+        except HeaderDefect:
+            email = Address(
+                username=bot_id + "-bot",
+                domain=domain_name,
+            ).addr_spec
+
+        if email in cls.duplicate_email_count:
+            cls.duplicate_email_count[email] += 1
+            address = Address(addr_spec=email)
+            email_username = address.username + "-" + str(cls.duplicate_email_count[email])
+            email = Address(username=email_username, domain=address.domain).addr_spec
+        else:
+            cls.duplicate_email_count[email] = 1
+
+        cls.assigned_email[bot_id] = email
+        return email
+
+
+def scrub_missing_upload_records_after_download(
+    output_dir: str,
+    zerver_attachments: list[AttachmentRecordData],
+    upload_records: list[UploadRecordData],
+) -> ScrubbedRecords:
+    """
+    This filters out any orphaned records in zerver_attachment and upload_record
+    due to failed parallel download.
+    """
+    return ScrubbedRecords(
+        zerver_attachments=[
+            attachment_record
+            for attachment_record in zerver_attachments
+            if os.path.isfile(os.path.join(output_dir, "uploads", attachment_record.path_id))
+        ],
+        upload_records=[
+            upload_record
+            for upload_record in upload_records
+            if os.path.isfile(os.path.join(output_dir, "uploads", upload_record.path))
+        ],
+    )

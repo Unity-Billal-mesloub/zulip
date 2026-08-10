@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 
 import emoji_codes from "../../static/generated/emoji/emoji_codes.json";
@@ -116,7 +116,11 @@ export function populate_emoji(): void {
         get_item: ListWidget.default_get_item,
         modifier_html(item) {
             const author = item.author
-                ? {...item.author, is_active: people.is_person_active(item.author_id)}
+                ? {
+                      ...item.author,
+                      is_active: people.is_person_active(item.author_id),
+                      avatar_url: people.small_avatar_url_for_person(item.author),
+                  }
                 : "";
             return render_admin_emoji_list({
                 emoji: {

@@ -11,8 +11,10 @@ function get_random_item_from_array<T>(array: T[]): T {
     return array[Math.floor(Math.random() * array.length)]!;
 }
 
+// This list should be squared with the logos listed
+// in templates/portico/hello.html
 const current_client_logo_class_names = new Set([
-    "client-logos-div client-logos__logo_akamai",
+    "client-logos-div client-logos__logo_pilot",
     "client-logos-div client-logos__logo_linux_foundation",
     "client-logos-div client-logos__logo_tum",
     "client-logos-div client-logos__logo_wikimedia",
@@ -20,10 +22,8 @@ const current_client_logo_class_names = new Set([
     "client-logos-div client-logos__logo_dr_on_demand",
 ]);
 const future_client_logo_class_names = new Set([
-    "client-logos-div client-logos__logo_pilot",
     "client-logos-div client-logos__logo_recurse",
     "client-logos-div client-logos__logo_maria",
-
     "client-logos-div client-logos__logo_layershift",
     "client-logos-div client-logos__logo_julia",
     "client-logos-div client-logos__logo_ucsd",
@@ -47,9 +47,7 @@ function update_client_logo(): void {
     const current_logo_class = client_logo_elt.className;
     current_client_logo_class_names.delete(current_logo_class);
 
-    const next_logo_class = get_random_item_from_array([
-        ...future_client_logo_class_names.values(),
-    ]);
+    const next_logo_class = get_random_item_from_array([...future_client_logo_class_names]);
     future_client_logo_class_names.delete(next_logo_class);
     client_logo_elt.className = next_logo_class;
     current_client_logo_class_names.add(next_logo_class);

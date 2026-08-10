@@ -1,10 +1,11 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
 import * as z from "zod/mini";
 
 import emoji_codes from "../../static/generated/emoji/emoji_codes.json";
 import render_emoji_popover from "../templates/popovers/emoji/emoji_popover.hbs";
+import render_emoji_popover_emoji from "../templates/popovers/emoji/emoji_popover_emoji.hbs";
 import render_emoji_popover_emoji_map from "../templates/popovers/emoji/emoji_popover_emoji_map.hbs";
 import render_emoji_popover_search_results from "../templates/popovers/emoji/emoji_popover_search_results.hbs";
 import render_emoji_showcase from "../templates/popovers/emoji/emoji_showcase.hbs";
@@ -227,6 +228,10 @@ const EMOJI_CATEGORIES = [
     {name: "Custom", icon: "fa-cog", translated: $t({defaultMessage: "Custom"})},
 ];
 
+// Does not dictate the layout.
+// It is only used to calculate heights of unpopulated sections to avoid scrollbar jumps.
+const COL_COUNT = 6;
+
 function get_total_sections(): number {
     if (search_is_active) {
         return 1;
@@ -237,7 +242,8 @@ function get_total_sections(): number {
 function get_max_index(section: number): number | undefined {
     if (search_is_active) {
         return search_results.length;
-    } else if (section >= 0 && section < get_total_sections()) {
+    }
+    if (section >= 0 && section < get_total_sections()) {
         return complete_emoji_catalog[section]!.emojis.length;
     }
     return undefined;
@@ -292,9 +298,10 @@ export function rebuild_catalog(): void {
     const catalog = new Map([
         [
             "Custom",
-            [...realm_emojis.keys()].map(
-                (realm_emoji_name) => emoji.emojis_by_name.get(realm_emoji_name)!,
-            ),
+            realm_emojis
+                .keys()
+                .map((realm_emoji_name) => emoji.emojis_by_name.get(realm_emoji_name)!)
+                .toArray(),
         ],
     ]);
 
@@ -359,8 +366,9 @@ const generate_emoji_picker_content = function (include_frequently_used_category
         emojis_used = message_reaction_session.already_used_emojis();
     }
 
+    const used_emoji_set = new Set(emojis_used);
     for (const emoji_dict of emoji.emojis_by_name.values()) {
-        emoji_dict.has_reacted = emoji_dict.aliases.some((alias) => emojis_used.includes(alias));
+        emoji_dict.has_reacted = emoji_dict.aliases.some((alias) => used_emoji_set.has(alias));
     }
 
     let emoji_catalog = complete_emoji_catalog;
@@ -574,7 +582,7 @@ function get_next_emoji_coordinates(move_by: number): {section: number; index: n
     let next_index = current_index + move_by;
     let max_len;
     if (next_index < 0) {
-        next_section = next_section - 1;
+        next_section -= 1;
         if (next_section >= 0) {
             next_index = get_max_index(next_section)! - 1;
             if (move_by === -6) {
@@ -585,7 +593,7 @@ function get_next_emoji_coordinates(move_by: number): {section: number; index: n
             }
         }
     } else if (next_index >= get_max_index(next_section)!) {
-        next_section = next_section + 1;
+        next_section += 1;
         if (next_section < get_total_sections()) {
             next_index = 0;
             if (move_by === 6) {
@@ -658,7 +666,8 @@ export function navigate(event_name: string, e?: JQuery.KeyDownEvent): boolean {
             return true;
         }
         return false;
-    } else if (
+    }
+    if (
         (current_section === 0 && current_index < 6 && event_name === "up_arrow") ||
         (current_section === 0 && current_index === 0 && event_name === "left_arrow")
     ) {
@@ -670,7 +679,7 @@ export function navigate(event_name: string, e?: JQuery.KeyDownEvent): boolean {
             // goes to beginning) with something reasonable and
             // consistent (cursor goes to the end of the filter
             // string).
-            $("#emoji-popover-filter").trigger("focus").caret(Number.POSITIVE_INFINITY);
+            $("#emoji-popover-filter").trigger("focus").caret(Infinity);
             scroll_util.get_scroll_element($emoji_map).scrollTop(0);
             scroll_util.get_scroll_element($(".emoji-search-results-container")).scrollTop(0);
             current_section = 0;
@@ -720,7 +729,7 @@ function process_keydown(e: JQuery.KeyDownEvent): void {
 
         const $emoji_filter = $<HTMLInputElement>("input#emoji-popover-filter");
         const old_query = $emoji_filter.val()!;
-        let new_query = "";
+        let new_query;
 
         if (pressed_key === "Backspace") {
             new_query = old_query.slice(0, -1);
@@ -828,12 +837,95 @@ function get_default_emoji_popover_options(
             if (!include_frequently_used_category) {
                 emoji_catalog = complete_emoji_catalog.slice(1);
             }
-            $popover
-                .find(".emoji-popover-emoji-map .simplebar-content")
-                .html(render_emoji_popover_emoji_map({emoji_categories: emoji_catalog}));
+
+            /* Initially render only the first two category fully,
+               to avoid flicker since they are displayed immediately,
+               the other categs are only as placeholders.
+            */
+            const initial_catalog = emoji_catalog.map((cat, index) =>
+                index < 2 ? cat : {...cat, emojis: []},
+            );
+
+            const $container = $popover.find(".emoji-popover-emoji-map .simplebar-content");
+            $container.html(render_emoji_popover_emoji_map({emoji_categories: initial_catalog}));
+
+            const $sections = $popover.find(".emoji-collection");
+            const $first_emoji = $popover.find(".emoji-popover-emoji").first();
+            const row_height = $first_emoji.outerHeight(true)!;
+            $sections.each((index, section) => {
+                if (index < 2) {
+                    return;
+                }
+                // set min_height is necessary to have a coherent scrollbar size, and avoid
+                // loading multiple sections at once if they're too small.
+                const count = emoji_catalog[index]!.emojis.length;
+                const height = Math.ceil(count / COL_COUNT) * row_height;
+                $(section).css("min-height", height + "px");
+            });
+
             refill_section_head_offsets($popover);
             show_emoji_catalog();
             register_popover_events($popover);
+
+            const scroll_container = scroll_util.get_scroll_element(
+                $popover.find(".emoji-popover-emoji-map"),
+            )[0]!;
+
+            /* We use IntersectionObserver to detect when a section comes close to a view
+              only to load its emojis then.
+              The added performance compared to only using lazy loading for emojis is huge,
+              because lazy loading only apply to custom emojis, normal ones are rendered
+              with css background image which do not support lazy loading.
+              The difference of loading speed is most visible on Safari.
+            */
+            const observer = new IntersectionObserver(
+                (entries) => {
+                    for (const entry of entries) {
+                        if (entry.isIntersecting) {
+                            const target = entry.target;
+                            assert(target instanceof HTMLElement);
+                            const section_name = target.getAttribute("data-section");
+
+                            if (target.childElementCount > 0) {
+                                continue;
+                            }
+
+                            const cat_index = emoji_catalog.findIndex(
+                                (c) => c.name === section_name,
+                            );
+                            assert(cat_index !== -1);
+                            const category = emoji_catalog[cat_index]!;
+                            const html = category.emojis
+                                .map((emoji_dict, idx) =>
+                                    render_emoji_popover_emoji({
+                                        emoji_dict,
+                                        type: "emoji_picker_emoji",
+                                        section: cat_index,
+                                        index: idx,
+                                    }),
+                                )
+                                .join("");
+                            target.innerHTML = html;
+                            target.style.minHeight = "";
+                            observer.unobserve(target);
+                        }
+                    }
+                },
+                {
+                    root: scroll_container,
+                    // half the size of the popover display height.
+                    // only support value in px
+                    rootMargin: `${scroll_container.clientHeight / 2}px 0px`,
+                },
+            );
+
+            $sections.each((index, section) => {
+                if (index > 0) {
+                    // We will unobserve the section once its emojis are loaded.
+                    observer.observe(section);
+                }
+            });
+
             // Don't focus filter box on mobile since it leads to window resize due
             // to keyboard being open and scrolls the emoji popover out of view while
             // still open in Chrome Android and can hide it based on device height in Firefox Android.

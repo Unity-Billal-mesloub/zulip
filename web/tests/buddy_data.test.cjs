@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const _ = require("lodash");
 
 const {make_realm} = require("./lib/example_realm.cjs");
+const {make_stream} = require("./lib/example_stream.cjs");
 const {make_bot, make_user} = require("./lib/example_user.cjs");
 const {make_message_list} = require("./lib/message_list.cjs");
 const {mock_esm, zrequire} = require("./lib/namespace.cjs");
@@ -86,6 +87,13 @@ const old_user = make_user({
     user_id: 9999,
     full_name: "Old User",
     email: "old_user@example.com",
+});
+
+const imported_user = make_user({
+    user_id: 10000,
+    full_name: "Imported user",
+    email: "imported-user@example.com",
+    is_imported_stub: true,
 });
 
 const bot = make_bot({
@@ -300,6 +308,18 @@ test("filters deactivated users", () => {
     assert.ok(!buddy_data.matches_filter("selm", selma.user_id));
 });
 
+test("deleted users excluded from search", () => {
+    const deleted_selma = {...selma, is_deleted: true};
+    people._add_user(deleted_selma);
+
+    let user_ids = buddy_data.get_filtered_and_sorted_user_ids();
+    assert.equal(user_ids.includes(selma.user_id), false);
+
+    user_ids = buddy_data.get_filtered_and_sorted_user_ids("selm");
+    assert.deepEqual(user_ids, []);
+    assert.ok(!buddy_data.matches_filter("selm", selma.user_id));
+});
+
 test("muted users excluded from search", () => {
     people.add_active_user(selma);
     muted_users.add_muted_user(selma.user_id);
@@ -320,7 +340,8 @@ test("bulk_data_hacks", ({override_rewire}) => {
     // sanity check
     assert.equal(mark.user_id, 1005);
 
-    for (const i of _.range(mark.user_id + 1, 2000)) {
+    const start_id = mark.user_id + 1;
+    for (const i of _.range(start_id, 2000)) {
         const person = {
             user_id: i,
             full_name: `Human ${i}`,
@@ -414,7 +435,7 @@ test("show offline channel subscribers for small channels", ({override_rewire}) 
     set_presence(jill.user_id, "offline");
 
     const stream_id = 1001;
-    const sub = {name: "Rome", subscribed: true, stream_id};
+    const sub = make_stream({name: "Rome", stream_id});
     stream_data.add_sub_for_tests(sub);
     peer_data.set_subscribers(stream_id, [
         selma.user_id,
@@ -445,7 +466,7 @@ test("show offline channel subscribers for small channels", ({override_rewire}) 
 test("get_conversation_participants", () => {
     people.add_active_user(selma);
 
-    const rome_sub = {name: "Rome", subscribed: true, stream_id: 1001};
+    const rome_sub = make_stream({name: "Rome", stream_id: 1001});
     stream_data.add_sub_for_tests(rome_sub);
     peer_data.set_subscribers(rome_sub.stream_id, [selma.user_id, me.user_id]);
 
@@ -498,7 +519,7 @@ test("compare_function", () => {
     const second_user_shown_higher = 1;
 
     const stream_id = 1001;
-    const sub = {name: "Rome", subscribed: true, stream_id};
+    const sub = make_stream({name: "Rome", stream_id});
     stream_data.add_sub_for_tests(sub);
     people.add_active_user(alice);
     people.add_active_user(fred);
@@ -577,6 +598,7 @@ test("compare_function", () => {
 
 test("user_last_seen_time_status", ({override}) => {
     page_params.presence_history_limit_days_for_web_app = 365;
+    people.add_active_user(old_user);
     set_presence(selma.user_id, "active");
     set_presence(me.user_id, "active");
 
@@ -607,6 +629,12 @@ test("user_last_seen_time_status", ({override}) => {
         assert.equal(user_id, old_user.user_id);
     };
     assert.equal(buddy_data.user_last_seen_time_status(old_user.user_id, missing_callback), "");
+
+    people.add_active_user(imported_user);
+    assert.equal(
+        buddy_data.user_last_seen_time_status(imported_user.user_id),
+        "translated: Imported account not activated",
+    );
 });
 
 test("get_items_for_users", ({override}) => {

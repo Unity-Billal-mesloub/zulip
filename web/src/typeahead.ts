@@ -40,14 +40,14 @@ export function get_popular_emojis(): EmojiItem[] {
 export let frequently_used_emojis: EmojiItem[] = [...get_popular_emojis()];
 
 export type Emoji =
+    | UnicodeEmoji
     | {
           emoji_name: string;
           reaction_type: "realm_emoji" | "zulip_extra_emoji";
           is_realm_emoji: true;
           emoji_url?: string | undefined;
           emoji_code?: undefined;
-      }
-    | UnicodeEmoji;
+      };
 
 // emoji_code is only available for unicode emojis.
 type UnicodeEmoji = {
@@ -62,13 +62,16 @@ export type EmojiSuggestion = Emoji & {
 };
 
 export type BaseEmoji = {emoji_name: string} & (
-    | {is_realm_emoji: false; emoji_code: string}
-    | {is_realm_emoji: true; emoji_code?: undefined}
+    {is_realm_emoji: false; emoji_code: string} | {is_realm_emoji: true; emoji_code?: undefined}
 );
 
 export function remove_diacritics(s: string): string {
     const unicode_marks = /\p{M}/gu;
     return s.normalize("NFKD").replaceAll(unicode_marks, "");
+}
+
+export function contains_diacritics(s: string): boolean {
+    return remove_diacritics(s) !== s;
 }
 
 export function last_prefix_match(prefix: string, words: string[]): number | null {
@@ -104,11 +107,11 @@ export function query_matches_string_in_order(
     query: string,
     source_str: string,
     split_char: string,
+    should_remove_diacritics: boolean,
 ): boolean {
     query = query.toLowerCase();
     source_str = source_str.toLowerCase();
 
-    const should_remove_diacritics = /^[a-z]+$/.test(query);
     if (should_remove_diacritics) {
         source_str = remove_diacritics(source_str);
     }
@@ -202,21 +205,23 @@ export function query_matches_string_in_any_order(
     return true;
 }
 
-function clean_query(query: string): string {
-    query = remove_diacritics(query);
+function clean_query(query: string, should_remove_diacritics: boolean): string {
+    if (should_remove_diacritics) {
+        query = remove_diacritics(query);
+    }
     // When `abc ` with a space at the end is typed in
     // a content-editable widget such as the composebox
     // direct message section, the space at the end was
     // a `no break-space (U+00A0)` instead of `space (U+0020)`,
     // which lead to no matches in those cases.
-    query = query.replaceAll("\u00A0", " ");
+    query = query.replaceAll("\u{A0}", " ");
 
     return query;
 }
 
-export function clean_query_lowercase(query: string): string {
+export function clean_query_lowercase(query: string, remove_diacritics = true): string {
     query = query.toLowerCase();
-    query = clean_query(query);
+    query = clean_query(query, remove_diacritics);
     return query;
 }
 
@@ -229,13 +234,17 @@ export const parse_unicode_emoji_code = (code: string): string =>
 export function get_emoji_matcher(query: string): (emoji: EmojiSuggestion) => boolean {
     // replace spaces with underscores for emoji matching
     query = query.replaceAll(" ", "_");
-    query = clean_query_lowercase(query);
+    query = clean_query_lowercase(query, false);
+    const should_remove_diacritics = !contains_diacritics(query);
 
     return function (emoji) {
         const matches_emoji_literal =
             emoji.reaction_type === "unicode_emoji" &&
             parse_unicode_emoji_code(emoji.emoji_code) === query;
-        return matches_emoji_literal || query_matches_string_in_order(query, emoji.emoji_name, "_");
+        return (
+            matches_emoji_literal ||
+            query_matches_string_in_order(query, emoji.emoji_name, "_", should_remove_diacritics)
+        );
     };
 }
 

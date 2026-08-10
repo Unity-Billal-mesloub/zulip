@@ -42,6 +42,7 @@ from zerver.decorator import require_human_non_guest_user, require_realm_admin
 from zerver.forms import PASSWORD_TOO_WEAK_ERROR, CreateUserForm
 from zerver.lib.avatar import avatar_url, get_avatar_for_inaccessible_user, get_gravatar_url
 from zerver.lib.bot_config import set_bot_config
+from zerver.lib.demo_organizations import check_demo_organization_has_set_email
 from zerver.lib.email_validation import email_allowed_for_realm, validate_email_not_already_in_realm
 from zerver.lib.exceptions import (
     CannotDeactivateLastUserError,
@@ -73,7 +74,7 @@ from zerver.lib.typed_endpoint import (
 )
 from zerver.lib.typed_endpoint_validators import check_int_in_validator, check_url
 from zerver.lib.types import ProfileDataElementUpdateDict
-from zerver.lib.upload import upload_avatar_image
+from zerver.lib.upload import get_file_info, upload_avatar_image
 from zerver.lib.url_encoding import append_url_query_string
 from zerver.lib.user_groups import UserGroupMembershipDetails
 from zerver.lib.users import (
@@ -573,7 +574,8 @@ def patch_bot_backend(
         [user_file] = request.FILES.values()
         assert isinstance(user_file, UploadedFile)
         assert user_file.size is not None
-        upload_avatar_image(user_file, bot, content_type=user_file.content_type)
+        _filename, content_type = get_file_info(user_file)
+        upload_avatar_image(user_file, bot, content_type=content_type)
         avatar_source = UserProfile.AVATAR_FROM_USER
         do_change_avatar_fields(bot, avatar_source, acting_user=user_profile)
     else:
@@ -646,6 +648,9 @@ def add_bot_backend(
     service_name: str | None = None,
     short_name_raw: Annotated[str, ApiParamConfig("short_name")],
 ) -> HttpResponse:
+    if user_profile.realm.demo_organization_scheduled_deletion_date is not None:
+        check_demo_organization_has_set_email(user_profile.realm)
+
     if config_data is None:
         config_data = {}
     try:
@@ -662,7 +667,7 @@ def add_bot_backend(
     if bot_type != UserProfile.INCOMING_WEBHOOK_BOT:
         service_name = service_name or short_name
     full_name = check_full_name(
-        full_name_raw=full_name_raw, user_profile=user_profile, realm=user_profile.realm
+        full_name_raw=full_name_raw, user_profile=None, realm=user_profile.realm
     )
     form = CreateUserForm({"full_name": full_name, "email": email})
 
@@ -731,9 +736,8 @@ def add_bot_backend(
         [user_file] = request.FILES.values()
         assert isinstance(user_file, UploadedFile)
         assert user_file.size is not None
-        upload_avatar_image(
-            user_file, bot_profile, content_type=user_file.content_type, future=False
-        )
+        _filename, content_type = get_file_info(user_file)
+        upload_avatar_image(user_file, bot_profile, content_type=content_type, future=False)
 
     if bot_type in (UserProfile.OUTGOING_WEBHOOK_BOT, UserProfile.EMBEDDED_BOT):
         assert isinstance(service_name, str)
@@ -899,7 +903,7 @@ def create_user_backend(
         raise JsonableError(_("User not authorized to create users"))
 
     full_name = check_full_name(
-        full_name_raw=full_name_raw, user_profile=user_profile, realm=user_profile.realm
+        full_name_raw=full_name_raw, user_profile=None, realm=user_profile.realm
     )
     form = CreateUserForm({"full_name": full_name, "email": email})
     if not form.is_valid():

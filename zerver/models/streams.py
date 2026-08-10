@@ -48,7 +48,7 @@ class Stream(models.Model):
     subscriber_count = models.PositiveIntegerField(default=0, db_default=0)
 
     # Foreign key to the Recipient object for STREAM type messages to this stream.
-    recipient = models.ForeignKey(Recipient, null=True, on_delete=models.SET_NULL)
+    recipient = models.OneToOneField(Recipient, null=True, on_delete=models.SET_NULL)
 
     folder = models.ForeignKey(ChannelFolder, null=True, on_delete=models.SET_NULL)
 
@@ -117,6 +117,10 @@ class Stream(models.Model):
         "realm_default": None,
     }
     message_retention_days = models.IntegerField(null=True, default=None)
+
+    # When True, new subscriptions default to push_notifications=True instead of
+    # inheriting from the user's account-level default.
+    default_push_notifications = models.BooleanField(default=False, db_default=False)
 
     # on_delete field for group value settings is set to RESTRICT
     # because we don't want to allow deleting a user group in case it
@@ -267,6 +271,7 @@ class Stream(models.Model):
         "creator_id",
         "date_created",
         "deactivated",
+        "default_push_notifications",
         "description",
         "first_message_id",
         "folder_id",

@@ -7,10 +7,69 @@ contributors.
 
 ## Philosophy
 
-Zulip's coding philosophy is to **focus relentlessly on making the codebase
-easy to understand and difficult to make dangerous mistakes**. This applies
-equally to AI-generated contributions. Every change should make the codebase
-more maintainable and easier to read.
+Zulip is a team chat application used by thousands of organizations,
+built to last for many years. It is developed by a vibrant open-source
+community, with maintainers who have consistently emphasized **high
+standards for codebase readability, code review, commit discipline,
+debuggability, automated testing, tooling, documentation, and all the
+other subtle details that together determine whether software is easy
+to understand, operate, and modify**.
+
+Zulip's engineering strategy is to **"move quickly without breaking
+things"**. This is possible because the project has invested years in
+testing, tooling, code structure, documentation, and development
+practices that catch bugs systematically rather than relying on
+individual vigilance. Maintainers spend most of their review time on
+product decisions and code structure/readability, not on chasing
+correctness issues — because the process is designed to prevent them.
+
+This means Zulip's coding philosophy is to **focus relentlessly on
+making the codebase easy to understand and difficult to make dangerous
+mistakes**. This applies equally to AI-generated contributions. Every
+change should make the codebase more maintainable and easier to read.
+
+### No detail is too small
+
+Zulip holds itself to a high bar for polish because users depend on
+this software daily, and because the project is built to last for
+decades. There is no category of "minor issue" that is acceptable
+to ship — if something is broken in any context where a user would
+encounter it, it must be fixed before merging. The project's
+extensive investment in testing, tooling, and review processes exists
+precisely so that these issues get caught and fixed, not so that they
+can be classified as low-priority and deferred.
+
+This philosophy extends to every aspect of the product:
+
+- **Visual precision matters.** Alignment, spacing, colors, and font
+  sizes must be consistent with similar existing UI. When making CSS
+  changes, you must demonstrate with pixel-precise before/after
+  comparisons that there are no unintended side effects.
+- **Every state matters.** UI must look correct in all its states:
+  hover, active, disabled, focused, selected, empty, overflowing.
+  Changes that could plausibly affect colors, contrast, or
+  theme-dependent imagery must work in both light and dark themes;
+  changes whose effect can't reasonably vary with theme (pure
+  geometry/typography — `font-size`, `line-height`, `margin`,
+  `padding`, `display`, `font-weight`, etc.) only need a single
+  theme verified.
+- **Every window size matters.** UI must look good from wide desktop
+  (1920px) down to narrow phone screens (480px).
+- **Every language matters.** Translated strings can be 1.5x longer
+  than English or half as short. UI must handle both extremes without
+  breaking layout. Think about right-to-left languages too.
+- **Every interaction path matters.** Keyboard navigation, screen
+  readers, permission levels, feature interactions (banners
+  overlapping, resolved topics, muted messages), and edge cases in
+  data (empty lists, very long names, single items vs. many) must all
+  be considered.
+
+The right attitude is: "What could go wrong, and how do I verify that
+it doesn't?" not "It looks fine to me." **What isn't tested probably
+doesn't work** — this applies to visual changes just as much as to
+backend logic.
+
+### Understand before coding
 
 Before writing any code, you must understand:
 
@@ -63,11 +122,25 @@ Structure changes as clean commits:
 - Backend and API changes (with tests and API doc changes documented
   fully using our double-entry changelog system). When starting an API
   change, reread `docs/documentation/api.md` to review the process for
-  documenting an API change. You'll run `tools/create-api-changelog`
-  to create an `api_docs/unmerged.d/ZF-RANDOM.md` file. Never update
-  `API_FEATURE_LEVEL` manually. **Changes** entries should use the
-  "New in Zulip 12.0 (Feature level RANDOM)" pattern, which will be
-  replaced with the final feature level when the changes are merged.
+  documenting an API change. Run `tools/create-api-changelog`; it
+  generates an empty `api_docs/unmerged.d/ZF-XXXXXX.md` file (where
+  `XXXXXX` is a random hex string the tool picks for you) and stages
+  it for you. Document the changes in that file with the header
+  `**Feature level ZF-XXXXXX**` and an unordered list (`*` bullets)
+  of the additions or changes, formatted to match `api_docs/changelog.md`.
+  In the OpenAPI yaml (`zerver/openapi/zulip.yaml`), reference the same
+  filename stem in **Changes** notes, e.g.,
+  `**Changes**: New in Zulip 13.0 (feature level ZF-XXXXXX).` The merge
+  process matches the `Zulip <version> (feature level ZF-XXXXXX)` shape
+  and overwrites both the version and the placeholder with the real
+  release version and final feature level. Use the upcoming release's
+  version — the next major release after the latest one shipped (e.g.,
+  13.0 while 12.0 is the current release), which you can read from the
+  first `## Changes in Zulip X.Y` heading in `api_docs/changelog.md`.
+  You must keep the literal `New in Zulip X.Y` format, or the merge
+  tooling won't recognize the note and CI (`check-feature-level-updated`)
+  will fail with the `ZF-` placeholder still in the file. Never update
+  `API_FEATURE_LEVEL` manually.
 - Frontend UI changes (with tests and user-facing documentation
   updates). Remember to plan to use your visual test skill to check
   your work whenever you change web app code (HTML, CSS, JS).
@@ -114,7 +187,21 @@ Zulip has over 185,000 words of developer documentation. Before working on any a
 - Prefer writing code that is readable without explanation over heavily
   commented code using clever tricks. Comments should explain "why" when
   the reason isn't obvious, not narrate "what" the code does.
+- Use `em` units instead of `px` for computed CSS values that need to
+  scale with font size. Pixel approximations break at different zoom
+  levels and font-size settings.
 - Comments should have a line to themself except for CSS px math.
+- **Review CSS for redundant rules.** After writing CSS, review the
+  full set of rules affecting the same elements. Look for rules that
+  are immediately overridden by a more specific selector, duplicated
+  selector lists, or cases where scoping (e.g., `:not()`) would
+  eliminate the need for an override.
+- **Check CSS change scope.** When modifying CSS, always check what
+  other pages or components use the same selectors, files, and
+  classes. Use `git grep` on class names and check webpack bundle
+  entries to understand which pages load the file. Prefer scoped
+  overrides (e.g., `.parent .target`) over modifying shared rules,
+  to avoid unintended changes to other parts of the app.
 
 See: https://zulip.readthedocs.io/en/latest/contributing/code-style.html
 
@@ -138,7 +225,12 @@ coherent idea."** This is non-negotiable.
 - Mix multiple separable changes in a single commit.
 - Create a commit that "fixes" a mistake from an earlier commit in the same PR;
   always edit Git to fix the original commit.
+- Add content in one commit only to remove or move it in the next;
+  plan upfront what belongs where and do it right the first time.
 - Include debugging code, commented-out code, or temporary TODOs.
+- Leave commits that break if a later commit in the PR is dropped.
+  When a commit is flagged as potentially droppable, verify all
+  earlier commits work correctly without it.
 
 ### Commit Message Format
 
@@ -171,6 +263,8 @@ Fixes #123.
 
 - `Fixes #123.` - Automatically closes the issue
 - `Fixes part of #123.` - Does not close (for partial fixes)
+- In a multi-commit PR, use `Fixes part of #123.` in earlier commits
+  and `Fixes #123.` in the final commit.
 - Never: `Partially fixes #123.` (GitHub ignores "partially")
 
 ### Rebasing Commits (Non-Interactive)
@@ -178,7 +272,11 @@ Fixes #123.
 Since `git rebase -i` requires an interactive editor, use
 `GIT_SEQUENCE_EDITOR` to supply the todo list via a script:
 
-1. **Squashing fixups into existing commits:** Create fixup commits with
+1. **Updating the HEAD commit:** If the commit you need to modify is
+   already at HEAD, just use `git commit --amend` directly. The
+   fixup+rebase workflow below is only needed for non-HEAD commits.
+
+2. **Squashing fixups into existing commits:** Create fixup commits with
    `git commit --fixup=<target-hash>`, then write a shell script that
    outputs the desired todo (with `pick` and `fixup` lines in order)
    and run:
@@ -190,12 +288,17 @@ Since `git rebase -i` requires an interactive editor, use
    Note: `--autosquash` alone without `-i` does **not** reorder or
    squash anything.
 
-2. **Rewording commit messages:** In the todo script, use `exec` lines:
+3. **Rewording commit messages:** Use `git format-patch` to export
+   commits as patch files, edit the message headers in the patch
+   files, then reapply:
+
+   ```bash
+   git format-patch <base> -o /tmp/patches/
+   # Edit the commit message in each /tmp/patches/000N-*.patch file
+   # (the message is between the Subject: line and the --- line)
+   git reset --hard <base>
+   git am /tmp/patches/*.patch
    ```
-   pick <hash> Original message
-   exec GIT_EDITOR=/path/to/new-msg-script.sh git commit --amend
-   ```
-   where the message script writes the new commit message to `$1`.
 
 ## Testing Requirements
 
@@ -237,22 +340,37 @@ tests.
 ### Manual Testing for UI Changes
 
 If a PR makes frontend changes, manually verify the affected UI. This
-catches issues that automated tests miss:
+catches issues that automated tests miss. **Treat this checklist as
+blocking, not advisory** — every applicable item must be verified
+before the change is ready.
 
 **Visual appearance:**
 
 - Is the new UI consistent with similar elements (fonts, colors, sizes)?
-- Is alignment correct, both vertically and horizontally?
+  Find the closest existing analogues and compare carefully.
+- Is alignment correct, both vertically and horizontally? Measure
+  programmatically with `getBoundingClientRect()` when in doubt —
+  don't eyeball it.
 - Do clickable elements have hover behavior consistent with similar UI?
 - If elements can be disabled, does the disabled state look right?
 - Did the change accidentally affect other parts of the UI? Use
-  `git grep` to check if modified CSS is used elsewhere.
-- Check all of the above in both light and dark themes.
+  `git grep` to check if modified CSS is used elsewhere. CSS changes
+  are notorious for unintended consequences — check every page and
+  component that shares the selectors you modified.
+- Check all of the above in both light and dark themes when the
+  change could plausibly affect colors, contrast, or theme-dependent
+  imagery. Pure geometry/typography changes (`font-size`,
+  `line-height`, `margin`, `padding`, `display`, `font-weight`,
+  etc.) don't need a separate dark-theme pass —
+  `web/styles/dark_theme.css` only overrides colors, so a single
+  theme suffices for theme-invariant changes.
 
 **Responsiveness and internationalization:**
 
-- Does the UI look good at different window sizes, including mobile?
-- Would the UI break if translated strings were 1.5x longer than English?
+- Does the UI look good at different window sizes? Check wide desktop
+  (1920px), typical laptop (1280px), tablet, and narrow phone (480px).
+- Would the UI break if translated strings were 1.5x longer than
+  English? What if they were half as long? Both directions matter.
 
 **Functionality:**
 
@@ -266,6 +384,35 @@ catches issues that automated tests miss:
   has permissions and one who does not.
 - Think about feature interactions: could banners overlap? What about
   resolved/unresolved topics? Collapsed or muted messages?
+- Think about edge cases in data: empty lists, very long names, single
+  items vs. hundreds, special characters in strings.
+
+### Puppeteer Visual Tests: Verifying Alignment
+
+When using Puppeteer to verify visual alignment, do not rely on
+eyeballing screenshots — especially small full-page ones. Instead:
+
+- Use `page.evaluate()` with `getBoundingClientRect()` to measure
+  actual pixel positions of the elements you need aligned, and print
+  them to the console. Compare the numbers.
+- Always take **both** a full-page screenshot and a zoomed clip of
+  the area of interest.
+- For zoomed clips, calculate the clip region from non-fixed elements;
+  fixed/sticky elements may report bounding-box positions that don't
+  match their visual location on the page.
+- Be aware that CSS nesting can scope styles to a specific parent
+  (e.g., `.parent .my-class`) — reusing the same class name in a
+  different context may not pick up the expected styles.
+- To verify keyboard-focus styles, use real keyboard navigation
+  (`page.keyboard.press`); programmatic `.focus()` doesn't reliably
+  trigger `:focus-visible` and may be overridden by view-level focus
+  management.
+- Focus rings drawn as `::before` / `::after` pseudo-elements aren't
+  visible in `getComputedStyle` of the focused element — verify them
+  in a screenshot, not via computed styles.
+- For visual changes, produce before/after screenshot pairs by writing
+  one test and running it twice with a `SCREENSHOT_SUFFIX` env var
+  (`-old` on `main`, `-updated` on your branch).
 
 ## Self-Review Checklist
 
@@ -292,6 +439,18 @@ follow's Zulip's guidelines once you finish preparing a series of
 commits.
 
 ## Common Pitfalls
+
+### Treating Known Issues as Acceptable
+
+A common failure mode is discovering a problem during verification
+and then noting it as a known limitation rather than fixing it. At
+Zulip, there is no category of "known minor issue" that is acceptable
+to ship. If it's broken in any state, size, theme, or language, it
+needs to be fixed.
+
+**Mitigation:** When you find any issue during verification, fix it
+before presenting the work. If a fix would require a design decision,
+raise it as a question rather than shipping the broken state.
 
 ### Overconfident Code Generation
 
@@ -340,6 +499,10 @@ faster and easier to just plan and write them well the first time.
 - Don't use `cursor.execute()` with string formatting (SQL injection risk)
 - Don't use `.extra()` in Django without careful review and commenting
 - Don't use `onclick` attributes in HTML; use event delegation
+- Don't access DOM APIs (`document.documentElement.style`, `$()`
+  selectors for specific elements) without guarding for node test
+  environments, where the DOM is mocked minimally. Check that the
+  element exists before using it.
 - Don't create N+1 query patterns:
 
   ```python
@@ -351,12 +514,20 @@ faster and easier to just plan and write them well the first time.
   foos = {f.id: f for f in Foo.objects.filter(id__in=[b.foo_id for b in bars])}
   ```
 
+- In tests, don't assert on `assertLogs` output with
+  `any(phrase in line for line in mock_log.output)`; pin the full line
+  against `mock_log.output`, or a substring to a specific `mock_log.output[i]`.
+
 ### Process:
 
 - Always check if you're working on top of the latest upstream/main, and
   fetch + rebase when starting a project so you're not using a stale branch.
   If you're continuing a project, start by rebasing, resolving merge
   conflicts carefully.
+- Don't make design or UX decisions silently. When a technical
+  constraint forces a tradeoff, present the constraint and options
+  to the user rather than picking one. Never remove features, hide
+  UI elements, or change interaction patterns without asking.
 - Don't submit code you haven't tested
 - Don't skip becoming familiar with the code you're modifying
 - Don't make claims about code behavior without verification, and
@@ -369,6 +540,10 @@ faster and easier to just plan and write them well the first time.
 ## Pull Request Guidelines
 
 ### PR Description Should:
+
+When opening a pull request, prefix the PR title with `[ai]` (e.g.,
+`[ai] compose: Fix cursor position after emoji insertion.`). Use
+`upstream/main` as the base branch.
 
 Output the PR description in a markdown code block so that formatting
 (bold, headers, checkboxes, etc.) copy-pastes correctly into GitHub.
@@ -396,11 +571,12 @@ Output the PR description in a markdown code block so that formatting
 Recommend pausing for discussion when:
 
 - The approach involves security-sensitive code
-- Database migrations are needed
+- Database migrations are needed (See `docs/subsystems/schema-migrations.md`).
 - The change affects many files (>10)
 - Performance implications are unclear
 - The feature design isn't fully specified
 - The API or data model design isn't fully specified
+- An API change may not be compatible (See `docs/processes/api-design.md`).
 - Existing tests are failing for unclear reasons
 
 ## Task-Specific Approaches
@@ -433,6 +609,13 @@ Recommend pausing for discussion when:
 6. Verify completeness: use `git grep` to find all occurrences and
    confirm nothing was missed
 
+When removing a CSS dependency (e.g., Bootstrap), audit the full
+property list of every rule, not just visually obvious properties like
+colors and backgrounds. Subtle properties like `line-height`, `margin`,
+`padding`, `text-decoration`, `font-weight`, and `border` are easy to
+miss but cause visible regressions. Check inherited properties too —
+e.g., a `body` rule's `line-height` or `margin` affects all descendants.
+
 ## Key Documentation Links
 
 - Contributing guide: https://zulip.readthedocs.io/en/latest/contributing/contributing.html
@@ -464,29 +647,11 @@ docs/             # ReadTheDocs documentation source
 
 ## Help Center Documentation
 
-Help center articles are MDX files in `starlight_help/src/content/docs/`.
-Images go in `starlight_help/src/images`. Include files go in the `include/`
-subdirectory with an `_` prefix (e.g., `_AdminOnly.mdx`). New articles need
-a sidebar entry in `starlight_help/astro.config.mjs`.
-
-See `docs/documentation/helpcenter.md` for the full writing guide. Key points:
-
-- **Bold** UI element names (e.g., **Settings** page, **Save changes** button).
-- Do not specify default values or list out options in instructions — the user
-  can see them in the UI.
-- Do not use "we" to refer to Zulip; use "you" for the reader.
-- Fewer words is better; many users have English as a second language.
-- Use `<kbd>Enter</kbd>` for keyboard keys (non-Mac; auto-translated for Mac).
-- Common components and their imports:
-  ```
-  import {Steps, TabItem, Tabs} from "@astrojs/starlight/components";
-  import FlattenedSteps from "../../components/FlattenedSteps.astro";
-  import NavigationSteps from "../../components/NavigationSteps.astro";
-  import ZulipTip from "../../components/ZulipTip.astro";
-  import ZulipNote from "../../components/ZulipNote.astro";
-  import AdminOnly from "../include/_AdminOnly.mdx";
-  import SaveChanges from "../include/_SaveChanges.mdx";
-  ```
+When making any user-facing change, **read
+`docs/documentation/helpcenter.md`** in full and review the relevant
+help center articles under `starlight_help/src/content/docs/` for any
+updates that should be made. The writing guide there is the source
+of truth for help center conventions, components, and structure.
 
 ## Zulip Chat Links
 

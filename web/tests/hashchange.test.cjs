@@ -2,10 +2,11 @@
 
 const assert = require("node:assert/strict");
 
+const {make_stream} = require("./lib/example_stream.cjs");
 const {mock_esm, set_global, zrequire} = require("./lib/namespace.cjs");
 const {run_test, noop} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 const {page_params} = require("./lib/zpage_params.cjs");
 
 let $window_stub;
@@ -25,6 +26,7 @@ const settings = mock_esm("../src/settings");
 mock_esm("../src/settings_data", {
     user_can_create_public_streams: () => true,
 });
+const sidebar_ui = mock_esm("../src/sidebar_ui");
 const spectators = mock_esm("../src/spectators", {
     login_to_access() {},
 });
@@ -46,12 +48,12 @@ const user_settings = {};
 initialize_user_settings({user_settings});
 
 const devel_id = 100;
-const devel = {
+const devel = make_stream({
     name: "devel",
     stream_id: devel_id,
     color: "blue",
     subscribed: true,
-};
+});
 stream_data.add_sub_for_tests(devel);
 
 run_test("terms_round_trip", () => {
@@ -87,10 +89,10 @@ run_test("terms_round_trip", () => {
 
     // test new encodings, where we have a stream id
     const florida_id = 987;
-    const florida_stream = {
+    const florida_stream = make_stream({
         name: "Florida, USA",
         stream_id: florida_id,
-    };
+    });
     stream_data.add_sub_for_tests(florida_stream);
     terms = [{operator: "channel", operand: florida_id.toString()}];
     hash = hash_util.search_terms_to_hash(terms);
@@ -199,6 +201,10 @@ run_test("hash_interactions", ({override, override_rewire}) => {
     override(popovers, "hide_all", () => {
         hide_all_called = true;
     });
+    let sidebar_hide_all_called = false;
+    override(sidebar_ui, "hide_all", () => {
+        sidebar_hide_all_called = true;
+    });
     window.location.hash = "#unknown_hash";
 
     browser_history.clear_for_testing();
@@ -206,6 +212,7 @@ run_test("hash_interactions", ({override, override_rewire}) => {
     // If it's an unknown hash it should show the home view.
     assert.equal(recent_view_ui_shown, true);
     assert.equal(hide_all_called, true);
+    assert.equal(sidebar_hide_all_called, true);
     helper.assert_events([
         [overlays, "close_for_hash_change"],
         [message_viewport, "stop_auto_scrolling"],
@@ -213,10 +220,12 @@ run_test("hash_interactions", ({override, override_rewire}) => {
 
     window.location.hash = "#feed";
     hide_all_called = false;
+    sidebar_hide_all_called = false;
 
     helper.clear_events();
     $window_stub.trigger("hashchange");
     assert.equal(hide_all_called, true);
+    assert.equal(sidebar_hide_all_called, true);
     helper.assert_events([
         [overlays, "close_for_hash_change"],
         [message_viewport, "stop_auto_scrolling"],
@@ -245,11 +254,13 @@ run_test("hash_interactions", ({override, override_rewire}) => {
     assert.equal(window.location.hash, "#recent");
 
     const denmark_id = 1;
-    stream_data.add_sub_for_tests({
-        subscribed: true,
-        name: "Denmark",
-        stream_id: denmark_id,
-    });
+    stream_data.add_sub_for_tests(
+        make_stream({
+            subscribed: true,
+            name: "Denmark",
+            stream_id: denmark_id,
+        }),
+    );
     window.location.hash = "#narrow/channel/Denmark";
 
     helper.clear_events();
@@ -374,6 +385,12 @@ run_test("hash_interactions", ({override, override_rewire}) => {
         [admin, "launch", ["users", "active"]],
     ]);
 
+    let fixed_url;
+    override(history, "replaceState", (_state, _title, url) => {
+        fixed_url = url;
+        window.location.hash = new URL(url).hash;
+    });
+
     window.location.hash = "#organization/user-list-admin";
 
     // Check whether `user-list-admin` is redirect to `users`, we
@@ -382,6 +399,7 @@ run_test("hash_interactions", ({override, override_rewire}) => {
     // the arguments passed to `admin.launch`.
     helper.clear_events();
     $window_stub.trigger("hashchange");
+    assert.equal(fixed_url, "http://zulip.zulipdev.com/#organization/users/active");
     helper.assert_events([
         [overlays, "close_for_hash_change"],
         [settings, "build_page"],
@@ -429,6 +447,7 @@ run_test("update_hash_to_match_filter", ({override, override_rewire}) => {
 run_test("fail_incorrectly_cased_URL", ({override, override_rewire}) => {
     browser_history.clear_for_testing();
     override(popovers, "hide_all", noop);
+    override(sidebar_ui, "hide_all", noop);
     const helper = test_helper({override, override_rewire, change_tab: false});
 
     // We can receive URLs which contain operators that

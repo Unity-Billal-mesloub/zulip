@@ -1,10 +1,12 @@
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
+import assert from "minimalistic-assert";
 
 import render_left_sidebar from "../templates/left_sidebar.hbs";
 import render_buddy_list_popover from "../templates/popovers/buddy_list_popover.hbs";
 import render_right_sidebar from "../templates/right_sidebar.hbs";
 
+import * as blueslip from "./blueslip.ts";
 import {buddy_list} from "./buddy_list.ts";
 import * as channel from "./channel.ts";
 import * as compose_ui from "./compose_ui.ts";
@@ -15,7 +17,6 @@ import {ListCursor} from "./list_cursor.ts";
 import {localstorage} from "./localstorage.ts";
 import * as message_lists from "./message_lists.ts";
 import * as message_reminder from "./message_reminder.ts";
-import * as message_viewport from "./message_viewport.ts";
 import {page_params} from "./page_params.ts";
 import * as pm_list from "./pm_list.ts";
 import * as popover_menus from "./popover_menus.ts";
@@ -36,6 +37,25 @@ import * as util from "./util.ts";
 const LEFT_SIDEBAR_NAVIGATION_AREA_TITLE = $t({defaultMessage: "VIEWS"});
 
 export let left_sidebar_cursor: ListCursor<JQuery>;
+
+// Toggling a sidebar changes the message feed's width, causing rows to
+// reflow and shift vertically. Preserve the selected row's viewport
+// offset across the layout change to keep the user's reading position
+// stable.
+function toggle_sidebar_preserving_selected_row_offset(classname: string): void {
+    let saved_selected_row_offset: number | undefined;
+    if (message_lists.current !== undefined) {
+        const $selected_row = message_lists.current.selected_row();
+        if ($selected_row.length > 0) {
+            saved_selected_row_offset = $selected_row.get_offset_to_window().top;
+        }
+    }
+    $("body").toggleClass(classname);
+    if (saved_selected_row_offset !== undefined) {
+        assert(message_lists.current !== undefined);
+        message_lists.current.view.set_message_offset(saved_selected_row_offset);
+    }
+}
 
 function save_sidebar_toggle_status(): void {
     const ls = localstorage();
@@ -65,10 +85,26 @@ export function restore_sidebar_toggle_status(): void {
 export let left_sidebar_expanded_as_overlay = false;
 export let right_sidebar_expanded_as_overlay = false;
 
+export function update_sidebar_aria_expanded(): void {
+    // Reflect current sidebar visibility on the toggle buttons. State is
+    // tracked differently per viewport: at wide viewports the body's
+    // hide-*-sidebar classes are authoritative; at narrow viewports the
+    // overlay flags are.
+    const left_expanded = ui_util.matches_viewport_state("gte_md_min")
+        ? !$("body").hasClass("hide-left-sidebar")
+        : left_sidebar_expanded_as_overlay;
+    const right_expanded = ui_util.matches_viewport_state("gte_xl_min")
+        ? !$("body").hasClass("hide-right-sidebar")
+        : right_sidebar_expanded_as_overlay;
+    $(".left-sidebar-toggle-button").attr("aria-expanded", String(left_expanded));
+    $("#userlist-toggle-button").attr("aria-expanded", String(right_expanded));
+}
+
 export function hide_userlist_sidebar(): void {
     const $userlist_sidebar = $(".app-main .column-right");
     $userlist_sidebar.removeClass("expanded topmost-overlay");
     right_sidebar_expanded_as_overlay = false;
+    update_sidebar_aria_expanded();
 }
 
 export function show_userlist_sidebar(): void {
@@ -82,6 +118,7 @@ export function show_userlist_sidebar(): void {
     if (ui_util.matches_viewport_state("gte_xl_min")) {
         $("body").removeClass("hide-right-sidebar");
         fix_invite_user_button_flicker();
+        update_sidebar_aria_expanded();
         return;
     }
 
@@ -93,6 +130,7 @@ export function show_userlist_sidebar(): void {
     fix_invite_user_button_flicker();
     resize.resize_page_components();
     right_sidebar_expanded_as_overlay = true;
+    update_sidebar_aria_expanded();
 }
 
 export function show_streamlist_sidebar(): void {
@@ -106,6 +144,7 @@ export function show_streamlist_sidebar(): void {
     }
     resize.resize_stream_filters_container();
     left_sidebar_expanded_as_overlay = true;
+    update_sidebar_aria_expanded();
 }
 
 // We use this to display left sidebar without setting
@@ -120,6 +159,7 @@ export function show_left_sidebar(): void {
         show_streamlist_sidebar();
     } else if (!left_sidebar_expanded_as_overlay) {
         $("body").removeClass("hide-left-sidebar");
+        update_sidebar_aria_expanded();
     }
 }
 
@@ -128,6 +168,7 @@ export function hide_streamlist_sidebar(): void {
     $(".app-main .column-left, #navbar-middle").removeClass("expanded");
     $streamlist_sidebar.removeClass("topmost-overlay");
     left_sidebar_expanded_as_overlay = false;
+    update_sidebar_aria_expanded();
 }
 
 export function any_sidebar_expanded_as_overlay(): boolean {
@@ -166,14 +207,14 @@ export function initialize(): void {
     $("body").on("click", ".login_button", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        window.location.href = spectators.build_login_link();
+        window.location.assign(spectators.build_login_link());
     });
 
     $("body").on("keydown", ".login_button", (e) => {
         if (e.key === "Enter") {
             e.preventDefault();
             e.stopPropagation();
-            window.location.href = spectators.build_login_link();
+            window.location.assign(spectators.build_login_link());
         }
     });
 
@@ -182,7 +223,7 @@ export function initialize(): void {
         e.stopPropagation();
 
         if (ui_util.matches_viewport_state("gte_xl_min")) {
-            $("body").toggleClass("hide-right-sidebar");
+            toggle_sidebar_preserving_selected_row_offset("hide-right-sidebar");
             if (!$("body").hasClass("hide-right-sidebar")) {
                 fix_invite_user_button_flicker();
             }
@@ -193,6 +234,7 @@ export function initialize(): void {
                 "#message-formatting-controls-container",
             );
             save_sidebar_toggle_status();
+            update_sidebar_aria_expanded();
             return;
         }
 
@@ -208,15 +250,7 @@ export function initialize(): void {
         e.stopPropagation();
 
         if (ui_util.matches_viewport_state("gte_md_min")) {
-            $("body").toggleClass("hide-left-sidebar");
-            if (
-                message_lists.current !== undefined &&
-                !ui_util.matches_viewport_state("gte_xl_min")
-            ) {
-                // We expand the middle column width between md and xl breakpoints when the
-                // left sidebar is hidden. This can cause the pointer to move out of view.
-                message_viewport.scroll_to_selected();
-            }
+            toggle_sidebar_preserving_selected_row_offset("hide-left-sidebar");
             // We recheck the scrolling-button status of the compose
             // box, which may change for users who've chosen to
             // use full width on wide screens.
@@ -224,6 +258,7 @@ export function initialize(): void {
                 "#message-formatting-controls-container",
             );
             save_sidebar_toggle_status();
+            update_sidebar_aria_expanded();
             return;
         }
 
@@ -233,6 +268,11 @@ export function initialize(): void {
         }
         show_streamlist_sidebar();
     });
+
+    // Set initial state once handlers are registered, since the
+    // template defaults to aria-expanded="true" but the actual state
+    // depends on viewport and restored localStorage settings.
+    update_sidebar_aria_expanded();
 
     // Hide left / right sidebar on click outside.
     document.addEventListener(
@@ -401,14 +441,39 @@ export function initialize_right_sidebar(): void {
         },
     );
 
+    $("#buddy-list-users-matching-view-container").on(
+        "keydown",
+        ".buddy-list-section-toggle",
+        (e) => {
+            if (keydown_util.is_enter_event(e)) {
+                e.stopPropagation();
+                buddy_list.toggle_users_matching_view_section();
+            }
+        },
+    );
+
     $("#buddy-list-participants-container").on("click", ".buddy-list-subsection-header", (e) => {
         e.stopPropagation();
         buddy_list.toggle_participants_section();
     });
 
+    $("#buddy-list-participants-container").on("keydown", ".buddy-list-section-toggle", (e) => {
+        if (keydown_util.is_enter_event(e)) {
+            e.stopPropagation();
+            buddy_list.toggle_participants_section();
+        }
+    });
+
     $("#buddy-list-other-users-container").on("click", ".buddy-list-subsection-header", (e) => {
         e.stopPropagation();
         buddy_list.toggle_other_users_section();
+    });
+
+    $("#buddy-list-other-users-container").on("keydown", ".buddy-list-section-toggle", (e) => {
+        if (keydown_util.is_enter_event(e)) {
+            e.stopPropagation();
+            buddy_list.toggle_other_users_section();
+        }
     });
 
     function close_buddy_list_popover(): void {
@@ -418,33 +483,37 @@ export function initialize_right_sidebar(): void {
         }
     }
 
-    popover_menus.register_popover_menu("#buddy-list-menu-icon", {
-        theme: "popover-menu",
-        placement: "right",
-        onCreate(instance) {
-            popover_menus.popover_instances.buddy_list = instance;
-            instance.setContent(
-                ui_util.parse_html(
-                    render_buddy_list_popover({
-                        display_style_options: settings_config.user_list_style_values,
-                        can_invite_users:
-                            settings_data.user_can_invite_users_by_email() ||
-                            settings_data.user_can_create_multiuse_invite(),
-                    }),
-                ),
-            );
+    popover_menus.register_popover_menu(
+        "#buddy-list-menu-icon",
+        {
+            theme: "popover-menu",
+            placement: "right",
+            onCreate(instance) {
+                popover_menus.popover_instances.buddy_list = instance;
+                instance.setContent(
+                    ui_util.parse_html(
+                        render_buddy_list_popover({
+                            display_style_options: settings_config.user_list_style_values,
+                            can_invite_users:
+                                settings_data.user_can_invite_users_by_email() ||
+                                settings_data.user_can_create_multiuse_invite(),
+                        }),
+                    ),
+                );
+            },
+            onMount() {
+                const current_user_list_style =
+                    settings_preferences.user_settings_panel.settings_object.user_list_style;
+                $("#buddy-list-actions-menu-popover")
+                    .find(`.user_list_style_choice[value=${current_user_list_style}]`)
+                    .prop("checked", true);
+            },
+            onHidden() {
+                close_buddy_list_popover();
+            },
         },
-        onMount() {
-            const current_user_list_style =
-                settings_preferences.user_settings_panel.settings_object.user_list_style;
-            $("#buddy-list-actions-menu-popover")
-                .find(`.user_list_style_choice[value=${current_user_list_style}]`)
-                .prop("checked", true);
-        },
-        onHidden() {
-            close_buddy_list_popover();
-        },
-    });
+        {also_trigger_on_enter: true},
+    );
 
     $("body").on(
         "click",
@@ -475,7 +544,7 @@ function get_header_rows_selectors(): string {
         // Views header.
         "#left-sidebar-navigation-area:not(.hidden-by-filters) #views-label-container, " +
         // DM Headers
-        "#left_sidebar_scroll_container:not(.direct-messages-hidden-by-filters) #direct-messages-section-header, " +
+        "#left-sidebar:not(.direct-messages-hidden-by-filters) #direct-messages-section-header, " +
         // All channel headers.
         ".stream-list-section-container:not(.no-display) .stream-list-subsection-header"
     );
@@ -505,21 +574,51 @@ function all_rows(): JQuery {
     const $collapsed_channels = $(
         ".stream-list-section-container.collapsed .narrow-filter:not(.stream-expanded) .bottom_left_row",
     );
-    const $hidden_topic_rows = $(
-        ".stream-list-section-container.collapsed .topic-list-item:not(.active-sub-filter).bottom_left_row",
-    );
 
     // Exclude toggle inactive / muted channels row from the list of rows if user is searching.
     const $toggle_inactive_or_muted_channels_row = $(
         "#streams_list.is_searching .stream-list-toggle-inactive-or-muted-channels.bottom_left_row",
     );
 
-    return $all_rows
+    // Exclude the topic-search hint row when it's hidden; when shown,
+    // it should be a navigable row.
+    const $hidden_topic_search_hint_row = $(
+        "#left-sidebar-topic-search-hint.hidden .left-sidebar-topic-search-hint-link",
+    );
+
+    const $filtered_rows = $all_rows
         .not($inactive_or_muted_rows)
         .not($collapsed_views)
         .not($collapsed_channels)
-        .not($hidden_topic_rows)
-        .not($toggle_inactive_or_muted_channels_row);
+        .not($toggle_inactive_or_muted_channels_row)
+        .not($hidden_topic_search_hint_row);
+
+    // With a "topic:" prefix search, keyboard navigation only lands on
+    // topic rows, not channel header rows.
+    if (ui_util.is_topic_search()) {
+        return $filtered_rows.not("#stream_filters .channel-header.bottom_left_row");
+    }
+
+    return $filtered_rows;
+}
+
+const TOPIC_SEARCH_HINT_MIN_LENGTH = 2;
+
+function should_show_topic_search_hint(search_term: string): boolean {
+    // Once the user is already searching with the "topic:" prefix,
+    // topic-search results are visible and the hint is no longer
+    // useful. Otherwise, surface the hint as soon as the user has
+    // typed enough that they might want to expand the search.
+    return search_term.length >= TOPIC_SEARCH_HINT_MIN_LENGTH && !ui_util.is_topic_search();
+}
+
+function initiate_topic_search(): void {
+    const $search_input = $<HTMLInputElement>("input.left-sidebar-search-input").expectOne();
+    const current_value = ($search_input.val() ?? "").trim();
+    const new_value = ui_util.TOPIC_SEARCH_PREFIX + " " + current_value;
+    $search_input.val(new_value);
+    util.the($search_input).setSelectionRange(new_value.length, new_value.length);
+    $search_input.trigger("focus").trigger("input");
 }
 
 class LeftSidebarListCursor extends ListCursor<JQuery> {
@@ -545,6 +644,14 @@ export function initialize_left_sidebar_cursor(): void {
                     return undefined;
                 }
                 const $non_header_rows = $all_rows.not($(get_header_rows_selectors()));
+                // Prefer landing on a real result row first; fall
+                // back to the topic-search hint only when there are
+                // no other matches, so the hint never steals initial
+                // highlight from matching channels or topics.
+                const $non_hint_rows = $non_header_rows.not(".left-sidebar-topic-search-hint-link");
+                if ($non_hint_rows.length > 0) {
+                    return $non_hint_rows.first();
+                }
                 return $non_header_rows.first();
             },
             next_key($key) {
@@ -603,6 +710,13 @@ function actually_update_left_sidebar_for_search(): void {
     stream_list.update_streams_sidebar();
 
     resize.resize_page_components();
+    const show_topic_search_hint = should_show_topic_search_hint(search_value);
+    if (show_topic_search_hint) {
+        $(".left-sidebar-topic-search-hint-label").text(
+            $t({defaultMessage: "Search all topics for ‘{query}’"}, {query: search_value}),
+        );
+    }
+    $("#left-sidebar-topic-search-hint").toggleClass("hidden", !show_topic_search_hint);
     left_sidebar_cursor.reset();
     $("#left-sidebar-empty-list-message").toggleClass(
         "hidden",
@@ -639,6 +753,111 @@ const update_left_sidebar_for_search = _.throttle(() => {
     }
 }, 50);
 
+function focus_left_sidebar_row($row: JQuery): void {
+    // For header rows, focus the section toggle icon.
+    if ($row.hasClass("left-sidebar-section-header")) {
+        util.the($row.find(".sidebar-heading-icon")).focus({preventScroll: true});
+        return;
+    }
+    // For focusable rows, either they have an <a> tag that gets
+    // focus, or a tabindex="0" label directly on them. Determine
+    // which case we're in and focus the appropriate element.
+    const $link = $row.find("a");
+    if ($link.length > 0) {
+        util.the($link).focus({preventScroll: true});
+    } else if (util.the($row).tabIndex === 0) {
+        util.the($row).focus({preventScroll: true});
+    } else {
+        blueslip.error("Left sidebar row has no focusable child", {
+            class: util.the($row).className,
+        });
+    }
+}
+
+// Given the currently-focused element and arrow-key direction, return the row
+// we should land on, or undefined to do nothing. The returned row is where we
+// sync the cursor; if focus was already in a navigable row, we sync to it and
+// then step one further in `direction`.
+function resolve_left_sidebar_arrow_target(
+    $active: JQuery,
+    direction: "up" | "down",
+): JQuery | undefined {
+    const $row = $active.closest(".top_left_row, .bottom_left_row, .left-sidebar-section-header");
+    if ($row.length > 0) {
+        // Focus is inside a navigable row (a VIEWS entry, a channel/topic/DM
+        // row, or a section header). Return that row; the caller syncs the
+        // cursor to it and then steps prev/next, since the cursor already
+        // knows which rows are visible.
+        return $row;
+    }
+    if ($active.closest("#subscribe-to-more-streams").length > 0 && direction === "up") {
+        // Focus is on the "Browse channels" / "Create a channel" link, which
+        // sits below all channel rows. ArrowDown has nowhere to go; ArrowUp
+        // lands on the last visible row.
+        return all_rows().last();
+    }
+    // Focus isn't on anything we navigate between (e.g. an inline action
+    // button inside a row that we don't special-case). Do nothing.
+    return undefined;
+}
+
+// Handle arrow key navigation when a left sidebar element has Tab focus,
+// so that Tab and arrow key navigation stay in sync. Three steps:
+//   (a) resolve which row we should land on,
+//   (b) sync the cursor to it,
+//   (c) move DOM focus to it.
+function handle_left_sidebar_arrow_navigation(e: JQuery.KeyDownEvent): void {
+    if (e.key === "Tab") {
+        // Tab is handled by the browser, but we clear the cursor highlight
+        // so it doesn't remain painted on the arrow-navigated row after
+        // focus moves elsewhere.
+        left_sidebar_cursor.clear();
+        return;
+    }
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") {
+        return;
+    }
+    if (e.altKey || e.ctrlKey || e.shiftKey || !(document.activeElement instanceof HTMLElement)) {
+        return;
+    }
+
+    // Search inputs have their own arrow key handlers.
+    const $active = $(document.activeElement);
+    if (
+        $active.is(".left-sidebar-search-input, .direct-messages-list-filter, #topic_filter_query")
+    ) {
+        return;
+    }
+
+    const direction = e.key === "ArrowDown" ? "down" : "up";
+    const $landing_row = resolve_left_sidebar_arrow_target($active, direction);
+    if ($landing_row === undefined || $landing_row.length === 0) {
+        return;
+    }
+
+    left_sidebar_cursor.set_is_highlight_visible(true);
+    left_sidebar_cursor.go_to($landing_row);
+
+    // If focus was already inside a navigable row, we landed on *that* row;
+    // step the cursor one further in the arrow direction.
+    if (
+        $active.closest(".top_left_row, .bottom_left_row, .left-sidebar-section-header").length > 0
+    ) {
+        if (direction === "down") {
+            left_sidebar_cursor.next();
+        } else {
+            left_sidebar_cursor.prev();
+        }
+    }
+
+    const $new_row = left_sidebar_cursor.get_key();
+    assert($new_row !== undefined);
+    focus_left_sidebar_row($new_row);
+
+    e.preventDefault();
+    e.stopPropagation();
+}
+
 function focus_left_sidebar_filter(e: JQuery.ClickEvent): void {
     left_sidebar_cursor.reset();
     e.stopPropagation();
@@ -659,6 +878,11 @@ export function set_event_handlers(): void {
 
         if ($row === undefined) {
             // This can happen for empty searches, no need to warn.
+            return;
+        }
+
+        if ($row.hasClass("left-sidebar-topic-search-hint-link")) {
+            initiate_topic_search();
             return;
         }
 
@@ -708,6 +932,16 @@ export function set_event_handlers(): void {
                 left_sidebar_cursor.next();
                 return true;
             },
+            Tab() {
+                // If the user navigated to a row with arrow keys, Tab should focus
+                // that row instead of the next element in DOM order.
+                const $row = left_sidebar_cursor.get_key();
+                if ($row !== undefined && left_sidebar_cursor.is_highlight_visible) {
+                    focus_left_sidebar_row($row);
+                }
+                left_sidebar_cursor.clear();
+                return false;
+            },
         },
     });
 
@@ -716,6 +950,16 @@ export function set_event_handlers(): void {
         left_sidebar_cursor.clear();
     });
     $search_input.on("input", update_left_sidebar_for_search);
+
+    // Handle arrow key navigation when a sidebar element has Tab
+    // focus, so that Tab and arrow key navigation stay in sync.
+    $("#left-sidebar").on("keydown", handle_left_sidebar_arrow_navigation);
+
+    $("body").on("click", ".left-sidebar-topic-search-hint-link", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        initiate_topic_search();
+    });
 }
 
 export function initiate_search(): void {

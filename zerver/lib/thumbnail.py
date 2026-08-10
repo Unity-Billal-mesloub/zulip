@@ -104,8 +104,8 @@ TRANSCODED_IMAGE_FORMAT = ThumbnailFormat("webp", 4032, 3024, animated=False)
 # this does not provide any *security*, since the content-type is
 # provided by the browser, and may not match the bytes they uploaded.
 #
-# This should be kept synced with the client-side image-picker in
-# web/upload_widget.ts.  Any additions below must be accompanied by
+# This should be kept synced with the client-side list in
+# web/src/upload.ts.  Any additions below must be accompanied by
 # changes to the pyvips block below as well.
 THUMBNAIL_ACCEPT_IMAGE_TYPES = frozenset(
     [
@@ -194,8 +194,8 @@ def libvips_check_image(
 
     try:
         yield source_image
-    except pyvips.Error as e:  # nocoverage
-        logging.exception(e)
+    except pyvips.Error:  # nocoverage
+        logging.exception("Error while processing image")
         raise BadImageError(_("Image is corrupted or truncated"))
 
 
@@ -250,6 +250,10 @@ def resize_emoji(
     # 2) If it is animated, the still image data i.e. first frame of gif.
     with libvips_check_image(image_data) as source_image:
         if source_image.get_n_pages() == 1:
+            # This will crop the image to fit exactly within size x size pixels,
+            # using center cropping to preserve the most important part of the image.
+            # Unlike animated images below, static images are cropped rather
+            # than padded to achieve square dimensions.
             return (
                 pyvips.Image.thumbnail_buffer(
                     image_data,
@@ -259,12 +263,6 @@ def resize_emoji(
                 ).write_to_buffer(write_file_ext),
                 None,
             )
-        first_still = pyvips.Image.thumbnail_buffer(
-            image_data,
-            size,
-            height=size,
-            crop=pyvips.Interesting.CENTRE,
-        ).write_to_buffer(".png")
 
         animated = pyvips.Image.thumbnail_buffer(
             image_data,
@@ -290,7 +288,21 @@ def resize_emoji(
                 for frame in animated.pagesplit()
             ]
             animated = frames[0].pagejoin(frames[1:])
+            first_still = frames[0].write_to_buffer(".png")
+        else:
+            first_still = animated.pagesplit()[0].write_to_buffer(".png")
         return (animated.write_to_buffer(write_file_ext), first_still)
+
+
+def needs_transcoded_format(image_attachment: ImageAttachment) -> bool:
+    # Images whose content-type browsers can't render inline need a
+    # transcoded, web-safe copy.  Some old uploads have a missing
+    # content-type -- null, or empty from a blank ?mimetype= -- which
+    # is falsy here and so judged inline, since we can't tell otherwise.
+    return bool(
+        image_attachment.content_type
+        and bare_content_type(image_attachment.content_type) not in INLINE_MIME_TYPES
+    )
 
 
 def missing_thumbnails(
@@ -301,8 +313,7 @@ def missing_thumbnails(
         seen_thumbnails.add(StoredThumbnailFormat(**existing_thumbnail))
 
     potential_output_formats = list(THUMBNAIL_OUTPUT_FORMATS)
-    assert image_attachment.content_type
-    if bare_content_type(image_attachment.content_type) not in INLINE_MIME_TYPES:
+    if needs_transcoded_format(image_attachment):
         if image_attachment.original_width_px >= image_attachment.original_height_px:
             additional_format = ThumbnailFormat(
                 TRANSCODED_IMAGE_FORMAT.extension,
@@ -382,7 +393,7 @@ def maybe_thumbnail(
                 # enqueued during message rendering; thumbnailing them
                 # before/during message rendering can cause race
                 # conditions.
-                queue_event_on_commit("thumbnail", {"id": image_row.id})
+                queue_event_on_commit("thumbnail", {"id": image_row.id, "path_id": path_id})
             return image_row
     except BadImageError:
         return None
@@ -441,7 +452,7 @@ def manifest_and_get_user_upload_previews(
         realm_id=realm_id, path_id__in=path_ids
     ).order_by("id")
     if lock:
-        image_attachments = image_attachments.select_for_update(of=("self",))
+        image_attachments = image_attachments.select_for_update(of=("self",), no_key=True)
     for image_attachment in image_attachments:
         if image_attachment.thumbnail_metadata == []:
             # Image exists, and header of it parsed as a valid image,
@@ -462,7 +473,9 @@ def manifest_and_get_user_upload_previews(
             # the worker if all of the currently-configured thumbnail
             # formats have already been generated.
             if enqueue:
-                queue_event_on_commit("thumbnail", {"id": image_attachment.id})
+                queue_event_on_commit(
+                    "thumbnail", {"id": image_attachment.id, "path_id": image_attachment.path_id}
+                )
         else:
             url, is_animated = get_default_thumbnail_url(image_attachment)
             image_metadata[image_attachment.path_id] = MarkdownImageMetadata(
@@ -521,10 +534,7 @@ def get_transcoded_format(
     # not in INLINE_MIME_TYPES get an extra large-resolution thumbnail
     # added to their list of formats, this is thus either None or a
     # high-resolution thumbnail.
-    if (
-        image_attachment.content_type is None
-        or bare_content_type(image_attachment.content_type) in INLINE_MIME_TYPES
-    ):
+    if not needs_transcoded_format(image_attachment):
         return None
 
     thumbs_by_size = sorted(

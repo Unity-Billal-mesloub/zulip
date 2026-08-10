@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import type * as tippy from "tippy.js";
 
 import render_add_default_streams from "../templates/settings/add_default_streams.hbs";
@@ -16,6 +16,7 @@ import * as scroll_util from "./scroll_util.ts";
 import * as settings_profile_fields from "./settings_profile_fields.ts";
 import {current_user} from "./state_data.ts";
 import * as stream_data from "./stream_data.ts";
+import type {StreamSubscription} from "./sub_store";
 import * as sub_store from "./sub_store.ts";
 import * as ui_report from "./ui_report.ts";
 
@@ -46,11 +47,11 @@ function create_choice_row(): void {
     $container.append($(row_html));
 
     // List of non-default streams that are not yet selected.
-    function get_options(): {name: string; unique_id: number}[] {
+    function get_options(): {name: string; unique_id: number; stream: StreamSubscription}[] {
         const chosen_default_streams = get_chosen_default_streams();
 
         return stream_data
-            .get_non_default_stream_names()
+            .get_default_stream_options()
             .filter((e) => !chosen_default_streams.has(e.unique_id));
     }
 
@@ -85,16 +86,6 @@ const meta = {
 
 export function reset(): void {
     meta.loaded = false;
-}
-
-export function maybe_disable_widgets(): void {
-    if (current_user.is_admin) {
-        return;
-    }
-
-    $(".organization-box [data-name='default-channels-list']")
-        .find("input:not(.search), button, select")
-        .prop("disabled", true);
 }
 
 export function build_default_stream_table(): void {
@@ -133,6 +124,10 @@ export function build_default_stream_table(): void {
 }
 
 export function update_default_streams_table(): void {
+    if (current_user.is_guest) {
+        return;
+    }
+
     if (["organization", "settings"].includes(hash_parser.get_current_hash_category())) {
         $("#admin_default_streams_table").expectOne().find("tr.default_stream_row").remove();
         build_default_stream_table();
@@ -184,7 +179,7 @@ function show_add_default_streams_modal(): void {
                 url: "/json/default_streams",
                 data,
                 success() {
-                    successful_requests = successful_requests + 1;
+                    successful_requests += 1;
 
                     if (successful_requests === chosen_streams.size) {
                         dialog_widget.close();
@@ -230,7 +225,6 @@ function show_add_default_streams_modal(): void {
 
 export function set_up(): void {
     build_page();
-    maybe_disable_widgets();
 }
 
 export function build_page(): void {
@@ -254,4 +248,14 @@ export function build_page(): void {
             delete_default_stream(stream_id, $row, $(this));
         },
     );
+}
+
+export function rerender_default_streams_for_role_change(): void {
+    if (!meta.loaded) {
+        return;
+    }
+
+    $("#show-add-default-streams-modal").toggleClass("hide", !current_user.is_admin);
+    $("#admin-default-channels-list th.actions").toggleClass("hide", !current_user.is_admin);
+    update_default_streams_table();
 }

@@ -48,8 +48,6 @@ Come find us on the [development community chat](https://zulip.com/development-c
   programs](https://zulip.readthedocs.io/en/latest/contributing/contributing.html#outreach-programs)**
   like [Google Summer of Code](https://developers.google.com/open-source/gsoc/).
 
-- **Supporting Zulip**. Learn about all the ways you can [support
-  Zulip](https://zulip.com/help/support-zulip-project), including contributing
-  financially, and helping others discover it.
+
 
 
